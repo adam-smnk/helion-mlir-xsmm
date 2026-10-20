@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=60"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "helion-mlir-utils"
+version = "0.1.0"
+description = "Helper utilities for Helion MLIR CPU kernels"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["helion_mlir_utils"]
+
+[tool.setuptools.package-dir]
+helion_mlir_utils = "."
