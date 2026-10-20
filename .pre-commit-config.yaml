@@ -1,0 +1,36 @@
+# Based on Helion rules
+repos:
+-   repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+    - id: check-symlinks
+    - id: destroyed-symlinks
+    - id: trailing-whitespace
+      exclude: '\.expected(?:$|_[^/]+$)'
+    - id: end-of-file-fixer
+      exclude: '\.expected$'
+    - id: check-yaml
+    - id: check-toml
+    - id: check-ast
+    - id: check-added-large-files
+    - id: check-merge-conflict
+    - id: check-executables-have-shebangs
+    - id: check-shebang-scripts-are-executable
+    - id: requirements-txt-fixer
+    - id: detect-private-key
+    - id: debug-statements
+      exclude: 'tests/test_breakpoint\.py$'
+
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.14
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+-   repo: https://github.com/codespell-project/codespell
+    rev: v2.4.2
+    hooks:
+      - id: codespell
+        additional_dependencies:
+          - tomli

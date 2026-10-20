@@ -1,0 +1,109 @@
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "helion-mlir-backend"
+version = "0.1.0"
+description = "Helion MLIR backend"
+readme = "README.md"
+requires-python = ">=3.11"
+# Users must supply their own compatible dependencies.
+dependencies = []
+
+# Set of fixed runtime dependencies for development and testing.
+[dependency-groups]
+dev = [
+  "lighthouse[ingress_torch_mlir]",
+  "PyYAML",
+  "numpy",
+  "python-dotenv",
+  "helion==1.4.0",
+  "torch==2.13.0+cpu",
+  "ml-dtypes",
+  "ruff==0.14.5", # Python linter and formatter
+  "pre-commit", # Tool to manage and apply pre-commit hooks
+  "pytest>=8.0.0",
+  "pytest-timeout",
+  "psutil",
+  "hypothesis",
+  "pytest-xdist",
+]
+
+# Based on Helion rules
+[tool.ruff]
+target-version = "py310"
+line-length = 88
+src = ["helion_mlir_backend", "tests", "examples"]
+force-exclude = true
+
+[tool.ruff.format]
+docstring-code-format = true
+quote-style = "double"
+line-ending = "lf"
+
+[tool.ruff.lint]
+select = [
+    "A", "ANN", "B", "C4", "COM", "D419", "E", "ERA001", "EXE", "F", "FA", "FLY", "FURB",
+    "G", "I", "ISC", "LOG", "NPY", "PERF", "PGH", "PIE", "PLC0131", "PLC0132",
+    "PLC0205", "PLC0208", "PLC2401", "PLC3002", "PLE", "PLR0133", "PLR0206",
+    "PLR1722", "PLR1736", "PLW0129", "PLW0131", "PLW0133", "PLW0245", "PLW0406",
+    "PLW0711", "PLW1501", "PLW1509", "PLW2101", "PLW3301", "PYI", "Q", "RET",
+    "RSE", "RUF005", "RUF007", "RUF008", "RUF009", "RUF010", "RUF012", "RUF013",
+    "RUF015", "RUF016", "RUF017", "RUF018", "RUF019", "RUF020", "RUF022", "RUF024",
+    "RUF026", "RUF030", "RUF034", "RUF036", "RUF037", "RUF041", "RUF047", "RUF051",
+    "RUF056", "RUF100", "RUF200", "S324", "SIM", "SLOT", "TCH", "TD001", "TD002",
+    "TD004", "TRY002", "TRY203", "TRY401", "UP", "W", "YTT",
+]
+ignore = [
+    "C409", "C419", "COM812", "E501", "ERA001", "FURB189", "G004", "PERF203", "PERF401",
+    "RET501", "SIM102", "SIM108", "SIM115", "UP035",
+]
+extend-safe-fixes = ["TC", "UP045", "RUF013", "RSE102"]
+preview = true
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN"]
+# Python-defined MLIR ops read their field annotations at class creation.
+"helion_mlir_backend/_compiler/mlir_transforms/*.py" = ["I002"]
+
+[tool.ruff.lint.isort]
+extra-standard-library = ["typing_extensions"]
+known-local-folder = ["helion_mlir_backend"]
+known-third-party = ["torch"]
+required-imports = ["from __future__ import annotations"]
+force-single-line = true
+force-sort-within-sections = true
+
+[tool.codespell]
+# "inout": a tensor argument the kernel reads and writes (entry-function role).
+ignore-words-list = "inout,inouts"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Parallel for whole-suite runs; see pytest_xdist_auto_num_workers in tests/conftest.py.
+addopts = ["-n", "auto"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+filterwarnings = [
+    'error', # Turn all uncaptured warnings into errors.
+    'ignore::DeprecationWarning',
+    'ignore::FutureWarning',
+    'ignore::UserWarning',
+]
+
+
+[tool.uv]
+package = true
+index-strategy = "unsafe-best-match"
+
+[tool.hatch.build.targets.wheel]
+packages = ["helion_mlir_backend"]
+
+[tool.uv.sources]
+torch = { index = "pytorch" }
+lighthouse = { git = "https://github.com/llvm/lighthouse", rev = "eb90452" }
+
+[[tool.uv.index]]
+name = "pytorch"
+url = "https://download.pytorch.org/whl"

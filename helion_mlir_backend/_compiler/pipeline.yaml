@@ -1,0 +1,120 @@
+# The optimizing (opt) pipeline.
+Pipeline:
+  # Cleanup freshly imported IR.
+  - pass: symbol-dce
+  - pass: cse
+  - pass: canonicalize
+
+  # Based on Lighthouse's x86 pipeline.
+  # Skips packing as the entry-level IR from Helion already contains parallel loops.
+  ## Pack and unpack ops the kernel has (e.g. from inline MLIR): tile, lower, vectorize.
+  - schedule: "x86/pack_lowering.py[gen=lower_packs_unpacks]{tile_size=32}"
+  - include: cleanup.yaml
+
+  ## Initial elementwise operations fusion to group them.
+  - pass: "linalg-fuse-elementwise-ops"
+
+  ## Small transposes stay one vector transpose: register tiling unrolls narrow ones per element.
+  - schedule: "helion_transforms.py[gen=pin_transposes]"
+  # Simplify shapes.
+  - schedule: "linalg.py[gen=linalg_contract_fold_unit_dims]"
+  - include: cleanup.yaml
+
+  ## Remap iteration space of parallel loops for communication avoidance.
+  - schedule: "sfc.py[gen=remap]"
+
+  ## Normalize ops to category.
+  - pass: "linalg-categorize-ops"
+  ## Partial tiles' zero-padded operands read through packs are copied into buffers.
+  - schedule: "helion_transforms.py[gen=materialize_operand_pads]{packed_only=True}"
+  ## Operand packs (e.g. VNNI B tiles) run once per contraction, not per register tile.
+  - schedule: "helion_transforms.py[gen=pin_transposes]"
+  - schedule: "helion_transforms.py[gen=isolate_operand_packs]"
+
+  ## 2) CPU register-level tiling - ensure data fits in registers.
+  ## Parallel register tiles: assign/propagate from contraction anchors and fuse.
+  - include: x86_64/tile-and-fuse.yaml {
+                                  strategy=register_parallel
+                                  propagate=True
+                                  use_forall=False
+                                }
+  - include: cleanup.yaml
+  ## Register tiles padding nothing read operands in place; only edge tiles copy
+  ## their padded operands into buffers.
+  - schedule: "helion_transforms.py[gen=version_padded_operands]"
+  - schedule: "helion_transforms.py[gen=materialize_operand_pads]"
+  ## Operands read in place from rows not at cache-line multiples (e.g. odd K)
+  ## are copied once per register tile into aligned rows.
+  - schedule: "helion_transforms.py[gen=align_operand_rows]"
+
+  ## Reduction register tiles: annotate K-like dims and tile ops individually.
+  # Tiling clears the pins; operand packs must not be tiled into tiny ops either.
+  - schedule: "helion_transforms.py[gen=pin_transposes]"
+  - include: x86_64/fuse-reductions.yaml {
+                          strategy=register_reduction
+                          use_forall=False
+                        }
+  - include: x86_64/tile.yaml {
+                          strategy=register_reduction
+                          propagate=False
+                          use_forall=False
+                        }
+  - include: cleanup.yaml
+
+  ## 3) CPU register-level unrolling via tiling - ensure hardware-friendly shapes.
+  - schedule: "helion_transforms.py[gen=pin_transposes]"
+  - include: x86_64/unroll-register.yaml
+  - include: cleanup.yaml
+  ## Register-tile temporaries (fused accumulator init, epilogues) sized per register tile.
+  - schedule: "helion_transforms.py[gen=fold_empty_slices]"
+
+  ## Large slice moves as linalg.copy ops, which vectorize_linalg tiles: unit-dim
+  ## folding turns data-movement ops into bare slices, copied whole when bufferized.
+  - schedule: "helion_transforms.py[gen=materialize_copies]"
+  ## Pads as vector reads of their source: no padded temporary to bufferize.
+  - schedule: "helion_transforms.py[gen=vectorize_pads]"
+  ## x86_64/vectorize.yaml, vectorizing ops of runtime shape with masks.
+  - schedule: "helion_transforms.py[gen=vectorize_linalg]"
+  # Not out of scf.forall: a value hoisted out of the parallel loop is copied per iteration.
+  - schedule: "hoisting.py[gen=hoist_loops]{target_op=scf.for}"
+  - schedule: "vectorization.py[gen=simplify_vector_ops]"
+  ## Transposes (e.g. of operand packs) as shuffles, of the widest elements they keep whole.
+  - schedule: "helion_transforms.py[gen=lower_transposes]"
+
+  ## x86_64/lower.yaml, plus lower-vector-multi-reduction, which
+  ## convert-vector-to-llvm does not include (reductions fail to JIT without it).
+  # Rank-reduced slices of an output tile's empty tensor (from unit-dim folding)
+  # stay empty tensors: else bufferization writes the tile to a temporary and copies.
+  - schedule: "helion_transforms.py[gen=fold_empty_slices]"
+  - include: bufferization.yaml
+  # Per-tile scratch (accumulators, staging) on the stack: no malloc/free per tile.
+  - schedule: "helion_transforms.py[gen=promote_buffers_to_stack]{max_alloc_size_in_bytes=1048576}"
+  - include: bufferization-cleanup.yaml
+  - schedule: "helion_transforms.py[gen=split_transfers]"
+  - schedule: "omp.py[gen=parallelize]"
+  - schedule: "helion_transforms.py[gen=amx_move_offsets]"
+  # The AMX rewrite rebuilds a K loop without the loop-invariant index ops defined in
+  # it (outer tiles of several blocks): left in the erased loop, they abort the rewrite.
+  - pass: "loop-invariant-code-motion"
+  - schedule: "vectorization.py[gen=x86_vectorization]"
+  - schedule: "vectorization.py[gen=vectorize_all]"
+  # Ops of runtime shape without evident bounds stay linalg until here.
+  - pass: "func.func(convert-linalg-to-loops)"
+  ## n-D transfers as 2-D ones, contiguous ones then 1-D: no per-element staging.
+  - schedule: "helion_transforms.py[gen=unroll_transfers]"
+  - schedule: "vectorization.py[gen=flatten_vector_ops]"
+  ## n-D elementwise ops (e.g. between reshapes of flattened transfers) as 1-D:
+  ## lowered n-D, they unroll into per-row ops and shuffles.
+  - schedule: "helion_transforms.py[gen=linearize_vector_ops]"
+  ## Reductions of the innermost dim as horizontal reductions, of outer dims as
+  ## lane-wise ops: the pass alone lowers a row reduction to a scalar chain.
+  - schedule: "vectorization.py[gen=lower_vector_multi_reductions]"
+  - pass: "func.func(lower-vector-multi-reduction)"
+  ## Math functions (exp, tanh, ...) as polynomials: LLVM would scalarize vector ones
+  ## into a libm call per element.
+  - schedule: "helion_transforms.py[gen=approximate_math]"
+  - schedule: "helion_transforms.py[gen=legalize_for_llvm]"
+  # Stack buffers of transfers in a loop would grow the stack each iteration.
+  - pass: "convert-vector-to-scf"
+  - schedule: "helion_transforms.py[gen=hoist_allocas]"
+  - include: llvm-lowering.yaml
