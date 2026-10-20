@@ -1,0 +1,20 @@
+func.func {arg_attrs=[{helion.name = "out", helion.role = "inout"}, {helion.name = "b", helion.param = 0 : i64, helion.role = "in"}], function_type=(memref<2x2x16x32x2xbf16>, memref<64x64xbf16>) -> (), sym_name=@sym0, sym_visibility="public"}
+  ^(memref<2x2x16x32x2xbf16>, memref<64x64xbf16>)
+  bufferization.to_tensor {restrict=unit, writable=unit} -> tensor<2x2x16x32x2xbf16>
+  bufferization.to_tensor {restrict=unit} -> tensor<64x64xbf16>
+  scf.forall {operandSegmentSizes=array<i32: 0, 0, 0, 1>, staticLowerBound=array<i64: 0, 0>, staticStep=array<i64: 1, 1>, staticUpperBound=array<i64: 2, 2>} -> tensor<2x2x16x32x2xbf16>
+    ^(index, index, tensor<2x2x16x32x2xbf16>)
+    affine.apply {map=affine_map<(d0) -> (d0 * 32)>} -> index
+    affine.apply {map=affine_map<(d0) -> (d0 * 32)>} -> index
+    tensor.extract_slice {operandSegmentSizes=array<i32: 1, 2, 0, 0>, static_offsets=array<i64: -9223372036854775808, -9223372036854775808, 0, 0, 0>, static_sizes=array<i64: 1, 1, 16, 32, 2>, static_strides=array<i64: 1, 1, 1, 1, 1>} -> tensor<1x1x16x32x2xbf16>
+    tensor.extract_slice {operandSegmentSizes=array<i32: 1, 2, 0, 0>, static_offsets=array<i64: -9223372036854775808, -9223372036854775808>, static_sizes=array<i64: 32, 32>, static_strides=array<i64: 1, 1>} -> tensor<32x32xbf16>
+    tensor.expand_shape {reassociation=[[0, 1], [2]], static_output_shape=array<i64: 16, 2, 32>} -> tensor<16x2x32xbf16>
+    tensor.empty -> tensor<16x32x2xbf16>
+    linalg.transpose {permutation=array<i64: 0, 2, 1>} -> tensor<16x32x2xbf16>
+      ^(bf16, bf16)
+      linalg.yield
+    tensor.insert_slice {operandSegmentSizes=array<i32: 1, 1, 0, 0, 0>, static_offsets=array<i64: 0, 0, 0, 0, 0>, static_sizes=array<i64: 1, 1, 16, 32, 2>, static_strides=array<i64: 1, 1, 1, 1, 1>} -> tensor<1x1x16x32x2xbf16>
+    scf.forall.in_parallel
+      tensor.parallel_insert_slice {operandSegmentSizes=array<i32: 1, 1, 2, 0, 0>, static_offsets=array<i64: -9223372036854775808, -9223372036854775808, 0, 0, 0>, static_sizes=array<i64: 1, 1, 16, 32, 2>, static_strides=array<i64: 1, 1, 1, 1, 1>}
+  bufferization.materialize_in_destination {restrict=unit, writable=unit}
+  func.return

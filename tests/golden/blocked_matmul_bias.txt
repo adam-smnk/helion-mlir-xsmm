@@ -1,0 +1,40 @@
+func.func {arg_attrs=[{helion.name = "out", helion.role = "inout"}, {helion.name = "a4", helion.param = 0 : i64, helion.role = "in"}, {helion.name = "b4", helion.param = 1 : i64, helion.role = "in"}, {helion.name = "bias3", helion.param = 2 : i64, helion.role = "in"}], function_type=(memref<2x32x2x32xbf16>, memref<2x2x32x32xbf16>, memref<2x2x32x32xbf16>, memref<2x1x32xf32>) -> (), sym_name=@sym0, sym_visibility="public"}
+  ^(memref<2x32x2x32xbf16>, memref<2x2x32x32xbf16>, memref<2x2x32x32xbf16>, memref<2x1x32xf32>)
+  arith.constant {value=0.000000e+00 : f32} -> f32
+  bufferization.to_tensor {restrict=unit, writable=unit} -> tensor<2x32x2x32xbf16>
+  bufferization.to_tensor {restrict=unit} -> tensor<2x2x32x32xbf16>
+  bufferization.to_tensor {restrict=unit} -> tensor<2x2x32x32xbf16>
+  bufferization.to_tensor {restrict=unit} -> tensor<2x1x32xf32>
+  scf.forall {operandSegmentSizes=array<i32: 0, 0, 0, 1>, staticLowerBound=array<i64: 0, 0>, staticStep=array<i64: 1, 1>, staticUpperBound=array<i64: 2, 2>} -> tensor<2x32x2x32xbf16>
+    ^(index, index, tensor<2x32x2x32xbf16>)
+    tensor.empty -> tensor<1x1x32x32xf32>
+    linalg.fill {operandSegmentSizes=array<i32: 1, 1>} -> tensor<1x1x32x32xf32>
+      ^(f32, f32)
+      linalg.yield
+    tensor.extract_slice {operandSegmentSizes=array<i32: 1, 1, 0, 0>, static_offsets=array<i64: -9223372036854775808, 0, 0, 0>, static_sizes=array<i64: 1, 2, 32, 32>, static_strides=array<i64: 1, 1, 1, 1>} -> tensor<1x2x32x32xbf16>
+    tensor.extract_slice {operandSegmentSizes=array<i32: 1, 1, 0, 0>, static_offsets=array<i64: -9223372036854775808, 0, 0, 0>, static_sizes=array<i64: 1, 2, 32, 32>, static_strides=array<i64: 1, 1, 1, 1>} -> tensor<1x2x32x32xbf16>
+    linalg.contract {indexing_maps=[affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d4, d2, d5)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d1, d4, d5, d3)>, affine_map<(d0, d1, d2, d3, d4, d5) -> (d0, d1, d2, d3)>], operandSegmentSizes=array<i32: 2, 1>} -> tensor<1x1x32x32xf32>
+      ^(bf16, bf16, f32)
+      arith.extf -> f32
+      arith.extf -> f32
+      arith.mulf {fastmath=#arith.fastmath<none>} -> f32
+      arith.addf {fastmath=#arith.fastmath<none>} -> f32
+      linalg.yield
+    tensor.extract_slice {operandSegmentSizes=array<i32: 1, 1, 0, 0>, static_offsets=array<i64: -9223372036854775808, 0, 0>, static_sizes=array<i64: 1, 1, 32>, static_strides=array<i64: 1, 1, 1>} -> tensor<1x1x32xf32>
+    linalg.generic {indexing_maps=[affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d1, 0, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types=[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>], operandSegmentSizes=array<i32: 2, 1>} -> tensor<1x1x32x32xf32>
+      ^(f32, f32, f32)
+      arith.addf {fastmath=#arith.fastmath<none>} -> f32
+      linalg.yield
+    tensor.empty -> tensor<1x32x1x32xf32>
+    linalg.transpose {permutation=array<i64: 0, 2, 1, 3>} -> tensor<1x32x1x32xf32>
+      ^(f32, f32)
+      linalg.yield
+    tensor.empty -> tensor<1x32x1x32xbf16>
+    linalg.generic {indexing_maps=[affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>, affine_map<(d0, d1, d2, d3) -> (d0, d1, d2, d3)>], iterator_types=[#linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>, #linalg.iterator_type<parallel>], operandSegmentSizes=array<i32: 1, 1>} -> tensor<1x32x1x32xbf16>
+      ^(f32, bf16)
+      arith.truncf -> bf16
+      linalg.yield
+    scf.forall.in_parallel
+      tensor.parallel_insert_slice {operandSegmentSizes=array<i32: 1, 1, 2, 0, 0>, static_offsets=array<i64: -9223372036854775808, 0, -9223372036854775808, 0>, static_sizes=array<i64: 1, 32, 1, 32>, static_strides=array<i64: 1, 1, 1, 1>}
+  bufferization.materialize_in_destination {restrict=unit, writable=unit}
+  func.return
