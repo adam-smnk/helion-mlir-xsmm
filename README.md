@@ -70,6 +70,13 @@ pytest -v
 
 This repo uses `pre-commit` with linter rules aligned with Helion style.
 
+Initial config:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
 All checks can be run using:
 
 ```bash
