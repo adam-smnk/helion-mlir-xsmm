@@ -67,7 +67,8 @@ _RUNTIME_LIB = "libmlir_levelzero_runtime.so"
 _PIPELINES = ("xegpu",)
 _CPU = "target='cpu' (CPU tensors)"
 _NO_PATTERN = "Could not apply any of the defined patterns"
-"""Lighthouse's failure when no kernel class (GEMM, attention, reduction) matches."""
+"""Lighthouse's failure when no kernel class (GEMM, attention, reduction, or the
+backend's elementwise class) matches."""
 _IR_ONLY = "HELION_MLIR_XPU_STOP_AT=xegpu-wg or xevm (IR only)"
 _MIN_WG_TILE = 32
 """Smallest matmul M/N block size searched: lighthouse's subgroup tiles are 16
@@ -114,7 +115,7 @@ def _translated(exc: Exception, stage: str) -> Exception:
             "kernel outside the XeGPU pipeline's kernel classes",
             reason=(
                 f"lighthouse's '{match.group(1)}' stage matched no GEMM, attention "
-                "or reduction pattern in a grid loop"
+                "reduction or elementwise pattern in a grid loop"
             ),
             alternatives=[_CPU],
         )

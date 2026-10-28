@@ -5,10 +5,12 @@ Helion kernel in program order (across ``hl.barrier`` phases). An entry, or a
 whole key, that is ``None`` or missing -- as are the kernels past the end of a
 shorter list -- leaves the parameter to lighthouse's inference:
 
-- ``xegpu_sg_tiles``: the subgroup tile, ``[sg_m, sg_n]`` of a GEMM kernel;
-  ``[rows, 0]`` of a (2D, row) reduction kernel.
+- ``xegpu_sg_tiles``: the subgroup tile, ``[sg_m, sg_n]`` of a GEMM or 2D
+  elementwise kernel; ``[rows, 0]`` of a (2D, row) reduction kernel.
 - ``xegpu_load_tiles``: ``[a_m, a_k, b_k, b_n]``, the A and B tiles a GEMM
-  kernel's subgroups load per instruction (``inst_data`` of the loads).
+  kernel's subgroups load per instruction (``inst_data`` of the loads);
+  ``[m, n]``, the tile a 2D elementwise kernel's subgroups load per instruction
+  (its stores take the largest 2D block store dividing the subgroup tile).
 - ``xegpu_prefetch_tiles``: ``[a_m, a_k, b_k, b_n]``, the A and B tiles a GEMM
   kernel's subgroups prefetch, in the orientation the operand is stored in (a
   transposed B prefetches ``[n, k]`` tiles).
@@ -17,13 +19,17 @@ shorter list -- leaves the parameter to lighthouse's inference:
 
 The workgroup tile and the K tile are not parameters: they are the kernel's
 block sizes (the grid tiles and the inner K tile), which lighthouse reads off
-the IR.
+the IR. Elementwise kernels (no lighthouse class) infer their parameters from
+the workgroup tile and element types
+(``mlir_transforms.xegpu_elementwise.elementwise_layout``); 1D ones take no
+parameters.
 
 :func:`xegpu_params` reads the config; :func:`attach_params` records the result
 on the generated module (so modules compiled with different parameters differ,
 also as JIT cache keys) and :func:`take_params` reads it back for lowering.
 :func:`check_params` validates parameters against the kernels' shapes with
-lighthouse's ``matmul_constraints`` before lowering.
+lighthouse's ``matmul_constraints`` (elementwise kernels: the hardware limits
+of ``elementwise_layout``) before lowering.
 """
 
 from __future__ import annotations
@@ -40,6 +46,8 @@ from mlir import ir
 from mlir.dialects import linalg
 
 from ..mlir.support.errors import XeGPUConfigError
+from ..mlir_transforms.xegpu_elementwise import ElementwiseLayout
+from ..mlir_transforms.xegpu_elementwise import elementwise_layout
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -50,6 +58,8 @@ LOAD_TILES = "xegpu_load_tiles"
 PREFETCH_TILES = "xegpu_prefetch_tiles"
 PREFETCH_DEPTHS = "xegpu_prefetch_depths"
 _ARITY = {SG_TILES: 2, LOAD_TILES: 4, PREFETCH_TILES: 4, PREFETCH_DEPTHS: 2}
+_ELEMENTWISE_ARITY = {LOAD_TILES: 2}
+"""Entries of a different length for elementwise kernels."""
 XEGPU_CONFIG_KEYS = frozenset(_ARITY)
 """The config keys of the XPU target's lowering."""
 _FIELDS = {
@@ -83,7 +93,7 @@ class KernelParams:
     def annotate_options(self) -> dict[str, object]:
         """Keyword arguments of lighthouse's ``analyze_and_annotate_gpu_func``."""
         options: dict[str, object] = {"sg_tile": self.sg_tile}
-        if self.load_tiles is not None:
+        if self.load_tiles is not None and len(self.load_tiles) == 4:
             options["load_tile_a"] = self.load_tiles[:2]
             options["load_tile_b"] = self.load_tiles[2:]
         if self.prefetch_tiles is not None:
@@ -92,6 +102,12 @@ class KernelParams:
         if self.prefetch_depths is not None:
             options["prefetch_a_nb"], options["prefetch_b_nb"] = self.prefetch_depths
         return options
+
+    def elementwise_load_tile(self) -> tuple[int, ...] | None:
+        """The forced load tile of an elementwise kernel (a 2-entry load tile)."""
+        if self.load_tiles is not None and len(self.load_tiles) == 2:
+            return self.load_tiles
+        return None
 
 
 def xegpu_params(config: Mapping[str, object]) -> tuple[KernelParams, ...]:
@@ -125,17 +141,23 @@ def _entry(key: str, index: int, item: object) -> tuple[int, ...] | None:
     if item is None:
         return None
     arity = _ARITY[key]
+    arities = {arity, _ELEMENTWISE_ARITY.get(key, arity)}
     if (
         not isinstance(item, (list, tuple))
-        or len(item) != arity
+        or len(item) not in arities
         or not all(
             isinstance(value, int) and not isinstance(value, bool) and value >= 0
             for value in item
         )
     ):
+        elementwise = (
+            f" ({_ELEMENTWISE_ARITY[key]} for an elementwise kernel)"
+            if key in _ELEMENTWISE_ARITY
+            else ""
+        )
         raise XeGPUConfigError(
-            f"{key}[{index}]={item!r}: expected {arity} non-negative ints or None "
-            "(one entry per GPU kernel)"
+            f"{key}[{index}]={item!r}: expected {arity} non-negative ints"
+            f"{elementwise} or None (one entry per GPU kernel)"
         )
     return tuple(item)
 
@@ -220,8 +242,46 @@ class ReductionShape:
         return f"reduction{rows}"
 
 
-def kernel_shape(loop: ir.Operation) -> GemmShape | ReductionShape | None:
-    """The GEMM or reduction a grid loop computes (on tensors, before lowering)."""
+@dataclass(frozen=True)
+class ElementwiseShape:
+    """The tiles of an elementwise kernel (no contraction, no reduction)."""
+
+    wg_tile: tuple[int, ...] | None
+    """The tile every store writes, ``None`` if the stores disagree."""
+    load_bits: tuple[int, ...]
+    """The element sizes of the tiles loaded."""
+    store_bits: tuple[int, ...]
+    """The element sizes of the tiles stored."""
+
+    def layout(
+        self,
+        sg_tile: Sequence[int] | None = None,
+        load_tile: Sequence[int] | None = None,
+    ) -> ElementwiseLayout:
+        """The kernel's XeGPU layout (``ValueError`` if none fits)."""
+        if self.wg_tile is None:
+            raise ValueError("the grid loop stores tiles of several shapes")
+        return elementwise_layout(
+            self.wg_tile,
+            self.load_bits,
+            self.store_bits,
+            sg_tile=sg_tile,
+            load_tile=load_tile,
+        )
+
+    def __str__(self) -> str:
+        if self.wg_tile is None:
+            return "elementwise kernel"
+        tile = "x".join(map(str, self.wg_tile))
+        return f"elementwise kernel (WG tile {tile})"
+
+
+KernelShape = GemmShape | ReductionShape | ElementwiseShape
+
+
+def kernel_shape(loop: ir.Operation) -> KernelShape | None:
+    """The GEMM, reduction or elementwise tiles a grid loop computes (on tensors,
+    before lowering)."""
     first_reduction = None
     for op in _walk(loop):
         view = op.opview
@@ -234,8 +294,40 @@ def kernel_shape(loop: ir.Operation) -> GemmShape | ReductionShape | None:
         if first_reduction is None and _reduced_dims(op, affine_maps):
             first_reduction = (op, affine_maps)
     if first_reduction is None:
-        return None
+        return _elementwise_shape(loop)
     return _reduction_shape(*first_reduction)
+
+
+def _elementwise_shape(loop: ir.Operation) -> ElementwiseShape | None:
+    """The tiles of the elementwise grid loop ``loop``: the tensors its
+    ``tensor.parallel_insert_slice`` ops store and the slices of that shape it
+    loads (``None`` if it stores nothing)."""
+    ops = _walk(loop)
+    stored = [op.operands[0] for op in ops if op.name == "tensor.parallel_insert_slice"]
+    shapes = {tuple(ir.ShapedType(value.type).shape) for value in stored}
+    if not shapes:
+        return None
+    if len(shapes) > 1:
+        return ElementwiseShape(None, (), ())
+    (wg_tile,) = shapes
+    loaded = [
+        op.results[0]
+        for op in ops
+        if op.name == "tensor.extract_slice"
+        and tuple(ir.ShapedType(op.results[0].type).shape) == wg_tile
+    ]
+    return ElementwiseShape(
+        wg_tile,
+        tuple(sorted({_bit_width(value) for value in loaded})),
+        tuple(sorted({_bit_width(value) for value in stored})),
+    )
+
+
+def _bit_width(value: ir.Value) -> int:
+    element = ir.ShapedType(value.type).element_type
+    if isinstance(element, (ir.IntegerType, ir.FloatType)):
+        return element.width
+    return 0
 
 
 def _walk(op: ir.Operation) -> list[ir.Operation]:
@@ -323,7 +415,7 @@ def _reduction_shape(op: ir.Operation, maps: list[ir.AffineMap]) -> ReductionSha
 
 def check_params(
     params: Sequence[KernelParams],
-    shapes: Sequence[GemmShape | ReductionShape | None],
+    shapes: Sequence[KernelShape | None],
 ) -> None:
     """Raise :class:`XeGPUConfigError` unless every kernel's forced parameters
     fit its shapes (``shapes``: one per kernel, by :func:`kernel_shape`) under
@@ -343,9 +435,12 @@ def check_params(
                 _check_gemm(kernel, shape, specs)
             elif isinstance(shape, ReductionShape):
                 _check_reduction(kernel, shape, specs)
+            elif isinstance(shape, ElementwiseShape):
+                _check_elementwise(kernel, shape)
             else:
                 raise ValueError(
-                    "parameters apply to GEMM (one 2D matmul) and reduction kernels"
+                    "parameters apply to GEMM (one 2D matmul), reduction and "
+                    "elementwise kernels"
                 )
         except ValueError as exc:
             values = ", ".join(
@@ -359,6 +454,8 @@ def check_params(
 
 def _check_gemm(kernel: KernelParams, shape: GemmShape, specs: XeGPUSpecs) -> None:
     wg_tile, k_tile = shape.wg_tile, shape.k_tile
+    if kernel.load_tiles is not None and len(kernel.load_tiles) != 4:
+        raise ValueError("the load tiles of a GEMM are [a_m, a_k, b_k, b_n]")
     sg_tile = kernel.sg_tile
     if sg_tile is not None:
         if 0 in sg_tile:
@@ -444,3 +541,19 @@ def _check_reduction(
             f"{shape.rows // rows} subgroups exceed the maximum of "
             f"{specs.max_nb_threads}"
         )
+
+
+def _check_elementwise(kernel: KernelParams, shape: ElementwiseShape) -> None:
+    gemm_only = [
+        key for key in (PREFETCH_TILES, PREFETCH_DEPTHS) if key in kernel.forced()
+    ]
+    if gemm_only:
+        raise ValueError(
+            f"{', '.join(gemm_only)} apply to GEMM kernels only (elementwise kernels "
+            "have no K loop to prefetch in)"
+        )
+    if kernel.load_tiles is not None and len(kernel.load_tiles) != 2:
+        raise ValueError("the load tile of an elementwise kernel is [m, n]")
+    if shape.wg_tile is not None and len(shape.wg_tile) == 1:
+        raise ValueError("1D elementwise kernels take no parameters (inferred only)")
+    shape.layout(sg_tile=kernel.sg_tile, load_tile=kernel.elementwise_load_tile())

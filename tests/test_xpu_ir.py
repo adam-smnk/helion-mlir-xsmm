@@ -145,6 +145,75 @@ def relu(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@_kernel(helion.Config(block_sizes=[64, 128]))
+def gelu_tanh_cast(x: torch.Tensor) -> torch.Tensor:
+    """bf16 math (tanh, exp) on bf16 tiles, stored as f32."""
+    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.shape):
+        v = x[tile]
+        out[tile] = (torch.tanh(v) * torch.exp(v)).to(torch.float32)
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 128]))
+def two_in_two_out(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused bf16 math over two inputs, into two outputs."""
+    a = torch.empty_like(x)
+    b = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        s = torch.sigmoid(x[tile] + y[tile])
+        a[tile] = s
+        b[tile] = torch.exp(s) * x[tile]
+    return a, b
+
+
+@_kernel(helion.Config(block_sizes=[64, 128]))
+def bias_relu(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """A row of ``bias`` broadcast over every row of the tile."""
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.shape):
+        out[tm, tn] = torch.relu(x[tm, tn] + bias[tn][None, :])
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[2048]))
+def sigmoid_1d(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.sigmoid(x[tile])
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 64]))
+def row_sums(x: torch.Tensor) -> torch.Tensor:
+    """Row sums, stored as a vector."""
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            acc = acc + x[tile_m, tile_n]
+        out[tile_m] = acc.sum(-1)
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 64]))
+def row_maxima(x: torch.Tensor) -> torch.Tensor:
+    """Row maxima, stored as a ``keepdim`` column."""
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m, 1], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        top = hl.full([tile_m, block_n], float("-inf"), dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            top = torch.maximum(top, x[tile_m, tile_n])
+        out[tile_m, :] = torch.amax(top, dim=-1, keepdim=True)
+    return out
+
+
 @_kernel(helion.Config(block_sizes=[256, 256, 32, 32]))
 def two_matmuls(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
     m, k = a.size()
@@ -309,6 +378,116 @@ def test_softmax_row_reduction(stop_at: str) -> None:
     assert "sg_layout" in text
 
 
+def _layouts(text: str, op: str) -> list[str]:
+    """The anchor layouts of the ``op`` ops in ``text``."""
+    return re.findall(rf"{re.escape(op)} [^\n]*<\{{layout = (#xegpu\.[^}}]*)\}}>", text)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_elementwise_kernel_lowers_to_xegpu(dtype: torch.dtype) -> None:
+    text = lower_xpu(relu, [xpu_tensor(4096, 4096, dtype=dtype)])
+    # 32x256 workgroup tiles: 8 subgroups of 32x32 (inferred), the widest block
+    # loads (32 bf16 or 16 f32 columns), 8x16 block stores.
+    load_cols = 32 if dtype == torch.bfloat16 else 16
+    tile = "sg_layout = [1, 8], sg_data = [32, 32]"
+    assert _layouts(text, "xegpu.load_nd") == [
+        f"#xegpu.layout<{tile}, inst_data = [32, {load_cols}]>"
+    ]
+    assert _layouts(text, "xegpu.store_nd") == [
+        f"#xegpu.layout<{tile}, inst_data = [8, 16]>"
+    ]
+    assert "known_block_size = array<i32: 128, 1, 1>" in text
+    assert "known_grid_size = array<i32: 128, 16, 1>" in text
+    _check_xevm(
+        lower_xpu(relu, [xpu_tensor(4096, 4096, dtype=dtype)], "xevm"), "relu", 1
+    )
+
+
+def _bf16_natives(text: str) -> list[str]:
+    """Device functions declared with bf16 operands (no such OpenCL builtins)."""
+    return re.findall(r"llvm\.func @(_Z\w+)\([^)]*bf16", text)
+
+
+@pytest.mark.isolated
+def test_elementwise_bf16_math_and_casts() -> None:
+    args = [xpu_tensor(1024, 1024, dtype=torch.bfloat16)]
+    text = lower_xpu(gelu_tanh_cast, args)
+    # bf16 loads, f32 stores: each with its own block tile.
+    assert re.search(r"xegpu\.load_nd [^\n]*inst_data = \[32, 32\][^\n]*xbf16>", text)
+    assert re.search(r"xegpu\.store_nd [^\n]*inst_data = \[8, 16\][^\n]*xf32>", text)
+    lowered = lower_xpu(gelu_tanh_cast, args, "xevm")
+    _check_xevm(lowered, "gelu_tanh_cast", 1)
+    # bf16 math runs in f32 (the fast exp too: upstream's math-to-xevm would
+    # call a bf16 native exp otherwise).
+    assert _bf16_natives(lowered) == []
+    assert "@_Z16__spirv_ocl_tanhf" in lowered
+    assert "@_Z22__spirv_ocl_native_expf" in lowered
+
+
+@pytest.mark.isolated
+def test_elementwise_several_inputs_and_outputs() -> None:
+    args = [xpu_tensor(1024, 1024, dtype=torch.bfloat16) for _ in range(2)]
+    text = lower_xpu(two_in_two_out, args)
+    assert len(_layouts(text, "xegpu.load_nd")) == 2
+    assert len(_layouts(text, "xegpu.store_nd")) == 2
+    assert "known_grid_size = array<i32: 16, 8, 1>" in text
+    lowered = lower_xpu(two_in_two_out, args, "xevm")
+    _check_xevm(lowered, "two_in_two_out", 1)
+    assert _bf16_natives(lowered) == []
+
+
+@pytest.mark.isolated
+def test_elementwise_broadcast_row() -> None:
+    args = [
+        xpu_tensor(1024, 1024, dtype=torch.bfloat16),
+        xpu_tensor(1024, dtype=torch.bfloat16),
+    ]
+    text = lower_xpu(bias_relu, args)
+    # The 64x128 tiles are anchored; the bias row's layout is propagated.
+    assert len(_layouts(text, "xegpu.load_nd")) == 1
+    assert len(_layouts(text, "xegpu.store_nd")) == 1
+    _check_xevm(lower_xpu(bias_relu, args, "xevm"), "bias_relu", 1)
+
+
+@pytest.mark.isolated
+def test_elementwise_1d_tiles_gather_and_scatter() -> None:
+    args = [xpu_tensor(1 << 20)]
+    text = lower_xpu(sigmoid_1d, args)
+    layout = "#xegpu.layout<sg_layout = [2], sg_data = [1024], inst_data = [16]>"
+    assert _layouts(text, "xegpu.load") == [layout]
+    assert _layouts(text, "xegpu.store") == [layout]
+    assert "known_block_size = array<i32: 32, 1, 1>" in text
+    _check_xevm(lower_xpu(sigmoid_1d, args, "xevm"), "sigmoid_1d", 1)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("name", "layout"),
+    [
+        (
+            "row_sums",
+            (
+                "#xegpu.slice<#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 64]>, "
+                "dims = [1]>"
+            ),
+        ),
+        ("row_maxima", "#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 1]>"),
+    ],
+    ids=["vector", "keepdim-column"],
+)
+def test_row_reduction_results(name: str, layout: str) -> None:
+    """Row results are stored with scatter stores, anchored with the reduction's
+    layout; a ``keepdim`` column needs no temporary buffer."""
+    kernel = {"row_sums": row_sums, "row_maxima": row_maxima}[name]
+    args = [xpu_tensor(4096, 8192)]
+    text = lower_xpu(kernel, args)
+    assert _layouts(text, "xegpu.store") == [layout]
+    assert "xegpu.store_nd" not in text and "gpu.alloc" not in text
+    assert "known_block_size = array<i32: 128, 1, 1>" in text
+    _check_xevm(lower_xpu(kernel, args, "xevm"), name, 1)
+
+
 @pytest.mark.isolated
 def test_cpu_tensors_lower_for_a_named_xpu_target() -> None:
     """Codegen is target-neutral: the IR of CPU (or meta) tensors lowers for the
@@ -364,9 +543,19 @@ def test_cpu_target_lowers_to_llvm() -> None:
 
 
 @pytest.mark.isolated
-def test_elementwise_only_kernel_is_unsupported() -> None:
-    with pytest.raises(UnsupportedOperationError, match="not supported on XPU yet"):
-        lower_xpu(relu, [xpu_tensor(4096, 4096, dtype=torch.bfloat16)])
+def test_elementwise_tile_columns_must_fit_block_loads() -> None:
+    config = helion.Config(block_sizes=[64, 8])
+    with pytest.raises(
+        UnsupportedOperationError,
+        match=r"elementwise kernel \(WG tile 64x8\) on XPU(.|\n)*not a multiple of 16",
+    ):
+        lower_mlir(
+            relu,
+            [xpu_tensor(4096, 4096, dtype=torch.bfloat16)],
+            config=config,
+            target="xpu",
+            stop_at="xegpu-wg",
+        )
 
 
 @pytest.mark.isolated

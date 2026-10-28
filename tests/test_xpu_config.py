@@ -26,6 +26,9 @@ from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
 from helion_mlir_backend._compiler.mlir.support import MLIRBackendError
 from helion_mlir_backend._compiler.mlir.support import XeGPUConfigError
+from helion_mlir_backend._compiler.mlir_transforms.xegpu_elementwise import (
+    elementwise_layout,
+)
 from helion_mlir_backend._compiler.targets import get_target
 from helion_mlir_backend._compiler.targets import target_config_keys
 from helion_mlir_backend._compiler.targets.xpu_params import PARAMS_ATTR
@@ -501,6 +504,215 @@ def test_transposed_operands_follow_lighthouse_constraints() -> None:
 def test_invalid_reduction_parameters(xegpu: dict[str, object], match: str) -> None:
     with pytest.raises(XeGPUConfigError, match=match):
         _lower(softmax, [xpu_tensor(4096, 4096)], SOFTMAX_BLOCKS, **xegpu)
+
+
+# --- Elementwise kernels ---------------------------------------------------------
+
+
+@_kernel
+def silu(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        v = x[tile].to(torch.float32)
+        out[tile] = (v * torch.sigmoid(v)).to(x.dtype)
+    return out
+
+
+@_kernel
+def silu_1d(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] * torch.sigmoid(x[tile])
+    return out
+
+
+ELEMENTWISE_BLOCKS = [128, 256]
+
+
+def _elementwise_args(dtype: torch.dtype = torch.bfloat16) -> list[object]:
+    return [xpu_tensor(4096, 4096, dtype=dtype)]
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("xegpu", "load", "store", "threads"),
+    [
+        (
+            {},
+            _layout([4, 8], [32, 32], [32, 32]),
+            _layout([4, 8], [32, 32], [8, 16]),
+            512,
+        ),
+        (
+            {"xegpu_sg_tiles": [[32, 64]]},
+            _layout([4, 4], [32, 64], [32, 32]),
+            _layout([4, 4], [32, 64], [8, 16]),
+            256,
+        ),
+        (
+            {"xegpu_sg_tiles": [[16, 64]], "xegpu_load_tiles": [[8, 16]]},
+            _layout([8, 4], [16, 64], [8, 16]),
+            _layout([8, 4], [16, 64], [8, 16]),
+            512,
+        ),
+        (
+            {"xegpu_load_tiles": [[16, 32]]},
+            _layout([4, 8], [32, 32], [16, 32]),
+            _layout([4, 8], [32, 32], [8, 16]),
+            512,
+        ),
+    ],
+    ids=["inferred", "sg-32x64", "sg-16x64-load-8x16", "load-16x32"],
+)
+def test_elementwise_parameters(
+    xegpu: dict[str, object], load: str, store: str, threads: int
+) -> None:
+    text = _lower(silu, _elementwise_args(), ELEMENTWISE_BLOCKS, **xegpu)
+    (kernel,) = _kernels(text).values()
+    assert _op_layouts(kernel, "xegpu.load_nd") == {load}
+    assert _op_layouts(kernel, "xegpu.store_nd") == {store}
+    assert _known_threads(kernel) == threads
+    assert _launch_threads(text) == [threads]
+    lowered = _lower(silu, _elementwise_args(), ELEMENTWISE_BLOCKS, "xevm", **xegpu)
+    _check_xevm(lowered, 1)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("xegpu", "dtype", "match"),
+    [
+        (
+            {"xegpu_prefetch_tiles": [[8, 16, 16, 16]]},
+            torch.bfloat16,
+            r"xegpu_prefetch_tiles apply to GEMM kernels only",
+        ),
+        (
+            {"xegpu_prefetch_depths": [[1, 1]]},
+            torch.bfloat16,
+            r"xegpu_prefetch_depths apply to GEMM kernels only",
+        ),
+        (
+            {"xegpu_load_tiles": [[8, 16, 16, 16]]},
+            torch.bfloat16,
+            r"the load tile of an elementwise kernel is \[m, n\]",
+        ),
+        (
+            {"xegpu_load_tiles": [[64, 32]]},
+            torch.bfloat16,
+            r"load tile \[64, 32\]: 2D block loads of 16-bit elements",
+        ),
+        (
+            {"xegpu_load_tiles": [[8, 32]]},
+            torch.float32,
+            r"load tile \[8, 32\]: 2D block loads of 32-bit elements .* cols in \[16\]",
+        ),
+        (
+            {"xegpu_load_tiles": [[32, 32]], "xegpu_sg_tiles": [[16, 64]]},
+            torch.bfloat16,
+            r"load tile \[32, 32\] does not divide the subgroup tile \[16, 64\]",
+        ),
+        (
+            {"xegpu_sg_tiles": [[48, 32]]},
+            torch.bfloat16,
+            r"subgroup tile \[48, 32\] does not divide the workgroup tile",
+        ),
+        (
+            {"xegpu_sg_tiles": [[8, 16]]},
+            torch.bfloat16,
+            r"256 subgroups exceed the maximum of 32",
+        ),
+        (
+            {"xegpu_sg_tiles": [[32, 8]]},
+            torch.bfloat16,
+            r"the innermost size is a multiple of 16",
+        ),
+        (
+            {"xegpu_sg_tiles": [[64, 64]]},
+            torch.bfloat16,
+            r"more than 2048 elements spill",
+        ),
+    ],
+    ids=[
+        "prefetch-tiles",
+        "prefetch-depths",
+        "gemm-load-tiles",
+        "load-rows",
+        "f32-load-cols",
+        "load-not-dividing",
+        "sg-not-dividing",
+        "too-many-subgroups",
+        "sg-cols",
+        "sg-too-large",
+    ],
+)
+def test_invalid_elementwise_parameters(
+    xegpu: dict[str, object], dtype: torch.dtype, match: str
+) -> None:
+    with pytest.raises(XeGPUConfigError, match=match) as info:
+        _lower(silu, _elementwise_args(dtype), ELEMENTWISE_BLOCKS, **xegpu)
+    assert "elementwise kernel (WG tile 128x256)" in str(info.value)
+
+
+@pytest.mark.isolated
+def test_gemm_rejects_elementwise_load_tiles() -> None:
+    with pytest.raises(XeGPUConfigError, match=r"load tiles of a GEMM are \[a_m"):
+        _lower(matmul, _gemm_args(), GEMM_BLOCKS, xegpu_load_tiles=[[8, 16]])
+
+
+@pytest.mark.isolated
+def test_1d_elementwise_parameters_are_inferred_only() -> None:
+    args = [xpu_tensor(1 << 20)]
+    with pytest.raises(XeGPUConfigError, match=r"1D elementwise kernels take no"):
+        _lower(silu_1d, args, [1024], xegpu_load_tiles=[[16, 16]])
+
+
+@pytest.mark.parametrize(
+    ("wg_tile", "load_bits", "store_bits", "sg_tile", "load_tile", "store_tile"),
+    [
+        ((128, 256), (16,), (16,), (32, 32), (32, 32), (8, 16)),
+        ((128, 256), (32,), (32,), (32, 32), (32, 16), (8, 16)),
+        ((128, 256), (16,), (32,), (32, 32), (32, 32), (8, 16)),
+        ((32, 256), (16,), (16,), (32, 32), (32, 32), (8, 16)),
+        ((256, 256), (16,), (16,), (32, 64), (32, 32), (8, 16)),
+        ((1, 4096), (16,), (16,), (1, 1024), (1, 32), (1, 16)),
+        ((1, 16), (16,), (16,), (1, 16), (1, 16), (1, 16)),
+        ((4, 16), (32,), (32,), (4, 16), (4, 16), (4, 16)),
+        ((96, 48), (16,), (16,), (24, 48), (8, 16), (8, 16)),
+        ((2048,), (32,), (32,), (1024,), (16,), (16,)),
+    ],
+)
+def test_elementwise_layout_inference(
+    wg_tile: tuple[int, ...],
+    load_bits: tuple[int, ...],
+    store_bits: tuple[int, ...],
+    sg_tile: tuple[int, ...],
+    load_tile: tuple[int, ...],
+    store_tile: tuple[int, ...],
+) -> None:
+    layout = elementwise_layout(wg_tile, load_bits, store_bits)
+    assert (layout.sg_tile, layout.load_tile, layout.store_tile) == (
+        sg_tile,
+        load_tile,
+        store_tile,
+    )
+    assert 1 <= layout.subgroups <= 32
+    assert layout.threads == layout.subgroups * 16
+
+
+@pytest.mark.parametrize(
+    ("wg_tile", "bits", "match"),
+    [
+        ((64, 8), (16,), r"8 innermost elements, not a multiple of 16"),
+        ((64, 64), (64,), r"64-bit elements"),
+        ((2, 4, 16), (16,), r"3D tiles"),
+        ((512, 512), (16,), r"no subgroup tile of at most 2048 elements divides"),
+    ],
+)
+def test_elementwise_layout_limits(
+    wg_tile: tuple[int, ...], bits: tuple[int, ...], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        elementwise_layout(wg_tile, bits, bits)
 
 
 # --- Config keys, recording, other targets -------------------------------------

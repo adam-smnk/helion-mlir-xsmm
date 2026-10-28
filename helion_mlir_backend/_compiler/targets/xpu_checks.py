@@ -7,8 +7,9 @@ The gates are conservative, by IR property (not by kernel):
 - static shapes, and full static tiles in every grid loop (no masking: block
   sizes divide the sizes they tile);
 - every grid loop (top-level ``scf.forall``, one GPU kernel each) is a kernel
-  class lighthouse handles: one matmul-like contraction (GEMM, plus epilogue) or
-  a reduction; elementwise-only loops are not supported yet;
+  class the pipeline handles: one matmul-like contraction (GEMM, plus epilogue),
+  a reduction (lighthouse's classes), or elementwise (only parallel ops: tiles
+  loaded and stored whole, that an XeGPU layout fits);
 - a contraction runs in a K loop (an inner ``hl.tile`` with a block size below
   K), on f16/bf16 operands accumulating in f32 (XeGPU DPAS).
 """
@@ -19,6 +20,8 @@ from mlir import ir
 from mlir.dialects import linalg
 
 from ..mlir.support.errors import UnsupportedOperationError
+from .xpu_params import ElementwiseShape
+from .xpu_params import kernel_shape
 
 _DPAS_OPERANDS = frozenset({"f16", "bf16"})
 _DPAS_ACCUMULATOR = "f32"
@@ -140,14 +143,8 @@ def _check_kernel_class(loop: ir.Operation) -> None:
         elif _is_reduction(view):
             reductions += 1
     if not contractions and not reductions:
-        raise UnsupportedOperationError(
-            "elementwise-only grid loop on XPU",
-            reason=(
-                "the XeGPU pipeline compiles grid loops with a matmul or a "
-                "reduction; elementwise-only kernels are not supported on XPU yet"
-            ),
-            alternatives=[_CPU],
-        )
+        _check_elementwise(loop)
+        return
     if len(contractions) > 1:
         raise UnsupportedOperationError(
             "several matmuls in one grid loop on XPU",
@@ -185,3 +182,29 @@ def _check_contraction(op: ir.OpView, loop: ir.Operation) -> None:
                 _CPU,
             ],
         )
+
+
+def _check_elementwise(loop: ir.Operation) -> None:
+    """An elementwise grid loop stores tiles of one shape that an XeGPU layout
+    fits (the inferred one; forced parameters are checked with the config)."""
+    shape = kernel_shape(loop)
+    if not isinstance(shape, ElementwiseShape):
+        raise UnsupportedOperationError(
+            "grid loop without stores on XPU",
+            reason="an elementwise grid loop must store its results",
+            alternatives=[_CPU],
+        )
+    try:
+        shape.layout()
+    except ValueError as exc:
+        raise UnsupportedOperationError(
+            f"{shape} on XPU",
+            reason=f"no XeGPU layout fits its tiles: {exc}",
+            alternatives=[
+                (
+                    "2D tiles of 16- or 32-bit elements whose columns are a "
+                    "multiple of 16 (block sizes)"
+                ),
+                _CPU,
+            ],
+        ) from None

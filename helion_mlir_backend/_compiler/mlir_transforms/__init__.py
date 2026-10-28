@@ -25,16 +25,22 @@ from .unmask_contractions import unmask_contractions
 from .vectorize_pads import vectorize_pads
 from .version_padded_operands import version_padded_operands
 from .widen_transposes import widen_transposes
+from .xegpu_elementwise import InferXeGPUElementwiseLayoutOp
+from .xegpu_elementwise import infer_xegpu_elementwise_layout
+from .xegpu_reduction import match_row_result_stores
 
 __all__ = [
     "OPERAND_PACK_ATTR_NAME",
     "HelionTransformDialect",
+    "InferXeGPUElementwiseLayoutOp",
     "align_operand_rows",
     "hoist_allocas",
+    "infer_xegpu_elementwise_layout",
     "legalize_for_llvm",
     "legalize_host_ops",
     "loop_bounds",
     "mark_operand_packs",
+    "match_row_result_stores",
     "materialize_copies",
     "materialize_operand_pads",
     "move_offsets_to_subview",

@@ -57,9 +57,38 @@ meta tensors or CPU tensors. `lower_mlir` returns the lowered module without JIT
 compilation, for either target (on the CPU: the LLVM dialect).
 
 Supported for now: static shapes with block sizes dividing the sizes they tile, and
-grid loops with one matmul (f16/bf16 inputs, f32 accumulation, a K loop; epilogues
-and transposed operands included) or row reductions (e.g. softmax). Other kernels,
-e.g. elementwise-only ones, raise `UnsupportedOperationError`.
+grid loops of one of these kernel classes:
+
+- one matmul: f16/bf16 inputs, f32 accumulation, a K loop; epilogues, casts of the
+  result and transposed operands (A, B or both) included;
+- row reductions (lighthouse's 2D class): softmax, log-softmax, L1/L2 norms and other
+  multi-pass row kernels; row results may also be stored as such (`out[tile_m] =
+  acc.sum(-1)`, or a `keepdim` column);
+- elementwise: any number of inputs and outputs, fused unary/binary math, casts,
+  broadcast rows (e.g. a bias), over 2D tiles of 16- or 32-bit elements (bf16, f16,
+  f32) whose columns are a multiple of 16, or 1D tiles (gathers and scatters). bf16
+  math runs in f32.
+
+Kernels outside them raise `UnsupportedOperationError` before lowering (e.g. dynamic
+shapes, partial tiles, f32 matmuls, two matmuls in one grid loop, elementwise tiles of
+8 or 64-bit elements or with columns that are not a multiple of 16).
+
+Elementwise kernels are not one of lighthouse's classes: the backend recognizes them
+(stores of one workgroup tile, no contraction or reduction) and anchors one
+workgroup layout on all their tile loads and stores. Its parameters are inferred from
+the workgroup tile (the block sizes) and the element types:
+
+- subgroup tile: dividing the workgroup tile in at most 32 subgroups, with a multiple
+  of 16 columns and at most 2048 elements (8 KB of f32 registers); the one closest to
+  32x32, then the squarest (a 128x256 tile: 32 subgroups of 32x32, 512 threads);
+- load tile (`inst_data` of the loads): the largest 2D block load dividing it, up to
+  32 rows and 32 (16-bit) or 16 (32-bit) columns;
+- store tile: the largest 2D block store dividing it, `[rows <= 8, 16]`.
+
+`AI-bench`'s KernelBench level 1 problems lower to `xevm` at the `mlir-gpu-bench`
+shapes (`tests/test_xpu_kernelbench.py`, kernels and block sizes in
+`tests/kernelbench_xpu.py`): the matmuls 1, 2, 6, 7, 9, 13, 16, 17 and 18 (bf16), the
+elementwise 19-22, 25 and 27-32 (bf16), and the reductions 23, 24, 38 and 39 (f32).
 
 ### XeGPU parameters
 
@@ -72,8 +101,8 @@ keeps lighthouse's inference.
 
 | Key | Entry | Applies to |
 |-----|-------|------------|
-| `xegpu_sg_tiles` | `[sg_m, sg_n]` subgroup tile (`threads` = 16 x subgroups); `[rows, 0]` for a row reduction | GEMM, reduction kernels |
-| `xegpu_load_tiles` | `[a_m, a_k, b_k, b_n]`: A and B tiles loaded per instruction | GEMM kernels |
+| `xegpu_sg_tiles` | `[sg_m, sg_n]` subgroup tile (`threads` = 16 x subgroups); `[rows, 0]` for a row reduction | GEMM, reduction, 2D elementwise kernels |
+| `xegpu_load_tiles` | `[a_m, a_k, b_k, b_n]`: A and B tiles loaded per instruction; `[m, n]`: the tile an elementwise kernel loads per instruction | GEMM, 2D elementwise kernels |
 | `xegpu_prefetch_tiles` | `[a_m, a_k, b_k, b_n]`: A and B prefetch tiles, in the operand's stored orientation (`[n, k]` for a transposed B) | GEMM kernels |
 | `xegpu_prefetch_depths` | `[a_nb, b_nb]`: K iterations A and B are prefetched ahead | GEMM kernels |
 
@@ -88,7 +117,8 @@ config = helion.Config(
 
 Before lowering, forced parameters are checked against each kernel's shapes with
 lighthouse's XeGPU constraints (`matmul_constraints`, the cost model's register and
-DPAS limits); invalid ones, malformed entries and lists longer than the number of
+DPAS limits; for elementwise kernels the limits of the inference above, and the
+prefetch keys are rejected: GEMM only); invalid ones, malformed entries and lists longer than the number of
 kernels raise `XeGPUConfigError` (an `MLIRBackendError`, so the autotuner skips the
 config). The CPU target ignores the `xegpu_*` keys, so one config can serve both
 devices. The autotuner does not search them yet; on the XPU it searches matmul tiles
