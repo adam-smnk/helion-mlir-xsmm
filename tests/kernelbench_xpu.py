@@ -21,6 +21,12 @@ chosen per shape:
 - Row reductions (f32): ``[rows, column chunk]`` block sizes, 64 rows per
   workgroup (lighthouse's reduction class: 8 subgroups of 8 rows) and 64-column
   chunks; multi-pass over the chunks like AI-bench's CPU kernels.
+- Rank 3 and 4 (batched matmuls, NCHW activations, a softmax over the last dim
+  of ``[B, H, S, D]``): block size 1 on the leading (batch, channel, head) dims,
+  the 2D kernels' tiles on the last two. The pipeline folds unit tile dims, so
+  each is its 2D kernel class, and the leading dims become workgroup grid dims
+  (they multiply the workgroups: a small per-batch matrix still fills the GPU).
+  Larger leading blocks (real 3D tiles) are rejected.
 """
 
 from __future__ import annotations
@@ -305,6 +311,57 @@ def _l2_norm(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+# --- Rank 3 and 4 ----------------------------------------------------------------
+
+
+def _batched_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``torch.bmm(a, b)`` of ``[B, M, K]`` and ``[B, K, N]`` (KernelBench 3)."""
+    batch, m, k = a.size()
+    _, _, n = b.size()
+    out = torch.empty([batch, m, n], dtype=a.dtype, device=a.device)
+    for tb, tm, tn in hl.tile([batch, m, n]):
+        acc = hl.zeros([tb, tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = hl.dot(a[tb, tm, tk], b[tb, tk, tn], acc=acc)
+        out[tb, tm, tn] = acc.to(a.dtype)
+    return out
+
+
+def _tensor_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``torch.matmul(a, b)`` of ``[N, M, K]`` and ``[K, L]`` (KernelBench 10):
+    ``B`` is shared by every batch (an einsum: ``hl.dot`` takes operands of one
+    rank)."""
+    batch, m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([batch, m, n], dtype=a.dtype, device=a.device)
+    for tb, tm, tn in hl.tile([batch, m, n]):
+        acc = hl.zeros([tb, tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = acc + torch.einsum("bmk,kn->bmn", a[tb, tm, tk], b[tk, tn])
+        out[tb, tm, tn] = acc.to(a.dtype)
+    return out
+
+
+def _softmax_last_dim(x: torch.Tensor) -> torch.Tensor:
+    """Softmax over the last dim of ``[B, H, S, D]`` (attention scores), in
+    three passes over column chunks like :func:`_softmax`."""
+    batch, heads, rows, cols = x.shape
+    block_n = hl.register_block_size(cols)
+    out = torch.empty_like(x)
+    for tb, th, tm in hl.tile([batch, heads, rows]):
+        top = hl.full([tb, th, tm, block_n], float("-inf"), dtype=torch.float32)
+        for tn in hl.tile(cols, block_size=block_n):
+            top = torch.maximum(top, x[tb, th, tm, tn])
+        row_top = torch.amax(top, dim=-1, keepdim=True)
+        total = hl.zeros([tb, th, tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(cols, block_size=block_n):
+            total = total + torch.exp(x[tb, th, tm, tn] - row_top)
+        inv = 1.0 / total.sum(-1, keepdim=True)
+        for tn in hl.tile(cols, block_size=block_n):
+            out[tb, th, tm, tn] = torch.exp(x[tb, th, tm, tn] - row_top) * inv
+    return out
+
+
 # --- Problems ---------------------------------------------------------------------
 
 
@@ -405,3 +462,57 @@ PROBLEMS: tuple[Problem, ...] = (
     _rows("39_L2Norm_", _l2_norm, (32768, 65536)),
 )
 """The problems, in KernelBench order by class (``(M, N, K)`` for matmuls)."""
+
+RANK3_PROBLEMS: tuple[Problem, ...] = (
+    # bench-gpu shapes (no mlir-gpu-bench variant), bf16 for the spec's f16 (the
+    # same DPAS). Per batch the matrix is small (512x1024: lighthouse alone
+    # picks 128x128 workgroups to fill the GPU), but 128 batches give 1024
+    # workgroups, so the 2D GEMMs' 256x256x32 tile (32 subgroups of 32x64)
+    # keeps its operand reuse.
+    Problem(
+        "3_Batched_matrix_multiplication",
+        "matmul",
+        _batched_matmul,
+        ((128, 512, 2048), (128, 2048, 1024)),
+        BF16,
+        [1, *_GEMM_BLOCKS],
+        (128, 2, 4),
+    ),
+    # bench-gpu shapes, bf16: 1024x768 per batch, L = 768 = 3 x 256 (192
+    # workgroups over 16 batches).
+    Problem(
+        "10_3D_tensor_matrix_multiplication",
+        "matmul",
+        _tensor_matmul,
+        ((16, 1024, 2048), (2048, 768)),
+        BF16,
+        [1, *_GEMM_BLOCKS],
+        (16, 4, 3),
+    ),
+    # 19_ReLU over an NCHW activation (no 4D level 1 spec): 16x64 images of
+    # 256x256, the 2D kernels' 128x256 tiles. W = 256 is one tile, so the grid
+    # is 3D (a launch has three grid dims; a fourth becomes a loop in each
+    # workgroup).
+    Problem(
+        "19_ReLU_NCHW",
+        "elementwise",
+        _relu,
+        ((16, 64, 256, 256),),
+        BF16,
+        [1, 1, *_ELEMENTWISE_BLOCKS],
+        (16, 64, 2),
+    ),
+    # 23_Softmax over the attention scores of 97_ScaledDotProductAttention's
+    # mlir-gpu-bench shapes (B=32, H=32, S=512: [32, 32, 512, 512], f32): the 2D
+    # softmax's 64 rows x 64-column chunks (the column block comes first).
+    Problem(
+        "23_Softmax_last_dim_4D",
+        "reduction",
+        _softmax_last_dim,
+        ((32, 32, 512, 512),),
+        F32,
+        [_REDUCTION_BLOCKS[1], 1, 1, _REDUCTION_BLOCKS[0]],
+        (32, 32, 8),
+    ),
+)
+"""Rank-3+ problems: block size 1 on the leading dims (folded away)."""

@@ -4,14 +4,18 @@ compiles, and the ``xegpu_*`` config keys as per-kernel fragments.
 Each GPU kernel (a root grid loop of the Helion kernel, in program order) is
 classified from Helion's facts on the kernel, before any code generation:
 a GEMM (a ``MatmulFact`` on its grid), a 2D row reduction (a
-``ReductionDescriptor`` in its graphs, one grid dim), else elementwise (1D or 2D
-tiles). Its memory accesses give its element sizes and its *column* blocks (the
-blocks of the contiguous, stride-1 dim of a tile).
+``ReductionDescriptor`` in its graphs, one grid dim of rows), else elementwise
+(1D or 2D tiles). Its memory accesses give its element sizes, its *column*
+blocks (the blocks of the contiguous, stride-1 dim of a tile) and its *leading*
+blocks (the blocks of all but the last two dims of a rank-3+ tile, e.g. a batch
+dim). The pipeline folds unit tile dims away, so leading blocks are 1 and the
+kernel is classified by the rank of its tiles without them.
 
 Block sizes (:func:`constrain_block_sizes`) are limited to what Helion's
 power-of-two ranges can express: each at most the largest power of two dividing
 its (static) size, so every sampled size divides it (no masking); column blocks
-at least 16 (a 2D block load or store row); per class, the bounds below. What a
+at least 16 (a 2D block load or store row); leading blocks 1; per class, the
+bounds below. What a
 range cannot express -- the workgroup tiles lighthouse's matmul cost model
 accepts, the subgroups an elementwise tile needs, forced parameters that do not
 fit the sampled block sizes -- is rejected before lowering by the target's
@@ -66,8 +70,9 @@ GEMM = "gemm"
 REDUCTION = "reduction"
 ELEMENTWISE = "elementwise"
 OTHER = "other"
-"""A kernel outside the classes (several matmuls, rank-3 tiles, ...): its block
-sizes get the generic bounds only, its parameters stay inferred."""
+"""A kernel outside the classes (several matmuls, rank-3 tiles that are not
+unit on their leading dims, a column reduction, ...): its block sizes get the
+generic bounds only, its parameters stay inferred."""
 
 MIN_WG_TILE = 32
 """Smallest matmul M/N block size searched: lighthouse's subgroup tiles are 16
@@ -113,10 +118,13 @@ class SearchKernel:
     grid_block_ids: tuple[int, ...]
     column_block_ids: frozenset[int] = frozenset()
     """Blocks tiling the contiguous dim of a tile the kernel loads or stores."""
+    leading_block_ids: frozenset[int] = frozenset()
+    """Blocks tiling a dim before the last two of a tile the kernel loads or
+    stores (block size 1: folded away)."""
     load_bits: tuple[int, ...] = ()
     """Element sizes of the tensors the kernel loads."""
     rank: int = 0
-    """Rank of the tiles an elementwise kernel stores."""
+    """Rank of the tiles an elementwise kernel stores, without leading dims."""
     matmul: MatmulFact | None = None
     transpose_a: bool = False
     transpose_b: bool = False
@@ -142,6 +150,10 @@ def search_kernels(config_spec: ConfigSpec, device_ir: DeviceIR) -> list[SearchK
             for fact in accesses
             if (block_id := _column_block(fact)) is not None
         )
+        leading = frozenset(
+            block_id for fact in accesses for block_id in _leading_blocks(fact)
+        )
+        rows = [block_id for block_id in grid if block_id not in leading]
         load_bits = tuple(
             sorted(
                 {
@@ -154,6 +166,7 @@ def search_kernels(config_spec: ConfigSpec, device_ir: DeviceIR) -> list[SearchK
         common = {
             "grid_block_ids": tuple(grid),
             "column_block_ids": columns,
+            "leading_block_ids": leading,
             "load_bits": load_bits,
         }
         matmuls = [
@@ -182,14 +195,25 @@ def search_kernels(config_spec: ConfigSpec, device_ir: DeviceIR) -> list[SearchK
                 )
             )
         elif reduced:
-            kind = REDUCTION if len(grid) == 1 else OTHER
+            # One grid dim of rows (else e.g. a column reduction).
+            row_reduction = len(rows) == 1 and rows[0] not in columns
+            kind = REDUCTION if row_reduction else OTHER
             reduced_ids = tuple(dict.fromkeys(fact.block_id for fact in reduced))
             kernels.append(SearchKernel(kind, reduced_block_ids=reduced_ids, **common))
         else:
             rank = max(
-                (fact.ndim for fact in accesses if fact.kind == "store"), default=0
+                (_rank(fact, leading) for fact in accesses if fact.kind == "store"),
+                default=0,
             )
-            kind = ELEMENTWISE if rank in (1, 2) else OTHER
+            # Tiles of the grid only (an inner tiled loop is e.g. an einsum's K
+            # loop, which has no matmul fact).
+            inner = {
+                block_id
+                for fact in accesses
+                for block_id in fact.subscript_block_ids
+                if block_id is not None and block_id not in grid
+            }
+            kind = ELEMENTWISE if rank in (1, 2) and not inner else OTHER
             kernels.append(SearchKernel(kind, rank=rank, **common))
     return kernels
 
@@ -216,10 +240,26 @@ def _graphs_of(device_ir: DeviceIR, root_id: int) -> set[int]:
     return found
 
 
+def _leading_blocks(fact: MemoryOpFact) -> list[int]:
+    """The blocks tiling the dims of a rank-3+ access before its last two."""
+    return [
+        block_id
+        for block_id in fact.subscript_block_ids[: max(fact.ndim - 2, 0)]
+        if block_id is not None
+    ]
+
+
+def _rank(fact: MemoryOpFact, leading: frozenset[int]) -> int:
+    """The rank of an access's tiles without its leading (unit) block dims."""
+    return fact.ndim - sum(
+        block_id in leading for block_id in fact.subscript_block_ids[: fact.ndim - 2]
+    )
+
+
 def _column_block(fact: MemoryOpFact) -> int | None:
-    """The block tiling the contiguous dim of a 1D or 2D access (``None``: none,
-    e.g. a full slice)."""
-    if fact.ndim not in (1, 2) or not fact.subscript_block_ids:
+    """The block tiling the contiguous dim of an access (``None``: none, e.g. a
+    full slice)."""
+    if fact.ndim < 1 or not fact.subscript_block_ids:
         return None
     strides = fact.subscript_strides
     position = strides.index(1) if 1 in strides else len(fact.subscript_block_ids) - 1
@@ -272,6 +312,9 @@ def constrain_block_sizes(
     for kernel in kernels:
         for block_id in kernel.column_block_ids:
             bound(block_id, BLOCK_COLS)
+        for block_id in kernel.leading_block_ids - kernel.column_block_ids:
+            # Unit: the tile is its lower-rank kernel (real 3D tiles fail).
+            bound(block_id, high=1)
         if kernel.kind == GEMM and kernel.matmul is not None:
             matmul = kernel.matmul
             bound(matmul.m_block_id, MIN_WG_TILE, MAX_WG_TILE)
@@ -285,7 +328,8 @@ def constrain_block_sizes(
                     k_block.update_max(below_k)
         elif kernel.kind == REDUCTION:
             for block_id in kernel.grid_block_ids:
-                bound(block_id, REDUCTION_SG_ROWS, MAX_REDUCTION_ROWS)
+                if block_id not in kernel.leading_block_ids:
+                    bound(block_id, REDUCTION_SG_ROWS, MAX_REDUCTION_ROWS)
             for block_id in kernel.reduced_block_ids:
                 bound(block_id, BLOCK_COLS, MAX_REDUCTION_COLS)
         elif kernel.kind == ELEMENTWISE:
@@ -293,7 +337,8 @@ def constrain_block_sizes(
             # side (the subgroup limit on their product is checked).
             high = MAX_ELEMENTWISE_TILE if kernel.rank == 1 else MAX_SG_ELEMENTS
             for block_id in kernel.grid_block_ids:
-                bound(block_id, high=high)
+                if block_id not in kernel.leading_block_ids:
+                    bound(block_id, high=high)
 
 
 def default_block_sizes(

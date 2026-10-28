@@ -28,6 +28,7 @@ from mlir import ir
 from mlir.dialects import transform
 from mlir.dialects.transform import loop
 from mlir.dialects.transform import structured
+from mlir.dialects.transform import tensor as tensor_transform
 from mlir.dialects.transform import vector as vector_transform
 from mlir.dialects.transform import xegpu
 
@@ -61,7 +62,18 @@ def prepare_for_xegpu() -> ir.Module:
       ``[rows, 1]`` column then reduces into a ``[rows]`` init, not a slice of a
       filled ``[rows, 1]`` temporary (which bufferizes to a scratch buffer the
       XeGPU conversion cannot read).
+    - Unit tile dims are folded away entirely, so a grid loop with block size 1
+      on its leading (e.g. batch or head) dims is its lower-rank kernel: the
+      reshapes the folding leaves fold into rank-reducing tile loads and
+      stores (``tensor.extract_slice``/``parallel_insert_slice``) and out of
+      loop-carried accumulators (``fold_loop_unit_dims``); batched matmuls are
+      generalized first (as lighthouse's cleanup does) so a unit batch dim
+      folds, leaving a matmul.
+
+    The XPU target applies this stage before its capability checks and
+    parameter validation, which therefore see the rank-reduced kernels.
     """
+    ht.HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
         anytype = transform.AnyOpType.get()
         module = apply_registered_pass(named_seq.bodyTarget, "symbol-dce")
@@ -69,11 +81,17 @@ def prepare_for_xegpu() -> ir.Module:
             module, structured.MatchInterfaceEnum.LinalgOp
         )
         transform_ext.remove_asserts(linalg_ops)
-        contracts = lh_transform.match_op(module, "linalg.contract")
+        contracts = lh_transform.match_op(
+            module, ["linalg.contract", "linalg.batch_matmul"]
+        )
         structured.structured_generalize(anytype, contracts)
         module = apply_registered_pass(module, "linalg-fuse-elementwise-ops")
         with ir.InsertionPoint(transform.apply_patterns(module).patterns):
             structured.apply_patterns_linalg_fold_unit_extent_dims_via_reshapes()
+            tensor_transform.apply_patterns_tensor_reassociative_reshape_folding()
+        ht.fold_loop_unit_dims(module)
+        with ir.InsertionPoint(transform.apply_patterns(module).patterns):
+            tensor_transform.apply_patterns_tensor_reassociative_reshape_folding()
         lh_transform.cleanup(module)
         transform.yield_()
     return schedule
@@ -174,8 +192,13 @@ def outline_kernels(entry: str, kernels: Sequence[KernelParams]) -> ir.Module:
 
     First, transfers whose permutation map drops dims (e.g. a row vector written
     into a ``[rows, 1]`` column) are rewritten to minor-identity transfers of a
-    reshaped vector, which the XeGPU conversion handles (scatter stores).
+    reshaped vector, which the XeGPU conversion handles (scatter stores). Then
+    transfers of tiles whose leading dims were unit (folded away) from
+    higher-rank buffers move onto a view of the buffer with the tile's rank
+    (``rank_reduce_transfers``), where lighthouse's analyses read the matrix the
+    tile belongs to (e.g. one batch of a batched matmul's operands).
     """
+    ht.HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
         anytype = transform.AnyOpType.get()
         module = named_seq.bodyTarget
@@ -188,6 +211,7 @@ def outline_kernels(entry: str, kernels: Sequence[KernelParams]) -> ir.Module:
         )
         with ir.InsertionPoint(transform.apply_patterns(func).patterns):
             vector_transform.apply_patterns_vector_transfer_permutation_patterns()
+        ht.rank_reduce_transfers(func)
         for index in range(len(kernels)):
             forall = _only(_kernel_ops(func, "scf.forall", index))
             parallel = loop.loop_forall_to_parallel([anytype], forall)

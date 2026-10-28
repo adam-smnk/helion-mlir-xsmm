@@ -293,7 +293,8 @@ KernelShape = GemmShape | ReductionShape | ElementwiseShape
 
 def kernel_shape(loop: ir.Operation) -> KernelShape | None:
     """The GEMM, reduction or elementwise tiles a grid loop computes (on tensors,
-    before lowering)."""
+    after ``prepare``: unit tile dims are folded, so a kernel with block size 1
+    on leading dims has its 2D shape)."""
     first_reduction = None
     for op in _walk(loop):
         view = op.opview
@@ -368,14 +369,32 @@ def _loop_sizes(op: ir.Operation, maps: list[ir.AffineMap]) -> dict[int, int]:
 
 
 def _source_shape(value: ir.Value) -> list[int] | None:
-    """The shape of the tensor ``value`` is a (rank-preserving) slice of."""
+    """The shape of the tensor ``value`` is a slice of, without the unit dims a
+    rank-reducing slice drops (e.g. the batch dim of a tile of one batch)."""
     sliced = False
+    kept: list[int] | None = None
     while isinstance(value, ir.OpResult) and value.owner.name == "tensor.extract_slice":
+        dims = _kept_dims(value.owner.opview)
+        kept = dims if kept is None else [dims[dim] for dim in kept]
         value = value.owner.operands[0]
         sliced = True
     if not sliced or not isinstance(value.type, ir.ShapedType):
         return None
-    return list(ir.ShapedType(value.type).shape)
+    shape = ir.ShapedType(value.type).shape
+    return [shape[dim] for dim in kept] if kept is not None else list(shape)
+
+
+def _kept_dims(op: ir.OpView) -> list[int]:
+    """The source dims of the ``tensor.extract_slice`` ``op`` its result keeps
+    (all but the unit dims a rank-reducing slice drops, matched from the
+    front as MLIR does)."""
+    sizes = list(ir.DenseI64ArrayAttr(op.attributes["static_sizes"]))
+    result = ir.ShapedType(op.results[0].type).shape
+    kept: list[int] = []
+    for dim, size in enumerate(sizes):
+        if len(kept) < len(result) and result[len(kept)] == size:
+            kept.append(dim)
+    return kept
 
 
 def _gemm_shape(op: ir.Operation, maps: list[ir.AffineMap]) -> GemmShape | None:

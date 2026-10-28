@@ -6,6 +6,7 @@ dialect only registers the ops defined before it is loaded."""
 
 from .align_operand_rows import align_operand_rows
 from .dialect import HelionTransformDialect
+from .fold_loop_unit_dims import fold_loop_unit_dims
 from .hoist_allocas import hoist_allocas
 from .hoist_invariant_scalars import hoist_invariant_scalars
 from .legalize_for_llvm import legalize_for_llvm
@@ -19,6 +20,7 @@ from .move_offsets_to_subview import move_offsets_to_subview
 from .outer_transpose_tile import outer_transpose_tile
 from .partition_linalg import partition_linalg
 from .pin_transposes import pin_transposes
+from .rank_reduce_transfers import rank_reduce_transfers
 from .schedule_amx_loads import schedule_amx_loads
 from .split_transfers import split_transfers
 from .tile_sizes import tile_sizes
@@ -36,6 +38,7 @@ __all__ = [
     "HelionTransformDialect",
     "InferXeGPUElementwiseLayoutOp",
     "align_operand_rows",
+    "fold_loop_unit_dims",
     "hoist_allocas",
     "hoist_invariant_scalars",
     "infer_xegpu_elementwise_layout",
@@ -51,6 +54,7 @@ __all__ = [
     "outer_transpose_tile",
     "partition_linalg",
     "pin_transposes",
+    "rank_reduce_transfers",
     "schedule_amx_loads",
     "split_transfers",
     "tile_sizes",

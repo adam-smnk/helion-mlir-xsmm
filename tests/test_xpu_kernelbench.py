@@ -3,7 +3,8 @@ and dtypes of AI-bench's ``mlir-gpu-bench`` variant (fake XPU tensors: the large
 shapes cost nothing). Each problem (``kernelbench_xpu.PROBLEMS``) lowers to
 annotated XeGPU (``xegpu-wg``) with its kernel class's ops and one launch over
 the expected workgroup grid, and on to LLVM/XeVM (``xevm``) without XeGPU ops
-left.
+left. Rank-3+ problems (``RANK3_PROBLEMS``: block size 1 on the leading dims)
+lower as their 2D kernel class: 2D XeGPU tiles, the leading dims as grid dims.
 """
 
 from __future__ import annotations
@@ -15,9 +16,12 @@ import pytest
 from tests.harness import lower_xpu
 from tests.harness import xpu_tensor
 from tests.kernelbench_xpu import PROBLEMS
+from tests.kernelbench_xpu import RANK3_PROBLEMS
 from tests.kernelbench_xpu import Problem
 
 _LAYOUT = re.compile(r"layout = #xegpu\.layout<([^>]*)>")
+_TENSOR_DESC = re.compile(r"!xegpu\.tensor_desc<((?:\d+x)+)\w+")
+_ALL = {problem.name: problem for problem in (*PROBLEMS, *RANK3_PROBLEMS)}
 
 
 def _args(problem: Problem) -> list[object]:
@@ -87,12 +91,15 @@ _CHECKS = {
 
 
 @pytest.mark.isolated
-@pytest.mark.parametrize("name", [problem.name for problem in PROBLEMS])
+@pytest.mark.parametrize("name", list(_ALL))
 def test_kernelbench_problem_lowers_for_xpu(name: str) -> None:
-    (problem,) = [problem for problem in PROBLEMS if problem.name == name]
+    problem = _ALL[name]
     text = lower_xpu(problem.kernel, _args(problem), "xegpu-wg")
     _check_launch(text, problem.grid)
     _CHECKS[problem.kind](text)
+    # Every tile is 2D, also of rank-3+ problems (unit leading dims folded).
+    ranks = {dims.count("x") for dims in _TENSOR_DESC.findall(text)}
+    assert ranks == {2}, ranks
     lowered = lower_xpu(problem.kernel, _args(problem), "xevm")
     assert "xegpu." not in lowered
     assert "llvm.func spir_funccc" in lowered

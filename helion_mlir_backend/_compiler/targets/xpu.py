@@ -90,14 +90,20 @@ class XpuLowering:
 
     def apply(self, module: ir.Module) -> ir.Module:
         for name, stage in self.stages:
-            try:
-                module = stage.apply(module)
-            except Exception as exc:
-                raise _translated(exc, name) from exc
-            if self.dump:
-                print(f"=== MLIR after XPU stage '{name}' ===", flush=True)
-                print(module, flush=True)
+            module = _apply_stage(name, stage, module, self.dump)
         return module
+
+
+def _apply_stage(name: str, stage: Stage, module: ir.Module, dump: bool) -> ir.Module:
+    """``stage`` applied to ``module``, its failure noted with its ``name``."""
+    try:
+        module = stage.apply(module)
+    except Exception as exc:
+        raise _translated(exc, name) from exc
+    if dump:
+        print(f"=== MLIR after XPU stage '{name}' ===", flush=True)
+        print(module, flush=True)
+    return module
 
 
 def _translated(exc: Exception, stage: str) -> Exception:
@@ -131,7 +137,7 @@ def _stages(
     be loaded (schedules use its transform ops)."""
     context = ir.Context.current
     schedules = [
-        ("prepare", xpu_transforms.prepare_for_xegpu()),
+        # "prepare" ran before the capability checks (XpuTarget.lowering).
         ("cleanup", xegpu.cleanup_schedule()),
         # No wg_tiling_schedule: Helion's grid loops are the workgroup tiles.
         ("vectorized", xegpu.vectorize_schedule()),
@@ -208,14 +214,22 @@ class XpuTarget(MLIRTarget):
         pipeline: str,
         stop_at: str | None = None,
     ) -> XpuLowering:
-        """The XeGPU stage list, after checking that ``module`` (inlined) is in
-        what it compiles (:func:`check_xegpu_capabilities`) and that its
-        recorded XeGPU parameters, forced or inferred, fit its kernels
-        (:func:`check_params`): configs that cannot lower fail here, before any
-        lighthouse stage. Tags
-        each grid loop (GPU kernel) with its index for the per-kernel stages."""
+        """The XeGPU stage list after ``prepare``, which is applied to
+        ``module`` (inlined) here: it folds unit tile dims, so the checks see
+        each grid loop as its lower-rank kernel (block size 1 on leading dims).
+        Then checks that ``module`` is in what the pipeline compiles
+        (:func:`check_xegpu_capabilities`) and that its recorded XeGPU
+        parameters, forced or inferred, fit its kernels (:func:`check_params`):
+        configs that cannot lower fail here, before any other lighthouse
+        stage. Tags each grid loop (GPU kernel) with its index for the
+        per-kernel stages."""
         self.resolve_pipeline(pipeline)
         self.check_stop_at(stop_at)
+        dump = DebugOptions.from_env().dump_stages
+        # Loads lighthouse's dialects, which building the schedules needs.
+        BackendDriver(module, entry, result_to_args=False, benchmark=False)
+        prepare = TransformStage(xpu_transforms.prepare_for_xegpu(), ir.Context.current)
+        _apply_stage("prepare", prepare, module, dump)
         loops = check_xegpu_capabilities(module, entry)
         params = take_params(module)
         check_params(params, [kernel_shape(loop) for loop in loops])
@@ -223,10 +237,8 @@ class XpuTarget(MLIRTarget):
         for index, loop in enumerate(loops):
             loop.attributes[xpu_transforms.KERNEL_ATTR] = ir.IntegerAttr.get(i64, index)
         kernels = [*params, *[KernelParams()] * (len(loops) - len(params))]
-        # Loads lighthouse's dialects, which building the schedules needs.
-        BackendDriver(module, entry, result_to_args=False, benchmark=False)
         stages = _stages(entry, kernels, stop_at or self.stop_points[-1])
-        return XpuLowering(stages, DebugOptions.from_env().dump_stages)
+        return XpuLowering(stages, dump)
 
     def runner(self, module: ir.Module) -> Runner:
         return Runner(

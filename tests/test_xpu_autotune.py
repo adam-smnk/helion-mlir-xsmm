@@ -20,6 +20,7 @@ import torch
 
 from tests.harness import xpu_tensor
 from tests.kernelbench_xpu import PROBLEMS
+from tests.kernelbench_xpu import RANK3_PROBLEMS
 from tests.kernelbench_xpu import Problem
 
 from helion_mlir_backend import lower_mlir
@@ -31,7 +32,7 @@ from helion_mlir_backend._compiler.targets.xpu_params import XEGPU_CONFIG_KEYS
 from helion_mlir_backend._compiler.targets.xpu_search import KernelChoicesFragment
 from helion_mlir_backend.api import _compile
 
-_PROBLEMS = {problem.name: problem for problem in PROBLEMS}
+_PROBLEMS = {problem.name: problem for problem in (*PROBLEMS, *RANK3_PROBLEMS)}
 GEMM = "1_Square_matrix_multiplication_"
 ELEMENTWISE = "19_ReLU"
 REDUCTION = "23_Softmax"
@@ -185,3 +186,30 @@ def test_kernel_choices_fragment() -> None:
         mutated = fragment.differential_mutation(value, [None, None], [None, None])
         assert mutated == value
     assert fragment.fingerprint() != KernelChoicesFragment(((None,),)).fingerprint()
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("name", [problem.name for problem in RANK3_PROBLEMS])
+def test_leading_blocks_are_unit(name: str) -> None:
+    """Rank-3+ kernels search block size 1 on their leading dims (where the
+    hand-picked configs have it), and their class's bounds on the others."""
+    problem = _PROBLEMS[name]
+    spec = _xpu_spec(problem)
+    unit = [size == 1 for size in problem.block_sizes]
+    assert [block.max_size == 1 for block in spec.block_sizes] == unit
+    default = spec.default_config()
+    assert [size == 1 for size in default.config["block_sizes"]] == unit
+    if name.startswith("10_"):
+        # An einsum has no matmul fact: no GEMM bounds or default (generic
+        # bounds; such configs are rejected before lowering).
+        return
+    text = str(
+        lower_mlir(
+            problem.kernel,
+            _args(problem),
+            config=default,
+            target="xpu",
+            stop_at="xegpu-wg",
+        )
+    )
+    assert "#xegpu.layout" in text

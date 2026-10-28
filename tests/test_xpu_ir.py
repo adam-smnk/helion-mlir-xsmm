@@ -28,6 +28,7 @@ from helion_mlir_backend._compiler import xpu_transforms
 from helion_mlir_backend._compiler.mlir.support import LoweringStoppedError
 from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 from helion_mlir_backend._compiler.mlir.support import UnsupportedTargetError
+from helion_mlir_backend._compiler.mlir.support import XeGPUConfigError
 from helion_mlir_backend._compiler.targets import XpuTarget
 from helion_mlir_backend._compiler.targets import get_target
 from helion_mlir_backend._compiler.targets.xpu import XpuLowering
@@ -243,6 +244,62 @@ def two_matmuls(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tens
         for tk in hl.tile(k):
             acc = torch.addmm(acc, a[tm, tk], c[tk, tn])
         out[tm, tn] = acc
+    return out
+
+
+# Rank 3+ kernels (block sizes per test): unit leading tile dims fold away.
+
+
+def relu_nd(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.relu(x[tile])
+    return out
+
+
+def batched_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    batch, m, k = a.size()
+    _, _, n = b.size()
+    out = torch.empty([batch, m, n], dtype=torch.float32, device=a.device)
+    for tb, tm, tn in hl.tile([batch, m, n]):
+        acc = hl.zeros([tb, tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = hl.dot(a[tb, tm, tk], b[tb, tk, tn], acc=acc)
+        out[tb, tm, tn] = acc
+    return out
+
+
+def tensor_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    batch, m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([batch, m, n], dtype=torch.float32, device=a.device)
+    for tb, tm, tn in hl.tile([batch, m, n]):
+        acc = hl.zeros([tb, tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = acc + torch.einsum("bmk,kn->bmn", a[tb, tm, tk], b[tk, tn])
+        out[tb, tm, tn] = acc
+    return out
+
+
+def head_row_sums(x: torch.Tensor) -> torch.Tensor:
+    """Row sums over the last dim of ``[B, H, S, D]`` in chunks, keepdim."""
+    batch, heads, rows, cols = x.shape
+    block_n = hl.register_block_size(cols)
+    out = torch.empty([batch, heads, rows, 1], dtype=x.dtype, device=x.device)
+    for tb, th, tm in hl.tile([batch, heads, rows]):
+        acc = hl.zeros([tb, th, tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(cols, block_size=block_n):
+            acc = acc + x[tb, th, tm, tn]
+        out[tb, th, tm, :] = acc.sum(-1, keepdim=True)
+    return out
+
+
+def middle_sums(x: torch.Tensor) -> torch.Tensor:
+    """Sums over the middle dim of ``[B, D1, D2]`` (KernelBench 47), keepdim."""
+    batch, _, cols = x.size()
+    out = torch.empty([batch, 1, cols], dtype=x.dtype, device=x.device)
+    for tb, tn in hl.tile([batch, cols]):
+        out[tb, :, tn] = torch.sum(x[tb, :, tn], dim=1, keepdim=True)
     return out
 
 
@@ -597,6 +654,87 @@ def test_cpu_target_lowers_to_llvm() -> None:
         lower_mlir(matmul, cpu, stop_at="xevm")
 
 
+# --- Rank 3+ (unit leading tile dims) -----------------------------------------
+
+_TENSOR_DESC = re.compile(r"!xegpu\.tensor_desc<((?:\d+x)+)\w+")
+_RANK3 = {
+    # name: (kernel, block sizes, input shapes, dtype, class op, grid)
+    "relu_3d": (
+        relu_nd,
+        [1, 128, 256],
+        [(4, 256, 512)],
+        torch.bfloat16,
+        "xegpu.load_nd",
+        (4, 2, 2),
+    ),
+    "relu_4d": (
+        relu_nd,
+        [1, 1, 128, 256],
+        [(2, 3, 256, 256)],
+        torch.float32,
+        "xegpu.load_nd",
+        (2, 3, 2),
+    ),
+    "batched_matmul": (
+        batched_matmul,
+        [1, 256, 256, 32],
+        [(4, N, N), (4, N, N)],
+        torch.float16,
+        "xegpu.dpas",
+        (4, 4, 4),
+    ),
+    "tensor_matmul": (
+        tensor_matmul,
+        [1, 256, 256, 32],
+        [(4, N, N), (N, N)],
+        torch.bfloat16,
+        "xegpu.dpas",
+        (4, 4, 4),
+    ),
+    "head_row_sums": (
+        head_row_sums,
+        [64, 1, 1, 64],
+        [(2, 4, 128, 256)],
+        torch.float32,
+        "vector.multi_reduction",
+        (2, 4, 2),
+    ),
+}
+
+
+def _lower_rank3(name: str, stop_at: str, **config: object) -> str:
+    fn, block_sizes, shapes, dtype, _, _ = _RANK3[name]
+    kernel = _kernel(helion.Config(block_sizes=block_sizes, **config))(fn)
+    args = [xpu_tensor(*shape, dtype=dtype) for shape in shapes]
+    return lower_xpu(kernel, args, stop_at)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("name", list(_RANK3))
+def test_unit_leading_tile_dims_fold(name: str) -> None:
+    """Block size 1 on the leading dims: the kernel lowers as its 2D class, all
+    XeGPU tiles 2D, the leading dims as workgroup grid dims."""
+    *_, class_op, grid = _RANK3[name]
+    text = _lower_rank3(name, "xegpu-wg")
+    assert class_op in text
+    ranks = {dims.count("x") for dims in _TENSOR_DESC.findall(text)}
+    assert ranks == {2}, ranks
+    assert f"known_grid_size = array<i32: {', '.join(map(str, grid))}>" in text
+    lowered = _lower_rank3(name, "xevm")
+    assert "xegpu." not in lowered
+    if class_op == "xegpu.dpas":
+        assert "matrix_mad" in lowered
+
+
+@pytest.mark.isolated
+def test_batched_matmul_params_see_the_batch_matrix() -> None:
+    """Parameter validation sees one batch's 2D GEMM (M, N, K of a matrix)."""
+    with pytest.raises(
+        XeGPUConfigError, match=r"GEMM \(M=1024, N=1024, K=1024, WG tile 256x256"
+    ):
+        _lower_rank3("batched_matmul", "xegpu-wg", xegpu_sg_tiles=[[256, 256]])
+
+
 # --- Unsupported kernels -----------------------------------------------------
 
 
@@ -640,6 +778,33 @@ def test_two_matmuls_in_one_grid_loop_are_unsupported() -> None:
     args = [xpu_tensor(N, N, dtype=torch.float16) for _ in range(3)]
     with pytest.raises(UnsupportedOperationError, match="several matmuls"):
         lower_xpu(two_matmuls, args)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("name", "block_sizes", "tile"),
+    [("relu_3d", [2, 64, 256], "2x64x256"), ("batched_matmul", [2, 128, 128, 32], "")],
+)
+def test_real_3d_tiles_are_unsupported(
+    name: str, block_sizes: list[int], tile: str
+) -> None:
+    fn, _, shapes, dtype, _, _ = _RANK3[name]
+    kernel = _kernel(helion.Config(block_sizes=block_sizes))(fn)
+    args = [xpu_tensor(*shape, dtype=dtype) for shape in shapes]
+    with pytest.raises(UnsupportedOperationError, match="3D tiles on XPU") as info:
+        lower_xpu(kernel, args)
+    assert tile in str(info.value)
+    assert "block size 1 on the leading" in str(info.value)
+
+
+@pytest.mark.isolated
+def test_reduction_over_a_middle_dim_is_unsupported() -> None:
+    kernel = _kernel(helion.Config(block_sizes=[1, 64]))(middle_sums)
+    with pytest.raises(
+        UnsupportedOperationError, match="reduction over a non-innermost dim"
+    ) as info:
+        lower_xpu(kernel, [xpu_tensor(16, 256, 256)])
+    assert "reduces dim 0 of a 256x64 tile" in str(info.value)
 
 
 @pytest.mark.isolated

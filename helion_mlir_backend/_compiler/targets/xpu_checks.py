@@ -6,10 +6,14 @@ The gates are conservative, by IR property (not by kernel):
 
 - static shapes, and full static tiles in every grid loop (no masking: block
   sizes divide the sizes they tile);
+- 1D or 2D tiles: the checks run after ``prepare`` folded unit tile dims away,
+  so a rank-3+ tile with block size 1 on its leading (e.g. batch) dims is 2D
+  here, and only tiles with more than two non-unit dims are rejected;
 - every grid loop (top-level ``scf.forall``, one GPU kernel each) is a kernel
   class the pipeline handles: one matmul-like contraction (GEMM, plus epilogue),
-  a reduction (lighthouse's classes), or elementwise (only parallel ops: tiles
-  loaded and stored whole, that an XeGPU layout fits);
+  a reduction over the innermost dim (lighthouse's classes: rows of 2D
+  tiles), or elementwise (only parallel ops: tiles loaded and stored whole,
+  that an XeGPU layout fits);
 - a contraction runs in a K loop (an inner ``hl.tile`` with a block size below
   K), on f16/bf16 operands accumulating in f32 (XeGPU DPAS).
 """
@@ -26,17 +30,22 @@ from .xpu_params import kernel_shape
 _DPAS_OPERANDS = frozenset({"f16", "bf16"})
 _DPAS_ACCUMULATOR = "f32"
 _CPU = "target='cpu' (CPU tensors)"
+_UNIT_LEADING_BLOCKS = (
+    "block size 1 on the leading (e.g. batch or head) dims, tiling only the last two"
+)
 
 
 def check_xegpu_capabilities(module: ir.Module, entry: str) -> list[ir.Operation]:
-    """Raise :class:`UnsupportedOperationError` if ``entry`` of the inlined
-    ``module`` is outside what the XeGPU pipeline compiles; returns its grid
-    loops (top-level ``scf.forall``), one GPU kernel each, in program order."""
+    """Raise :class:`UnsupportedOperationError` if ``entry`` of the inlined and
+    prepared (unit tile dims folded) ``module`` is outside what the XeGPU
+    pipeline compiles; returns its grid loops (top-level ``scf.forall``), one
+    GPU kernel each, in program order."""
     func = _function(module, entry)
     _check_static_arguments(func)
     loops = _grid_loops(func)
     for loop in loops:
         _check_full_tiles(loop)
+        _check_tile_ranks(loop)
         _check_kernel_class(loop)
     return loops
 
@@ -111,6 +120,30 @@ def _check_full_tiles(loop: ir.Operation) -> None:
             )
 
 
+def _check_tile_ranks(loop: ir.Operation) -> None:
+    """Every tile the grid loop slices or stores has at most two dims (after
+    unit-dim folding: at most two block sizes above 1)."""
+    for op in _walk(loop):
+        if op.name == "tensor.extract_slice":
+            tile = op.results[0]
+        elif op.name == "tensor.parallel_insert_slice":
+            tile = op.operands[0]
+        else:
+            continue
+        shape = ir.ShapedType(tile.type).shape
+        if len(shape) > 2:
+            raise UnsupportedOperationError(
+                f"{len(shape)}D tiles on XPU",
+                reason=(
+                    f"the grid loop works on {'x'.join(map(str, shape))} tiles; the "
+                    "XeGPU kernel classes take 1D or 2D tiles (unit tile dims "
+                    "are folded away, so only the last two tiled dims may have "
+                    "block sizes above 1)"
+                ),
+                alternatives=[_UNIT_LEADING_BLOCKS, _CPU],
+            )
+
+
 def _is_reduction(op: ir.OpView) -> bool:
     """A linalg op with a loop dim its results do not index."""
     maps = [ir.AffineMapAttr(m).value for m in linalg.get_indexing_maps(op)]
@@ -122,6 +155,46 @@ def _is_reduction(op: ir.OpView) -> bool:
         if isinstance(expr, ir.AffineDimExpr)
     }
     return bool(maps) and len(indexed) < maps[0].n_dims
+
+
+def _check_reduction(op: ir.OpView) -> None:
+    """The reduction ``op`` reduces its inputs over their innermost dim only
+    (lighthouse's reductions: the rows of a 2D tile)."""
+    maps = [ir.AffineMapAttr(m).value for m in linalg.get_indexing_maps(op)]
+    count = len(op.operation.operands) - len(op.results)
+    inits = maps[count:] if op.results else maps[-1:]
+    indexed = {
+        ir.AffineDimExpr(expr).position
+        for affine_map in inits
+        for expr in affine_map.results
+        if isinstance(expr, ir.AffineDimExpr)
+    }
+    for value, affine_map in zip(op.operation.operands, maps[:count], strict=False):
+        dims = [
+            ir.AffineDimExpr(expr).position
+            if isinstance(expr, ir.AffineDimExpr)
+            else None
+            for expr in affine_map.results
+        ]
+        inner = [
+            position
+            for position, dim in enumerate(dims[:-1])
+            if dim is not None and dim not in indexed
+        ]
+        if inner:
+            shape = "x".join(map(str, ir.ShapedType(value.type).shape))
+            raise UnsupportedOperationError(
+                "reduction over a non-innermost dim on XPU",
+                reason=(
+                    f"'{op.operation.name}' reduces dim {inner[0]} of a {shape} "
+                    "tile; the XeGPU reduction class reduces the rows of 2D tiles "
+                    "over their last (contiguous) dim"
+                ),
+                alternatives=[
+                    "a reduction over the last dim (e.g. of a transposed copy)",
+                    _CPU,
+                ],
+            )
 
 
 def _element_type(value: ir.Value) -> str:
@@ -141,6 +214,7 @@ def _check_kernel_class(loop: ir.Operation) -> None:
         if linalg.isa_contraction_op(view):
             contractions.append(view)
         elif _is_reduction(view):
+            _check_reduction(view)
             reductions += 1
     if not contractions and not reductions:
         _check_elementwise(loop)

@@ -71,9 +71,19 @@ grid loops of one of these kernel classes:
   f32) whose columns are a multiple of 16, or 1D tiles (gathers and scatters). bf16
   math runs in f32.
 
+Rank 3 and higher work with block size 1 on the leading dims (batch, channel, head):
+unit tile dims are folded away before the checks and lighthouse's stages, so the grid
+loop is its 2D kernel class and the leading dims become workgroup grid dims. E.g.
+batched matmuls (`hl.dot(a[tb, tm, tk], b[tb, tk, tn], acc=acc)` with blocks
+`[1, 256, 256, 32]`), a 3D tensor times a matrix (an `einsum("bmk,kn->bmn", ...)`),
+NCHW activations (`[1, 1, 128, 256]`) and softmax over the last dim of `[B, H, S, D]`.
+A launch has three grid dims: a fourth leading dim with more than one tile becomes a
+loop in each workgroup.
+
 Kernels outside them raise `UnsupportedOperationError` before lowering (e.g. dynamic
 shapes, partial tiles, f32 matmuls, two matmuls in one grid loop, elementwise tiles of
-8 or 64-bit elements or with columns that are not a multiple of 16).
+8 or 64-bit elements or with columns that are not a multiple of 16, rank-3 tiles with a
+leading block size above 1, reductions over a dim other than the last).
 
 Elementwise kernels are not one of lighthouse's classes: the backend recognizes them
 (stores of one workgroup tile, no contraction or reduction) and anchors one
