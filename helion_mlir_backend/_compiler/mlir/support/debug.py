@@ -10,6 +10,9 @@ PIPELINES = ("opt", "scalar")
 """The CPU target's lighthouse pipelines."""
 TARGETS = ("auto", "cpu", "xpu")
 """``HELION_MLIR_TARGET`` values; ``auto`` follows the device."""
+XPU_STOP_POINTS = ("xegpu-wg", "xevm", "binary")
+"""Where the XPU lowering can stop: annotated XeGPU, LLVM/XeVM without a device
+binary, and the full lowering with the binary."""
 PIPELINE_CONFIG_KEY = "mlir_pipeline"
 """Config key naming the lighthouse pipeline (``opt``/``scalar``) of one config."""
 
@@ -25,6 +28,8 @@ class DebugOptions:
     dump_ir: bool
     dump_pre_lowering: bool
     dump_lowered: bool
+    dump_stages: bool
+    """The IR after each stage of a lowering built stage by stage (XPU)."""
 
     @classmethod
     def from_env(cls) -> DebugOptions:
@@ -33,6 +38,7 @@ class DebugOptions:
             dump_ir=_flag("HELION_MLIR_DUMP_IR"),
             dump_pre_lowering=_flag("HELION_MLIR_DUMP_PRE_LOWERING"),
             dump_lowered=_flag("HELION_MLIR_DUMP_LOWERED"),
+            dump_stages=_flag("HELION_MLIR_DUMP_STAGES"),
         )
 
 
@@ -53,6 +59,18 @@ def target_override() -> str | None:
     if target not in TARGETS:
         raise ValueError(f"HELION_MLIR_TARGET={target!r}; expected one of {TARGETS}")
     return None if target == "auto" else target
+
+
+def xpu_stop_at() -> str | None:
+    """``HELION_MLIR_XPU_STOP_AT`` (``xegpu-wg``, ``xevm`` or ``binary``): where
+    XPU lowerings that name no stop point stop; ``None`` (the full lowering) if
+    unset."""
+    stop_at = os.environ.get("HELION_MLIR_XPU_STOP_AT", "").strip() or None
+    if stop_at is not None and stop_at not in XPU_STOP_POINTS:
+        raise ValueError(
+            f"HELION_MLIR_XPU_STOP_AT={stop_at!r}; expected one of {XPU_STOP_POINTS}"
+        )
+    return stop_at
 
 
 def compile_timeout() -> float | None:

@@ -40,24 +40,72 @@ class MLIRTarget(abc.ABC):
     """``cpu`` or ``xpu``; also part of JIT and autotune cache keys."""
     pipelines: ClassVar[tuple[str, ...]]
     """The names of the target's lighthouse pipelines."""
+    stop_points: ClassVar[tuple[str, ...]] = ()
+    """The stages, in order, a lowering can stop after to inspect its IR; the last
+    is the full lowering. Empty: only full lowerings."""
 
     @abc.abstractmethod
     def default_pipeline(self) -> str:
         """The pipeline of configs that name none (may read the environment)."""
 
-    @abc.abstractmethod
-    def lowering(self, module: ir.Module, entry: str, pipeline: str) -> Lowering:
-        """The lowering of ``module`` with ``pipeline``, down to the LLVM dialect.
+    def resolve_pipeline(self, pipeline: str | None) -> str:
+        """``pipeline``, or the default one for ``None``; ``ValueError`` if the
+        target has no such pipeline (e.g. a config's CPU pipeline on the XPU)."""
+        if pipeline is None:
+            return self.default_pipeline()
+        if pipeline not in self.pipelines:
+            raise ValueError(
+                f"unknown pipeline {pipeline!r} for the MLIR target '{self.name}'; "
+                f"expected one of {self.pipelines}"
+            )
+        return pipeline
 
-        Called in ``module``'s context. Unknown pipelines raise ``ValueError``. The
-        result may be applied in a forked process: it must not need the threads of
-        the calling one.
+    def default_stop_at(self) -> str | None:
+        """Where lowerings that name no stop point stop (default: ``None``, the
+        full lowering; may read the environment)."""
+        return None
+
+    def check_stop_at(self, stop_at: str | None) -> None:
+        """Raise ``ValueError`` for a stop point the target has not."""
+        if stop_at is not None and stop_at not in self.stop_points:
+            expected = self.stop_points or "none"
+            raise ValueError(
+                f"unknown stop point {stop_at!r} for the MLIR target "
+                f"'{self.name}'; expected one of {expected}"
+            )
+
+    def is_full(self, stop_at: str | None) -> bool:
+        """Whether a lowering stopping at ``stop_at`` is complete (JIT-able)."""
+        return stop_at is None or stop_at == self.stop_points[-1]
+
+    @abc.abstractmethod
+    def lowering(
+        self,
+        module: ir.Module,
+        entry: str,
+        pipeline: str,
+        stop_at: str | None = None,
+    ) -> Lowering:
+        """The lowering of ``module`` with ``pipeline``, down to the LLVM dialect
+        or to the end of stage ``stop_at`` (one of :attr:`stop_points`).
+
+        Called in ``module``'s context. Unknown pipelines raise ``ValueError``; a
+        module the pipeline cannot compile may raise ``UnsupportedOperationError``.
+        The result may be applied in a forked process: it must not need the threads
+        of the calling one.
         """
 
-    def lower(self, module: ir.Module, entry: str, pipeline: str) -> ir.Module:
-        """``module`` lowered with ``pipeline``, in this process with no time limit."""
+    def lower(
+        self,
+        module: ir.Module,
+        entry: str,
+        pipeline: str,
+        stop_at: str | None = None,
+    ) -> ir.Module:
+        """``module`` lowered with ``pipeline`` (to ``stop_at``), in this process
+        with no time limit."""
         with module.context, ir.Location.unknown():
-            return self.lowering(module, entry, pipeline).apply(module)
+            return self.lowering(module, entry, pipeline, stop_at).apply(module)
 
     @abc.abstractmethod
     def runner(self, module: ir.Module) -> Runner:
@@ -87,9 +135,9 @@ class MLIRTarget(abc.ABC):
         compiles well, before a search (default: unchanged)."""
         return
 
-    def validate_environment(self) -> None:
-        """Raise if this process cannot compile and run kernels for the target
-        (default: it can)."""
+    def validate_environment(self, stop_at: str | None = None) -> None:
+        """Raise if this process cannot lower kernels for the target to
+        ``stop_at``, or for ``None`` compile and run them (default: it can)."""
         return
 
     def __repr__(self) -> str:

@@ -75,7 +75,14 @@ class CpuTarget(MLIRTarget):
     def default_pipeline(self) -> str:
         return default_pipeline()
 
-    def lowering(self, module: ir.Module, entry: str, pipeline: str) -> BackendDriver:
+    def lowering(
+        self,
+        module: ir.Module,
+        entry: str,
+        pipeline: str,
+        stop_at: str | None = None,
+    ) -> BackendDriver:
+        self.check_stop_at(stop_at)
         driver = BackendDriver(module, entry, result_to_args=False, benchmark=False)
         driver.add_stage(pipeline_descriptor(pipeline))
         return driver

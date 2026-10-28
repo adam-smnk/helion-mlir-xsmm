@@ -15,6 +15,7 @@ from .block_ids import block_id_from_key
 from .block_ids import symbol_origin_info
 from .errors import CompileTimeoutError
 from .errors import DynamicShapeError
+from .errors import LoweringStoppedError
 from .errors import MLIRBackendError
 from .errors import NodeLoweringError
 from .errors import ShapeError
@@ -32,6 +33,7 @@ __all__ = [
     "CompileTimeoutError",
     "DynamicShapeError",
     "IndexDescriptor",
+    "LoweringStoppedError",
     "MLIRBackendError",
     "NodeLoweringError",
     "ShapeError",

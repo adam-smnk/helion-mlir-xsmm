@@ -8,11 +8,19 @@ from __future__ import annotations
 
 from .api import compile_mlir as compile_mlir
 from .api import generate_mlir as generate_mlir
+from .api import lower_mlir as lower_mlir
 from .inject import install as install
 from .language import InlineMLIRHint as InlineMLIRHint
 from .language import inline_mlir as inline_mlir
 
-__all__ = ["InlineMLIRHint", "compile_mlir", "generate_mlir", "inline_mlir", "install"]
+__all__ = [
+    "InlineMLIRHint",
+    "compile_mlir",
+    "generate_mlir",
+    "inline_mlir",
+    "install",
+    "lower_mlir",
+]
 
 # Import-time side effect: make backend name "mlir" available in Helion.
 install()

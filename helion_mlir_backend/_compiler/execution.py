@@ -1,9 +1,10 @@
 """Lower a generated module with lighthouse and JIT its memref-ABI entry function.
 
 :func:`compile_entry` returns a :class:`CompiledEntry` that takes the entry's
-buffers in argument order. The device target (``targets/``) supplies the
-lighthouse lowering and the JIT runner. Failures keep their exception type and get
-a note naming the stage. Lighthouse lowering runs in a forked process, killed after
+buffers in argument order; :func:`lower_entry` only lowers, possibly to a stage
+before the end of the target's pipeline (IR tests). The device target
+(``targets/``) supplies the lighthouse lowering and the JIT runner. Failures keep
+their exception type and get a note naming the stage. Lighthouse lowering runs in a forked process, killed after
 the compile timeout; only the lowered module comes back. Compiled entries are
 cached in-process by module text, target and pipeline, so equal modules (e.g.
 configs that clamp to the same tiles) JIT once.
@@ -33,6 +34,7 @@ from helion_mlir_backend._compiler.mlir.in_place import update_carried_values_in
 from helion_mlir_backend._compiler.mlir.support.debug import DebugOptions
 from helion_mlir_backend._compiler.mlir.support.debug import compile_timeout
 from helion_mlir_backend._compiler.mlir.support.errors import CompileTimeoutError
+from helion_mlir_backend._compiler.mlir.support.errors import LoweringStoppedError
 from helion_mlir_backend._compiler.mlir.support.type_utils import mlir_dtype_to_torch
 from helion_mlir_backend._compiler.targets import resolve_target
 
@@ -187,23 +189,56 @@ def compile_entry(
     """Inline, lower and JIT-compile ``entry`` (consumes ``module``) for ``target``
     (default: :func:`resolve_target` for the CPU), or reuse the entry compiled from
     an identical module for the same target and pipeline. ``pipeline`` defaults to
-    the target's."""
+    the target's. A target whose lowerings stop early by default (e.g.
+    ``HELION_MLIR_XPU_STOP_AT``) lowers and raises :class:`LoweringStoppedError`."""
     if target is None:
         target = resolve_target()
-    if pipeline is None:
-        pipeline = target.default_pipeline()
+    pipeline = target.resolve_pipeline(pipeline)
     debug = DebugOptions.from_env()
-    if debug.dump_ir or debug.dump_pre_lowering or debug.dump_lowered:
-        return _compile_entry(module, entry, target, pipeline, debug)
+    stop_at = target.default_stop_at()
+    if (
+        debug.dump_ir
+        or debug.dump_pre_lowering
+        or debug.dump_lowered
+        or debug.dump_stages
+        or not target.is_full(stop_at)
+    ):
+        return _compile_entry(module, entry, target, pipeline, stop_at, debug)
     key = (hashlib.sha256(str(module).encode()).hexdigest(), target.name, pipeline)
     if (compiled := _JIT_CACHE.get(key)) is not None:
         _JIT_CACHE.move_to_end(key)
         return compiled
-    compiled = _compile_entry(module, entry, target, pipeline, debug)
+    compiled = _compile_entry(module, entry, target, pipeline, stop_at, debug)
     _JIT_CACHE[key] = compiled
     if len(_JIT_CACHE) > _JIT_CACHE_SIZE:
         _JIT_CACHE.popitem(last=False)
     return compiled
+
+
+def lower_entry(
+    module: ir.Module,
+    entry: str,
+    *,
+    target: MLIRTarget | None = None,
+    pipeline: str | None = None,
+    stop_at: str | None = None,
+) -> ir.Module:
+    """Inline and lower ``entry`` (consumes ``module``) for ``target`` (default:
+    the CPU) with ``pipeline`` (default: the target's), to the target's stage
+    ``stop_at`` (default: :meth:`MLIRTarget.default_stop_at`; ``None`` there: the
+    full lowering, the LLVM dialect on the CPU). Nothing is JIT-compiled."""
+    if target is None:
+        target = resolve_target()
+    pipeline = target.resolve_pipeline(pipeline)
+    if stop_at is None:
+        stop_at = target.default_stop_at()
+    target.check_stop_at(stop_at)
+    if stop_at is None and target.stop_points:
+        stop_at = target.stop_points[-1]
+    target.validate_environment(stop_at)
+    return _inline_and_lower(
+        module, entry, target, pipeline, stop_at, DebugOptions.from_env()
+    )
 
 
 def _compile_entry(
@@ -211,30 +246,52 @@ def _compile_entry(
     entry: str,
     target: MLIRTarget,
     pipeline: str,
+    stop_at: str | None,
     debug: DebugOptions,
 ) -> CompiledEntry:
-    target.validate_environment()
+    full = target.is_full(stop_at)
+    target.validate_environment(None if full else stop_at)
     args = entry_args(module, entry)
-    _dump_if(debug.dump_ir, "MLIR before inlining", module)
-    with _stage("inlining"):
-        inline_module(module)
-    _dump_if(debug.dump_pre_lowering, "MLIR before lighthouse lowering", module)
-    with _stage(f"lowering with the lighthouse '{pipeline}' pipeline"):
-        lowered = _lower(module, entry, target, pipeline)
-    _dump_if(debug.dump_lowered, "MLIR after lighthouse lowering", lowered)
+    lowered = _inline_and_lower(module, entry, target, pipeline, stop_at, debug)
+    if not full:
+        raise LoweringStoppedError(target.name, stop_at)
     with _stage("JIT compilation"):
         runner = target.runner(lowered)
     return CompiledEntry(entry, args, runner, target)
 
 
-def _lower(
-    module: ir.Module, entry: str, target: MLIRTarget, pipeline: str
+def _inline_and_lower(
+    module: ir.Module,
+    entry: str,
+    target: MLIRTarget,
+    pipeline: str,
+    stop_at: str | None,
+    debug: DebugOptions,
 ) -> ir.Module:
-    """Lower ``module`` with the target's lighthouse ``pipeline``, in a forked
-    process under the compile timeout: native passes cannot be interrupted, only
-    killed with their process. The lowering is built here and applied there."""
+    _dump_if(debug.dump_ir, "MLIR before inlining", module)
+    with _stage("inlining"):
+        inline_module(module)
+    _dump_if(debug.dump_pre_lowering, "MLIR before lighthouse lowering", module)
+    until = "" if target.is_full(stop_at) else f" up to '{stop_at}'"
+    with _stage(f"lowering with the lighthouse '{pipeline}' pipeline{until}"):
+        lowered = _lower(module, entry, target, pipeline, stop_at)
+    _dump_if(debug.dump_lowered, f"MLIR after lighthouse lowering{until}", lowered)
+    return lowered
+
+
+def _lower(
+    module: ir.Module,
+    entry: str,
+    target: MLIRTarget,
+    pipeline: str,
+    stop_at: str | None = None,
+) -> ir.Module:
+    """Lower ``module`` with the target's lighthouse ``pipeline`` (to ``stop_at``),
+    in a forked process under the compile timeout: native passes cannot be
+    interrupted, only killed with their process. The lowering is built here and
+    applied there."""
     with module.context, ir.Location.unknown():
-        lowering = target.lowering(module, entry, pipeline)
+        lowering = target.lowering(module, entry, pipeline, stop_at)
         timeout = compile_timeout()
         if timeout is None or "fork" not in multiprocessing.get_all_start_methods():
             return lowering.apply(module)

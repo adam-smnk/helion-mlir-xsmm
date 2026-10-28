@@ -145,9 +145,15 @@ def test_config_selects_the_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
     chosen: list[str] = []
     original = execution._lower
 
-    def record(module: object, entry: str, target: object, pipeline: str) -> object:
+    def record(
+        module: object,
+        entry: str,
+        target: object,
+        pipeline: str,
+        stop_at: str | None = None,
+    ) -> object:
         chosen.append(pipeline)
-        return original(module, entry, target, "scalar")
+        return original(module, entry, target, "scalar", stop_at)
 
     monkeypatch.setattr(execution, "_lower", record)
     monkeypatch.setattr(execution, "_JIT_CACHE", type(execution._JIT_CACHE)())

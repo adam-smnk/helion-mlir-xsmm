@@ -2,7 +2,8 @@
 
 External MLIR backend package for Helion.
 
-Currently, only CPU execution is supported.
+Currently, only CPU execution is supported. Intel XPU support is experimental and
+IR-only (see [XPU (experimental)](#xpu-experimental)).
 
 ## Usage
 
@@ -25,10 +26,43 @@ Controls tile sizes corresponding to each dimension passed `hl.tile` or call
 to `hl.register_block_size` in the kernel.
 
 Additional MLIR backend kernel (`helion.kernel(...)`) options:
-* **mlir\_pipeline** (`"opt"`, `"scalar"`):
+* **mlir\_pipeline** (`"opt"`, `"scalar"`, `"xegpu"`):
 Selects compilation pipeline:
   - `opt`: Optimizing pipeline (default). Vectorization, parallelization etc.
   - `scalar`: Scalar lowering. A simple serial fallback; mostly useful for debugging.
+  - `xegpu`: The XPU target's pipeline (its only one; CPU pipelines are rejected on the XPU).
+
+## XPU (experimental)
+
+Kernels on `xpu` tensors (or with `target="xpu"` / `HELION_MLIR_TARGET=xpu`) use the
+XPU target: lighthouse's XeGPU pipeline (`xegpu`, the only XPU pipeline), with
+Helion's grid loops as the workgroup tiles. Each top-level `hl.tile` loop becomes one
+kernel launch; the launches of a kernel (`hl.barrier()` phases included) run in
+program order on one stream. Runtime scalars stay on the host.
+
+Status: IR only. Without an XPU, kernels lower to annotated XeGPU (`xegpu-wg`) and to
+LLVM/XeVM without device binaries (`xevm`):
+
+```python
+import helion_mlir_backend
+
+ir = helion_mlir_backend.lower_mlir(kernel, args, target="xpu", stop_at="xegpu-wg")
+```
+
+`args` may be fake XPU tensors (`with FakeTensorMode(): torch.empty(..., device="xpu")`),
+meta tensors or CPU tensors. `lower_mlir` returns the lowered module without JIT
+compilation, for either target (on the CPU: the LLVM dialect).
+
+Supported for now: static shapes with block sizes dividing the sizes they tile, and
+grid loops with one matmul (f16/bf16 inputs, f32 accumulation, a K loop; epilogues
+and transposed operands included) or row reductions (e.g. softmax). Other kernels,
+e.g. elementwise-only ones, raise `UnsupportedOperationError`.
+
+Device binaries and execution need an LLVM built with the SPIR-V target and the Level
+Zero runtime (`-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=SPIRV -DMLIR_ENABLE_LEVELZERO_RUNNER=1`
+and Python bindings, at the commit of the pinned `mlir-python-bindings`), used through
+`PYTHONPATH=$LLVM_INSTALL_DIR/python_packages/mlir_core`, and a PyTorch with XPU
+support. The stock bindings cannot emit SPIR-V.
 
 ## Install
 
@@ -90,9 +124,11 @@ pre-commit run -a
 | `HELION_MLIR_COMPILE_TIMEOUT` | Bounds MLIR lowering of each kernel, in seconds (default `30`; `0` disables the limit) |
 | `HELION_MLIR_DUMP_IR` | Raw generated IR before inlining (shows `@_aten_*` helpers and tile loops) |
 | `HELION_MLIR_DUMP_PRE_LOWERING` | After inlining / all pre-passes, immediately before the lighthouse lowering schedule |
-| `HELION_MLIR_DUMP_LOWERED` | After lighthouse lowering (LLVM dialect, expanded memref descriptors) |
+| `HELION_MLIR_DUMP_LOWERED` | After lighthouse lowering (LLVM dialect, expanded memref descriptors; on the XPU, the IR at the stop point) |
+| `HELION_MLIR_DUMP_STAGES` | XPU: after each stage of the XeGPU pipeline |
 | `HELION_MLIR_PIPELINE=opt\|scalar` | Selects compilation pipeline (default: `opt`) |
-| `HELION_MLIR_TARGET=auto\|cpu\|xpu` | Selects the device target (default: `auto`, from the kernel's tensors; an explicit `target=` of `generate_mlir`/`compile_mlir` wins). `meta` tensors need a named target; `xpu` is reserved (not implemented yet) |
+| `HELION_MLIR_TARGET=auto\|cpu\|xpu` | Selects the device target (default: `auto`, from the kernel's tensors; an explicit `target=` of `generate_mlir`/`compile_mlir`/`lower_mlir` wins). `meta` tensors need a named target |
+| `HELION_MLIR_XPU_STOP_AT=xegpu-wg\|xevm\|binary` | XPU: where lowerings stop by default (default: `binary`, the full lowering). Kernel calls then fail after lowering (nothing to run); `lower_mlir` returns the IR |
 
 ## License
 

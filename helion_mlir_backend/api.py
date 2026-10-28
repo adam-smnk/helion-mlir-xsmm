@@ -61,6 +61,42 @@ def compile_mlir(
     return compile_kernel(hf, config, env, target=target, pipeline=pipeline)
 
 
+def lower_mlir(
+    kernel: object,
+    args: list[object],
+    *,
+    config: object | None = None,
+    target: str | None = None,
+    pipeline: str | None = None,
+    stop_at: str | None = None,
+) -> ir.Module:
+    """Generate, inline and lower a Helion kernel for ``args``' shapes and dtypes
+    without JIT-compiling it: the IR a call would run, or an earlier stage of it.
+
+    ``target`` and ``pipeline`` as for :func:`compile_mlir` (``pipeline``
+    defaults to the config's ``mlir_pipeline``, then the target's). ``stop_at`` is
+    a stage of the target's lowering: on the XPU ``"xegpu-wg"`` (annotated
+    XeGPU), ``"xevm"`` (LLVM/XeVM, no device binary) or ``"binary"``; default:
+    ``HELION_MLIR_XPU_STOP_AT`` on the XPU, else the full lowering (the LLVM
+    dialect on the CPU). Unsupported kernels raise ``UnsupportedOperationError``.
+    """
+    from helion._compiler.backend_registry import get_backend_class
+
+    from helion_mlir_backend._compiler.execution import lower_entry
+    from helion_mlir_backend._compiler.mlir.support.debug import PIPELINE_CONFIG_KEY
+    from helion_mlir_backend._compiler.targets import resolve_target
+
+    hf, config, env = _compile(kernel, args, config)
+    mlir_target = resolve_target(env.device, target)
+    if pipeline is None:
+        pipeline = config.get(PIPELINE_CONFIG_KEY)
+    with env:
+        module = get_backend_class("mlir")().generate_mlir(hf, config, env)
+    return lower_entry(
+        module, hf.name, target=mlir_target, pipeline=pipeline, stop_at=stop_at
+    )
+
+
 def _compile(
     kernel: object, args: list[object], config: object | None
 ) -> tuple[HostFunction, object, CompileEnvironment]:

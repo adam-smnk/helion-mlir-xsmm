@@ -8,8 +8,10 @@ from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import torch
+from torch._subclasses import FakeTensorMode
 
 from helion_mlir_backend import generate_mlir
+from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
 
 if TYPE_CHECKING:
@@ -35,6 +37,22 @@ def scalar_pipeline() -> contextlib.AbstractContextManager[None]:
 
 def opt_pipeline() -> contextlib.AbstractContextManager[None]:
     return use_pipeline("opt")
+
+
+_FAKE_MODE = FakeTensorMode()
+
+
+def xpu_tensor(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """A fake XPU tensor: generating and lowering XPU IR needs no XPU."""
+    with _FAKE_MODE:
+        return torch.empty(*shape, dtype=dtype, device="xpu")
+
+
+def lower_xpu(
+    kernel: helion.Kernel, args: list[object], stop_at: str = "xegpu-wg"
+) -> str:
+    """The IR of ``kernel`` for ``args`` lowered for the XPU to ``stop_at``."""
+    return str(lower_mlir(kernel, list(args), target="xpu", stop_at=stop_at))
 
 
 def execute_module(module: object, *tensors: torch.Tensor, kernel_name: str) -> object:

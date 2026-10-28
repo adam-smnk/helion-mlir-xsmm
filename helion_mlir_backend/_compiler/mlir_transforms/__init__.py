@@ -8,6 +8,7 @@ from .align_operand_rows import align_operand_rows
 from .dialect import HelionTransformDialect
 from .hoist_allocas import hoist_allocas
 from .legalize_for_llvm import legalize_for_llvm
+from .legalize_host_ops import legalize_host_ops
 from .loop_bounds import loop_bounds
 from .mark_operand_packs import OPERAND_PACK_ATTR_NAME
 from .mark_operand_packs import mark_operand_packs
@@ -31,6 +32,7 @@ __all__ = [
     "align_operand_rows",
     "hoist_allocas",
     "legalize_for_llvm",
+    "legalize_host_ops",
     "loop_bounds",
     "mark_operand_packs",
     "materialize_copies",

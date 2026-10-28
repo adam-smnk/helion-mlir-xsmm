@@ -13,17 +13,18 @@ from ..mlir.support.debug import target_override
 from ..mlir.support.errors import UnsupportedTargetError
 from .base import MLIRTarget
 from .cpu import CpuTarget
+from .xpu import XpuTarget
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     import torch
 
-__all__ = ["CpuTarget", "MLIRTarget", "get_target", "resolve_target"]
+__all__ = ["CpuTarget", "MLIRTarget", "XpuTarget", "get_target", "resolve_target"]
 
 _FACTORIES: dict[str, Callable[[], MLIRTarget] | None] = {
     "cpu": CpuTarget,
-    "xpu": None,  # Reserved: the XPU target is not implemented yet.
+    "xpu": XpuTarget,
 }
 _DEVICE_TARGETS = {"cpu": "cpu", "xpu": "xpu"}
 """The target of each ``torch.device`` type under ``auto``."""

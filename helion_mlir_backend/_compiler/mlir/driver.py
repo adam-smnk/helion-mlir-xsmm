@@ -150,6 +150,8 @@ def call_entry(
         else tensor.contiguous()
         for tensor, role in zip(tensors, roles, strict=True)
     ]
+    # Runtime scalars are 0-d CPU tensors on every target: the entry reads them
+    # on the host (an XPU kernel gets the value as an argument).
     scalars = [
         torch.tensor(value, dtype=arg.dtype)
         for arg, value in zip(entry.args, values, strict=True)
