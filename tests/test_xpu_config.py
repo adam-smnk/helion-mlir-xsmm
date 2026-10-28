@@ -29,6 +29,9 @@ from helion_mlir_backend._compiler.mlir.support import XeGPUConfigError
 from helion_mlir_backend._compiler.mlir_transforms.xegpu_elementwise import (
     elementwise_layout,
 )
+from helion_mlir_backend._compiler.mlir_transforms.xegpu_reduction import (
+    reduction_tiles,
+)
 from helion_mlir_backend._compiler.targets import get_target
 from helion_mlir_backend._compiler.targets import target_config_keys
 from helion_mlir_backend._compiler.targets.xpu_params import PARAMS_ATTR
@@ -99,6 +102,27 @@ def softmax(x: torch.Tensor) -> torch.Tensor:
         inv = 1.0 / total.sum(-1, keepdim=True)
         for tile_n in hl.tile(n, block_size=block_n):
             out[tile_m, tile_n] = torch.exp(x[tile_m, tile_n] - row_top) * inv
+    return out
+
+
+@_kernel
+def softmax_in_f32(x: torch.Tensor) -> torch.Tensor:
+    """Row softmax of any float type, computed in f32."""
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        top = hl.full([tile_m, block_n], float("-inf"), dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            top = torch.maximum(top, x[tile_m, tile_n].to(torch.float32))
+        row_top = torch.amax(top, dim=-1, keepdim=True)
+        total = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            total = total + torch.exp(x[tile_m, tile_n].to(torch.float32) - row_top)
+        inv = 1.0 / total.sum(-1, keepdim=True)
+        for tile_n in hl.tile(n, block_size=block_n):
+            v = torch.exp(x[tile_m, tile_n].to(torch.float32) - row_top) * inv
+            out[tile_m, tile_n] = v.to(x.dtype)
     return out
 
 
@@ -201,6 +225,11 @@ def _check_xevm(text: str, launches: int) -> None:
     assert "xegpu." not in text
     assert "llvm.func spir_funccc" in text
     assert text.count("gpu.launch_func") == launches
+
+
+def _block_reads(text: str) -> set[str]:
+    """The 2D block reads of lowered device code, as ``<bits>b_<rows>r<cols>``."""
+    return set(re.findall(r"intel_sub_group_2d_block_read_(\d+b_\d+r\d+)x", text))
 
 
 DEFAULT_GEMM = {
@@ -358,6 +387,105 @@ def test_reduction_subgroup_rows(stop_at: str, rows: int | None, threads: int) -
 
 
 @pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("dtype", "xegpu", "rows", "load_tile", "reads"),
+    [
+        (torch.float32, {}, 8, [8, 16], {"32b_8r16"}),
+        (torch.float32, {"xegpu_sg_tiles": [[32, 0]]}, 32, [32, 16], {"32b_32r16"}),
+        (
+            torch.float32,
+            {"xegpu_sg_tiles": [[32, 0]], "xegpu_load_tiles": [[16, 16]]},
+            32,
+            [16, 16],
+            {"32b_16r16"},
+        ),
+        (
+            torch.float32,
+            {"xegpu_sg_tiles": [[32, 0]], "xegpu_load_tiles": [[32, 16]]},
+            32,
+            [32, 16],
+            {"32b_32r16"},
+        ),
+        (torch.bfloat16, {}, 8, [8, 32], {"16b_8r32"}),
+        (
+            torch.bfloat16,
+            {"xegpu_sg_tiles": [[32, 0]], "xegpu_load_tiles": [[32, 16]]},
+            32,
+            [32, 16],
+            {"16b_32r16"},
+        ),
+    ],
+    ids=[
+        "f32-inferred",
+        "f32-sg32",
+        "f32-sg32-load-16x16",
+        "f32-sg32-load-32x16",
+        "bf16-inferred",
+        "bf16-sg32-load-32x16",
+    ],
+)
+def test_reduction_load_tiles(
+    dtype: torch.dtype,
+    xegpu: dict[str, object],
+    rows: int,
+    load_tile: list[int],
+    reads: set[str],
+) -> None:
+    """A reduction's tile loads take its subgroup layout and a 2D block load
+    tile (inferred: the largest dividing the subgroup tile); its tile stores
+    the 2D block store tile."""
+    args = [xpu_tensor(4096, 4096, dtype=dtype)]
+    text = _lower(softmax_in_f32, args, SOFTMAX_BLOCKS, **xegpu)
+    (kernel,) = _kernels(text).values()
+    sg_layout, sg_data = [64 // rows, 1], [rows, 64]
+    assert _op_layouts(kernel, "xegpu.load_nd") == {
+        _layout(sg_layout, sg_data, load_tile)
+    }
+    assert _op_layouts(kernel, "xegpu.store_nd") == {
+        _layout(sg_layout, sg_data, [8, 16])
+    }
+    lowered = _lower(softmax_in_f32, args, SOFTMAX_BLOCKS, "xevm", **xegpu)
+    _check_xevm(lowered, 1)
+    assert _block_reads(lowered) == reads
+
+
+@pytest.mark.parametrize(
+    ("sg_data", "bits", "load_tile", "expected"),
+    [
+        ((8, 64), (32,), None, ((8, 16), (8, 16))),
+        ((32, 64), (32,), None, ((32, 16), (8, 16))),
+        ((64, 64), (32,), None, ((32, 16), (8, 16))),
+        ((8, 64), (16,), None, ((8, 32), (8, 16))),
+        ((8, 16), (16,), None, ((8, 16), (8, 16))),
+        ((2, 64), (32,), None, ((2, 16), (2, 16))),
+        ((32, 64), (16,), (16, 16), ((16, 16), (8, 16))),
+    ],
+)
+def test_reduction_tile_inference(
+    sg_data: tuple[int, int],
+    bits: tuple[int, ...],
+    load_tile: tuple[int, int] | None,
+    expected: tuple[tuple[int, int], tuple[int, int]],
+) -> None:
+    assert reduction_tiles(sg_data, bits, load_tile) == expected
+
+
+@pytest.mark.parametrize(
+    ("sg_data", "bits", "match"),
+    [
+        ((8, 24), (32,), r"has 24 columns, not a multiple of 16"),
+        ((8, 64), (8,), r"8-bit elements"),
+        ((8, 0, 64), (32,), r"3D subgroup tile"),
+    ],
+)
+def test_reduction_tile_limits(
+    sg_data: tuple[int, ...], bits: tuple[int, ...], match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        reduction_tiles(sg_data, bits)
+
+
+@pytest.mark.isolated
 @pytest.mark.parametrize("stop_at", ["xegpu-wg", "xevm"])
 @pytest.mark.parametrize("forced", [False, True])
 def test_kernels_of_different_classes(stop_at: str, forced: bool) -> None:
@@ -495,15 +623,53 @@ def test_transposed_operands_follow_lighthouse_constraints() -> None:
 @pytest.mark.parametrize(
     ("xegpu", "match"),
     [
-        ({"xegpu_load_tiles": [[8, 16, 16, 16]]}, r"apply to GEMM kernels only"),
+        (
+            {"xegpu_prefetch_tiles": [[8, 16, 16, 16]]},
+            r"xegpu_prefetch_tiles apply to GEMM kernels only",
+        ),
+        (
+            {"xegpu_prefetch_depths": [[1, 1]]},
+            r"xegpu_prefetch_depths apply to GEMM kernels only",
+        ),
         ({"xegpu_sg_tiles": [[8, 8]]}, r"is \[rows, 0\] with rows > 0"),
         ({"xegpu_sg_tiles": [[48, 0]]}, r"48 rows do not divide the workgroup's 64"),
+        (
+            {"xegpu_load_tiles": [[8, 16, 16, 16]]},
+            r"the load tile of a reduction kernel is \[m, n\]",
+        ),
+        (
+            {"xegpu_load_tiles": [[16, 16]]},
+            r"load tile \[16, 16\] does not divide the subgroup tile \[8, 64\]",
+        ),
+        (
+            {"xegpu_sg_tiles": [[32, 0]], "xegpu_load_tiles": [[32, 32]]},
+            r"load tile \[32, 32\]: 2D block loads of 32-bit .* cols in \[16\]",
+        ),
+        (
+            {"xegpu_sg_tiles": [[64, 0]], "xegpu_load_tiles": [[64, 16]]},
+            r"load tile \[64, 16\]: .* rows in \[1, 2, 4, 8, 16, 32\]",
+        ),
+        (
+            {"xegpu_sg_tiles": [[16, 0]], "xegpu_load_tiles": [[12, 16]]},
+            r"load tile \[12, 16\]: .* rows in \[1, 2, 4, 8, 16, 32\]",
+        ),
     ],
-    ids=["load-tiles", "two-dims", "not-dividing"],
+    ids=[
+        "prefetch-tiles",
+        "prefetch-depths",
+        "two-dims",
+        "not-dividing",
+        "load-arity",
+        "load-rows-not-dividing",
+        "f32-load-cols",
+        "load-rows-too-many",
+        "load-rows-not-power-of-two",
+    ],
 )
 def test_invalid_reduction_parameters(xegpu: dict[str, object], match: str) -> None:
-    with pytest.raises(XeGPUConfigError, match=match):
+    with pytest.raises(XeGPUConfigError, match=match) as info:
         _lower(softmax, [xpu_tensor(4096, 4096)], SOFTMAX_BLOCKS, **xegpu)
+    assert "reduction of 64 rows per workgroup" in str(info.value)
 
 
 # --- Elementwise kernels ---------------------------------------------------------

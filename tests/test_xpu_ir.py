@@ -531,11 +531,16 @@ def test_elementwise_1d_tiles_gather_and_scatter() -> None:
 )
 def test_row_reduction_results(name: str, layout: str) -> None:
     """Row results are stored with scatter stores, anchored with the reduction's
-    layout; a ``keepdim`` column needs no temporary buffer."""
+    layout (no ``inst_data``: a ``keepdim`` column's fails in XeVM); a
+    ``keepdim`` column needs no temporary buffer. The reduced tiles' loads are
+    anchored too."""
     kernel = {"row_sums": row_sums, "row_maxima": row_maxima}[name]
     args = [xpu_tensor(4096, 8192)]
     text = lower_xpu(kernel, args)
     assert _layouts(text, "xegpu.store") == [layout]
+    assert _layouts(text, "xegpu.load_nd") == [
+        "#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 64], inst_data = [8, 16]>"
+    ]
     assert "xegpu.store_nd" not in text and "gpu.alloc" not in text
     assert "known_block_size = array<i32: 128, 1, 1>" in text
     _check_xevm(lower_xpu(kernel, args, "xevm"), name, 1)

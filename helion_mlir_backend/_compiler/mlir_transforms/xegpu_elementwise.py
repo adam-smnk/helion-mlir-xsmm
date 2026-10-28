@@ -215,14 +215,43 @@ def elementwise_layout(
                 "per gather"
             )
         return ElementwiseLayout(wg_tile, sg_tile, store_tile, store_tile)
+    store_tile = block_store_tile(sg_tile)
+    load_tile = block_load_tile(sg_tile, load_bits, load_tile)
+    return ElementwiseLayout(wg_tile, sg_tile, load_tile, store_tile)
+
+
+def block_store_tile(sg_tile: Sequence[int]) -> tuple[int, int]:
+    """The 2D block store tile (``inst_data``) of a subgroup tile ``sg_tile``
+    whose columns are a multiple of 16: the largest ``[rows <= 8, 16]``
+    dividing it."""
     rows = _largest_dividing(STORE_ROWS, sg_tile[0])
     assert rows is not None
-    store_tile = (rows, BLOCK_COLS)
+    return (rows, BLOCK_COLS)
+
+
+def block_load_tile(
+    sg_tile: Sequence[int],
+    load_bits: Sequence[int],
+    load_tile: Sequence[int] | None = None,
+) -> tuple[int, int]:
+    """The 2D block load tile (``inst_data``) of a subgroup tile ``sg_tile`` of
+    ``load_bits``-bit elements; a forced ``load_tile`` is checked, a missing one
+    inferred.
+
+    ``[rows, cols]``, dividing ``sg_tile``: rows a power of two of at most 32,
+    16 or 32 columns (16 when 32-bit elements are loaded: rows of at most
+    :data:`LOAD_ROW_BYTES`); inferred: the largest. Raises ``ValueError`` naming
+    the violated constraint (also when no such tile divides ``sg_tile``).
+    """
     cols = load_cols(load_bits)
     if load_tile is None:
         load_rows = _largest_dividing(LOAD_ROWS, sg_tile[0])
         load_cols_ = _largest_dividing(cols, sg_tile[1])
-        assert load_rows is not None and load_cols_ is not None
+        if load_rows is None or load_cols_ is None:
+            raise ValueError(
+                f"no 2D block load of {max(load_bits, default=16)}-bit elements "
+                f"divides the subgroup tile {list(sg_tile)}"
+            )
         load_tile = (load_rows, load_cols_)
     load_tile = tuple(load_tile)
     if len(load_tile) != 2 or load_tile[0] not in LOAD_ROWS or load_tile[1] not in cols:
@@ -236,7 +265,7 @@ def elementwise_layout(
             f"load tile {list(load_tile)} does not divide the subgroup tile "
             f"{list(sg_tile)}"
         )
-    return ElementwiseLayout(wg_tile, sg_tile, load_tile, store_tile)
+    return load_tile
 
 
 # --- The kernel's tiles in the IR ----------------------------------------------

@@ -247,7 +247,7 @@ def _elementwise_layout(
     """``infer_xegpu_elementwise_layout`` of ``target`` with ``kernel``'s forced
     subgroup and load tiles."""
     return ht.infer_xegpu_elementwise_layout(
-        target, sg_tile=kernel.sg_tile, load_tile=kernel.elementwise_load_tile()
+        target, sg_tile=kernel.sg_tile, load_tile=kernel.block_load_tile()
     )
 
 
@@ -312,12 +312,14 @@ def _annotate_kernel(gpu_func: ir.Value, kernel: KernelParams) -> None:
         anchor_op = transform_ext.extract_handle(anchor_op, 0, silenceable=True)
         annotate_reduction(scope, anchor_op, force_sg_tile=sg_tile)
         annotate_row_result_stores(scope, anchor_op, sg_tile)
+        annotate_reduction_tiles(scope, anchor_op, kernel)
         transform.yield_([scope])
     with alternatives.region(3) as scope:
         # A reduction storing only its row results (no 2D tile store).
         anchor_op = lh_transform.match_op(scope, "vector.multi_reduction")
         anchor_op = transform_ext.extract_handle(anchor_op, 0, silenceable=True)
         annotate_row_result_stores(scope, anchor_op, sg_tile, require=True)
+        annotate_reduction_tiles(scope, anchor_op, kernel)
         transform.yield_([scope])
     with alternatives.region(4) as scope:
         annotate_elementwise(scope, kernel)
@@ -342,10 +344,7 @@ def annotate_row_result_stores(
     vectors as its slice over the reduced dim, ``[rows, 1]`` columns with one
     column per subgroup. Lighthouse's 2D reductions only (``[rows, 0]``
     subgroup tiles). With ``require``, fails silenceably without such stores."""
-    wg_tile, sg, reduction_tile = transform_ext.infer_xegpu_reduction_params(
-        anchor_op, force_sg_tile=list(sg_tile) if sg_tile is not None else None
-    )
-    sg_layout, sg_data = transform_ext.compute_sg_layout(wg_tile, sg, reduction_tile)
+    sg_layout, sg_data = _reduction_layout(anchor_op, sg_tile)
     stores = ht.match_row_result_stores(gpu_func, anchor_op, require=require)
     xegpu.set_anchor_layout(
         stores.sliced, sg_layout=sg_layout, sg_data=sg_data, slice_dims=[1]
@@ -353,6 +352,40 @@ def annotate_row_result_stores(
     xegpu.set_anchor_layout(
         stores.keepdim, sg_layout=sg_layout, sg_data=[sg_data[0], 1]
     )
+
+
+def annotate_reduction_tiles(
+    gpu_func: ir.Value, anchor_op: ir.Value, kernel: KernelParams
+) -> None:
+    """Anchor the tile loads (and prefetches) and stores of the reduction
+    ``anchor_op``'s source tile shape (``infer_xegpu_reduction_tiles``) with
+    lighthouse's reduction layout and their per-instruction tiles: the 2D block
+    load tile (``kernel``'s forced one, else the largest fitting) on loads, the
+    2D block store tile on stores. Lighthouse sets no ``inst_data``, and the
+    loads would lower to one-row block reads. Lighthouse's 2D reductions only
+    (``[rows, 0]`` subgroup tiles)."""
+    sg_layout, sg_data = _reduction_layout(anchor_op, kernel.sg_tile)
+    tiles = ht.infer_xegpu_reduction_tiles(
+        gpu_func, anchor_op, sg_data, load_tile=kernel.block_load_tile()
+    )
+    for ops, inst_data in (
+        (tiles.loads, tiles.load_tile),
+        (tiles.stores, tiles.store_tile),
+    ):
+        xegpu.set_anchor_layout(
+            ops, sg_layout=sg_layout, sg_data=sg_data, inst_data=inst_data
+        )
+
+
+def _reduction_layout(
+    anchor_op: ir.Value, sg_tile: Sequence[int] | None
+) -> tuple[list[ir.Value], list[ir.Value]]:
+    """Lighthouse's ``sg_layout`` and ``sg_data`` params (one per dim) of the
+    reduction ``anchor_op`` (as ``annotate_reduction`` computes them)."""
+    wg_tile, sg, reduction_tile = transform_ext.infer_xegpu_reduction_params(
+        anchor_op, force_sg_tile=list(sg_tile) if sg_tile is not None else None
+    )
+    return transform_ext.compute_sg_layout(wg_tile, sg, reduction_tile)
 
 
 def annotate_elementwise(gpu_func: ir.Value, kernel: KernelParams) -> None:

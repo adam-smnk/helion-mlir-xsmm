@@ -87,6 +87,14 @@ the workgroup tile (the block sizes) and the element types:
   32 rows and 32 (16-bit) or 16 (32-bit) columns;
 - store tile: the largest 2D block store dividing it, `[rows <= 8, 16]`.
 
+Row reductions take lighthouse's layout (subgroups of 8 rows of the reduced tile,
+`[rows, 0]` forced). Lighthouse sets no per-instruction tiles, so the backend also
+anchors the tiles the reduction loads (and its 2D tile stores) with that layout and,
+by the rules above for the subgroup tile `[rows, block_n]`, the largest 2D block load
+and store tiles: `[8, 16]` for f32 (8-row block reads rather than one row each),
+`[8, 32]` for bf16. Stores of the row results themselves (scatter stores) get no
+per-instruction tile.
+
 `AI-bench`'s KernelBench level 1 problems lower to `xevm` at the `mlir-gpu-bench`
 shapes (`tests/test_xpu_kernelbench.py`, kernels and block sizes in
 `tests/kernelbench_xpu.py`): the matmuls 1, 2, 6, 7, 9, 13, 16, 17 and 18 (bf16), the
@@ -104,7 +112,7 @@ keeps lighthouse's inference.
 | Key | Entry | Applies to |
 |-----|-------|------------|
 | `xegpu_sg_tiles` | `[sg_m, sg_n]` subgroup tile (`threads` = 16 x subgroups); `[rows, 0]` for a row reduction | GEMM, reduction, 2D elementwise kernels |
-| `xegpu_load_tiles` | `[a_m, a_k, b_k, b_n]`: A and B tiles loaded per instruction; `[m, n]`: the tile an elementwise kernel loads per instruction | GEMM, 2D elementwise kernels |
+| `xegpu_load_tiles` | `[a_m, a_k, b_k, b_n]`: A and B tiles loaded per instruction; `[m, n]`: the tile an elementwise kernel, or a row reduction (of the tiles it reduces), loads per instruction | GEMM, reduction, 2D elementwise kernels |
 | `xegpu_prefetch_tiles` | `[a_m, a_k, b_k, b_n]`: A and B prefetch tiles, in the operand's stored orientation (`[n, k]` for a transposed B) | GEMM kernels |
 | `xegpu_prefetch_depths` | `[a_nb, b_nb]`: K iterations A and B are prefetched ahead | GEMM kernels |
 
@@ -119,8 +127,9 @@ config = helion.Config(
 
 Before lowering, forced parameters are checked against each kernel's shapes with
 lighthouse's XeGPU constraints (`matmul_constraints`, the cost model's register and
-DPAS limits; for elementwise kernels the limits of the inference above, and the
-prefetch keys are rejected: GEMM only); invalid ones, malformed entries and lists longer than the number of
+DPAS limits; for elementwise and reduction kernels the limits of the inference
+above, e.g. a reduction's load tile rows divide its subgroup rows and f32 loads take
+16 columns; the prefetch keys are rejected: GEMM only); invalid ones, malformed entries and lists longer than the number of
 kernels raise `XeGPUConfigError` (an `MLIRBackendError`, so the autotuner skips the
 config). The CPU target ignores the `xegpu_*` keys, so one config can serve both
 devices. The autotuner does not search them yet; on the XPU it searches matmul tiles

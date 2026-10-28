@@ -61,11 +61,22 @@ def _check_elementwise(text: str) -> None:
 
 def _check_reduction(text: str) -> None:
     assert "vector.multi_reduction" in text
-    assert "xegpu.load_nd" in text and "xegpu.store_nd" in text
-    # Lighthouse's reduction layout: 8 subgroups of 8 rows.
-    stores = _anchor_layouts(text, "xegpu.store_nd")
-    assert any("sg_layout = [8, 1]" in store for store in stores)
+    # Lighthouse's reduction layout (8 subgroups of 8 rows of the 64x64 f32
+    # tiles), with 8x16 block loads and stores.
+    tile = "sg_layout = [8, 1], sg_data = [8, 64]"
+    loads = _anchor_layouts(text, "xegpu.load_nd")
+    assert len(loads) >= 2
+    assert set(loads) == {f"{tile}, inst_data = [8, 16]"}
+    assert _anchor_layouts(text, "xegpu.store_nd") == [f"{tile}, inst_data = [8, 16]"]
     assert "known_block_size = array<i32: 128, 1, 1>" in text
+
+
+def _block_read_rows(lowered: str) -> set[int]:
+    """The rows of the 32-bit 16-column 2D block reads of lowered device code."""
+    return {
+        int(rows)
+        for rows in re.findall(r"intel_sub_group_2d_block_read_32b_(\d+)r16x", lowered)
+    }
 
 
 _CHECKS = {
@@ -88,3 +99,6 @@ def test_kernelbench_problem_lowers_for_xpu(name: str) -> None:
     assert re.search(r"gpu\.launch_func <%\w+ : !llvm\.ptr>", lowered)
     # No math on bf16 left for the device (no such OpenCL builtins).
     assert not re.search(r"llvm\.func @_Z\w+\([^)]*bf16", lowered)
+    if problem.kind == "reduction":
+        # The anchored loads: 8-row block reads, not one row each.
+        assert _block_read_rows(lowered) == {8}

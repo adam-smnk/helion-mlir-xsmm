@@ -9,8 +9,9 @@ shorter list -- leaves the parameter to lighthouse's inference:
   elementwise kernel; ``[rows, 0]`` of a (2D, row) reduction kernel.
 - ``xegpu_load_tiles``: ``[a_m, a_k, b_k, b_n]``, the A and B tiles a GEMM
   kernel's subgroups load per instruction (``inst_data`` of the loads);
-  ``[m, n]``, the tile a 2D elementwise kernel's subgroups load per instruction
-  (its stores take the largest 2D block store dividing the subgroup tile).
+  ``[m, n]``, the tile a 2D elementwise or (2D, row) reduction kernel's
+  subgroups load per instruction (a reduction: of the tiles it reduces; the
+  stores take the largest 2D block store dividing the subgroup tile).
 - ``xegpu_prefetch_tiles``: ``[a_m, a_k, b_k, b_n]``, the A and B tiles a GEMM
   kernel's subgroups prefetch, in the orientation the operand is stored in (a
   transposed B prefetches ``[n, k]`` tiles).
@@ -22,14 +23,17 @@ block sizes (the grid tiles and the inner K tile), which lighthouse reads off
 the IR. Elementwise kernels (no lighthouse class) infer their parameters from
 the workgroup tile and element types
 (``mlir_transforms.xegpu_elementwise.elementwise_layout``); 1D ones take no
-parameters.
+parameters. Reduction kernels take lighthouse's subgroup tile and infer their
+load tile the same way from it
+(``mlir_transforms.xegpu_reduction.reduction_tiles``).
 
 :func:`xegpu_params` reads the config; :func:`attach_params` records the result
 on the generated module (so modules compiled with different parameters differ,
 also as JIT cache keys) and :func:`take_params` reads it back for lowering.
 :func:`check_params` validates parameters against the kernels' shapes with
-lighthouse's ``matmul_constraints`` (elementwise kernels: the hardware limits
-of ``elementwise_layout``) before lowering.
+lighthouse's ``matmul_constraints`` (elementwise and reduction kernels: the
+hardware limits of ``elementwise_layout`` and ``reduction_tiles``) before
+lowering.
 """
 
 from __future__ import annotations
@@ -48,6 +52,7 @@ from mlir.dialects import linalg
 from ..mlir.support.errors import XeGPUConfigError
 from ..mlir_transforms.xegpu_elementwise import ElementwiseLayout
 from ..mlir_transforms.xegpu_elementwise import elementwise_layout
+from ..mlir_transforms.xegpu_reduction import reduction_tiles
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -59,7 +64,7 @@ PREFETCH_TILES = "xegpu_prefetch_tiles"
 PREFETCH_DEPTHS = "xegpu_prefetch_depths"
 _ARITY = {SG_TILES: 2, LOAD_TILES: 4, PREFETCH_TILES: 4, PREFETCH_DEPTHS: 2}
 _ELEMENTWISE_ARITY = {LOAD_TILES: 2}
-"""Entries of a different length for elementwise kernels."""
+"""Entries of a different length for elementwise and reduction kernels."""
 XEGPU_CONFIG_KEYS = frozenset(_ARITY)
 """The config keys of the XPU target's lowering."""
 _FIELDS = {
@@ -70,7 +75,7 @@ _FIELDS = {
 }
 PARAMS_ATTR = "helion.xegpu_params"
 """Module attribute holding the parameters: one dictionary per kernel."""
-_GEMM_ONLY = (LOAD_TILES, PREFETCH_TILES, PREFETCH_DEPTHS)
+_GEMM_ONLY = (PREFETCH_TILES, PREFETCH_DEPTHS)
 
 
 @dataclass(frozen=True)
@@ -103,8 +108,9 @@ class KernelParams:
             options["prefetch_a_nb"], options["prefetch_b_nb"] = self.prefetch_depths
         return options
 
-    def elementwise_load_tile(self) -> tuple[int, ...] | None:
-        """The forced load tile of an elementwise kernel (a 2-entry load tile)."""
+    def block_load_tile(self) -> tuple[int, ...] | None:
+        """The forced load tile of an elementwise or reduction kernel (a
+        2-entry load tile)."""
         if self.load_tiles is not None and len(self.load_tiles) == 2:
             return self.load_tiles
         return None
@@ -151,7 +157,7 @@ def _entry(key: str, index: int, item: object) -> tuple[int, ...] | None:
         )
     ):
         elementwise = (
-            f" ({_ELEMENTWISE_ARITY[key]} for an elementwise kernel)"
+            f" ({_ELEMENTWISE_ARITY[key]} for an elementwise or reduction kernel)"
             if key in _ELEMENTWISE_ARITY
             else ""
         )
@@ -236,6 +242,10 @@ class ReductionShape:
 
     rows: int | None
     """The rows a workgroup reduces (2D row reductions), else ``None``."""
+    cols: int | None = None
+    """The columns of the tiles it reduces (2D row reductions), else ``None``."""
+    load_bits: tuple[int, ...] = ()
+    """The element sizes of the ``[rows, cols]`` tiles the kernel loads."""
 
     def __str__(self) -> str:
         rows = "" if self.rows is None else f" of {self.rows} rows per workgroup"
@@ -295,7 +305,7 @@ def kernel_shape(loop: ir.Operation) -> KernelShape | None:
             first_reduction = (op, affine_maps)
     if first_reduction is None:
         return _elementwise_shape(loop)
-    return _reduction_shape(*first_reduction)
+    return _reduction_shape(loop, *first_reduction)
 
 
 def _elementwise_shape(loop: ir.Operation) -> ElementwiseShape | None:
@@ -401,13 +411,27 @@ def _reduced_dims(op: ir.Operation, maps: list[ir.AffineMap]) -> list[int]:
     return [dim for dim in range(maps[0].n_dims) if dim not in indexed]
 
 
-def _reduction_shape(op: ir.Operation, maps: list[ir.AffineMap]) -> ReductionShape:
+def _reduction_shape(
+    loop: ir.Operation, op: ir.Operation, maps: list[ir.AffineMap]
+) -> ReductionShape:
+    """The reduction ``op`` of the grid loop ``loop``: for a 2D row reduction,
+    its ``[rows, cols]`` tile and the element sizes of the slices of that shape
+    the loop loads (else of the reduced operand)."""
     reduced = _reduced_dims(op, maps)
     parallel = [dim for dim in range(maps[0].n_dims) if dim not in reduced]
     sizes = _loop_sizes(op, maps)
-    if len(parallel) == 1 and len(reduced) == 1:
-        return ReductionShape(sizes.get(parallel[0]))
-    return ReductionShape(None)
+    if len(parallel) != 1 or len(reduced) != 1:
+        return ReductionShape(None)
+    rows, cols = sizes.get(parallel[0]), sizes.get(reduced[0])
+    loaded = [
+        nested.results[0]
+        for nested in _walk(loop)
+        if nested.name == "tensor.extract_slice"
+        and tuple(ir.ShapedType(nested.results[0].type).shape) == (rows, cols)
+    ] or list(op.operands[:1])
+    return ReductionShape(
+        rows, cols, tuple(sorted({_bit_width(value) for value in loaded}))
+    )
 
 
 # --- Validation ------------------------------------------------------------------
@@ -520,27 +544,42 @@ def _selected_sg_tile(
     return params["sg_m"], params["sg_n"]
 
 
+_REDUCTION_SG_ROWS = 8
+"""The rows of lighthouse's inferred reduction subgroup tile
+(``infer_xegpu_reduction_params``)."""
+
+
 def _check_reduction(
     kernel: KernelParams, shape: ReductionShape, specs: XeGPUSpecs
 ) -> None:
     gemm_only = [key for key in _GEMM_ONLY if key in kernel.forced()]
     if gemm_only:
         raise ValueError(f"{', '.join(gemm_only)} apply to GEMM kernels only")
-    sg_tile = kernel.sg_tile
-    if sg_tile is None:
-        return
+    load_tile = kernel.load_tiles
+    if load_tile is not None and len(load_tile) != 2:
+        raise ValueError("the load tile of a reduction kernel is [m, n]")
     if shape.rows is None:
-        raise ValueError("forced subgroup tiles need a 2D row reduction")
-    rows, cols = sg_tile
-    if cols != 0 or rows == 0:
-        raise ValueError("the subgroup tile of a reduction is [rows, 0] with rows > 0")
-    if shape.rows % rows:
-        raise ValueError(f"{rows} rows do not divide the workgroup's {shape.rows}")
-    if shape.rows // rows > specs.max_nb_threads:
-        raise ValueError(
-            f"{shape.rows // rows} subgroups exceed the maximum of "
-            f"{specs.max_nb_threads}"
-        )
+        raise ValueError("forced parameters need a 2D row reduction")
+    rows = _REDUCTION_SG_ROWS
+    if kernel.sg_tile is not None:
+        rows, cols = kernel.sg_tile
+        if cols != 0 or rows == 0:
+            raise ValueError(
+                "the subgroup tile of a reduction is [rows, 0] with rows > 0"
+            )
+        if shape.rows % rows:
+            raise ValueError(f"{rows} rows do not divide the workgroup's {shape.rows}")
+        if shape.rows // rows > specs.max_nb_threads:
+            raise ValueError(
+                f"{shape.rows // rows} subgroups exceed the maximum of "
+                f"{specs.max_nb_threads}"
+            )
+    if load_tile is not None:
+        if shape.cols is None:
+            raise ValueError("the reduced tile's columns are unknown")
+        # The subgroup tile lighthouse lays the reduced tile out in: its rows,
+        # all columns.
+        reduction_tiles((rows, shape.cols), shape.load_bits, load_tile)
 
 
 def _check_elementwise(kernel: KernelParams, shape: ElementwiseShape) -> None:
@@ -556,4 +595,4 @@ def _check_elementwise(kernel: KernelParams, shape: ElementwiseShape) -> None:
         raise ValueError("the load tile of an elementwise kernel is [m, n]")
     if shape.wg_tile is not None and len(shape.wg_tile) == 1:
         raise ValueError("1D elementwise kernels take no parameters (inferred only)")
-    shape.layout(sg_tile=kernel.sg_tile, load_tile=kernel.elementwise_load_tile())
+    shape.layout(sg_tile=kernel.sg_tile, load_tile=kernel.block_load_tile())

@@ -28,6 +28,7 @@ from .version_padded_operands import version_padded_operands
 from .widen_transposes import widen_transposes
 from .xegpu_elementwise import InferXeGPUElementwiseLayoutOp
 from .xegpu_elementwise import infer_xegpu_elementwise_layout
+from .xegpu_reduction import infer_xegpu_reduction_tiles
 from .xegpu_reduction import match_row_result_stores
 
 __all__ = [
@@ -38,6 +39,7 @@ __all__ = [
     "hoist_allocas",
     "hoist_invariant_scalars",
     "infer_xegpu_elementwise_layout",
+    "infer_xegpu_reduction_tiles",
     "legalize_for_llvm",
     "legalize_host_ops",
     "loop_bounds",
