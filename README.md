@@ -132,8 +132,28 @@ above, e.g. a reduction's load tile rows divide its subgroup rows and f32 loads 
 16 columns; the prefetch keys are rejected: GEMM only); invalid ones, malformed entries and lists longer than the number of
 kernels raise `XeGPUConfigError` (an `MLIRBackendError`, so the autotuner skips the
 config). The CPU target ignores the `xegpu_*` keys, so one config can serve both
-devices. The autotuner does not search them yet; on the XPU it searches matmul tiles
-of at least 32 (M, N) and 16 (K), with K tiles below K.
+devices.
+
+### Autotuning on the XPU
+
+Given configs are used as they are; autotuning is an extra. The XPU search space
+(`targets/xpu_search.py`) classifies each GPU kernel from Helion's facts on the
+kernel (GEMM, row reduction, elementwise) and narrows the block sizes Helion samples
+to what XeGPU compiles: powers of two dividing the sizes they tile (no masking), at
+least 16 for the blocks of a tile's contiguous dim; matmul M/N tiles of 32 to 1024
+and K tiles of 16 to 64, below K; reduction rows of 8 to 256 (whole 8-row subgroups,
+at most 32) and 16 to 256 columns; 2D elementwise tiles of at most 2048 per side. The
+default config infers every XeGPU parameter, with a matmul's block sizes from
+lighthouse's parameter selection for its sizes, and lowers. The `xegpu_*` keys are
+searched as per-kernel fragments, `None` (inferred) the default: `xegpu_sg_tiles`
+(GEMM 32x32, 32x64, 64x32; reduction 16 or 32 rows; elementwise 16x32, 32x32, 32x64),
+`xegpu_load_tiles` (reduction and elementwise: 8 or 32 rows at the widest block load)
+and `xegpu_prefetch_depths` (GEMM: 2 and 2); `xegpu_prefetch_tiles` is not searched.
+Sampled configs that cannot lower (e.g. a subgroup tile not dividing the sampled
+workgroup tile, block sizes lighthouse's matmul cost model rejects, an elementwise
+tile needing more than 32 subgroups) fail before any lighthouse stage with an
+`MLIRBackendError` the autotuner skips. Timing the search needs an XPU: benchmarking
+with XPU synchronization is not implemented yet.
 
 Device binaries and execution need an LLVM built with the SPIR-V target and the Level
 Zero runtime (`-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=SPIRV -DMLIR_ENABLE_LEVELZERO_RUNNER=1`

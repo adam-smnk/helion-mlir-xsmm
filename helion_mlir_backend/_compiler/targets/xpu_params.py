@@ -33,7 +33,8 @@ also as JIT cache keys) and :func:`take_params` reads it back for lowering.
 :func:`check_params` validates parameters against the kernels' shapes with
 lighthouse's ``matmul_constraints`` (elementwise and reduction kernels: the
 hardware limits of ``elementwise_layout`` and ``reduction_tiles``) before
-lowering.
+lowering (also the GEMM and reduction tiles the block sizes imply when nothing
+is forced), so configs that cannot lower fail fast.
 """
 
 from __future__ import annotations
@@ -50,6 +51,7 @@ from mlir import ir
 from mlir.dialects import linalg
 
 from ..mlir.support.errors import XeGPUConfigError
+from ..mlir_transforms.xegpu_elementwise import BLOCK_COLS
 from ..mlir_transforms.xegpu_elementwise import ElementwiseLayout
 from ..mlir_transforms.xegpu_elementwise import elementwise_layout
 from ..mlir_transforms.xegpu_reduction import reduction_tiles
@@ -441,36 +443,44 @@ def check_params(
     params: Sequence[KernelParams],
     shapes: Sequence[KernelShape | None],
 ) -> None:
-    """Raise :class:`XeGPUConfigError` unless every kernel's forced parameters
-    fit its shapes (``shapes``: one per kernel, by :func:`kernel_shape`) under
-    lighthouse's XeGPU constraints."""
+    """Raise :class:`XeGPUConfigError` unless every kernel's parameters fit its
+    shapes (``shapes``: one per kernel, by :func:`kernel_shape`) under
+    lighthouse's XeGPU constraints: the forced ones (``params``; kernels past
+    its end infer all), and the inferred ones the block sizes decide (a GEMM's
+    workgroup and K tiles must leave lighthouse's parameter selection a choice,
+    a reduction's rows and columns must fit its subgroup and block tiles)."""
     if len(params) > len(shapes):
         raise XeGPUConfigError(
             f"xegpu_* lists of {len(params)} entries, but the kernel has "
             f"{len(shapes)} GPU kernel(s) (one per top-level grid loop)"
         )
     specs = XeGPUSpecs.get("B70")
-    for index, (kernel, shape) in enumerate(zip(params, shapes, strict=False)):
+    for index, shape in enumerate(shapes):
+        kernel = params[index] if index < len(params) else KernelParams()
         forced = kernel.forced()
-        if not forced:
-            continue
         try:
             if isinstance(shape, GemmShape):
                 _check_gemm(kernel, shape, specs)
             elif isinstance(shape, ReductionShape):
                 _check_reduction(kernel, shape, specs)
             elif isinstance(shape, ElementwiseShape):
-                _check_elementwise(kernel, shape)
-            else:
+                if forced:
+                    _check_elementwise(kernel, shape)
+            elif forced:
                 raise ValueError(
                     "parameters apply to GEMM (one 2D matmul), reduction and "
                     "elementwise kernels"
                 )
         except ValueError as exc:
+            kind = f", a {shape}" if shape is not None else ""
+            if not forced:
+                raise XeGPUConfigError(
+                    f"GPU kernel {index}{kind}: its block sizes leave the XeGPU "
+                    f"pipeline no parameters: {exc}"
+                ) from None
             values = ", ".join(
                 f"{key}[{index}]={list(value)}" for key, value in forced.items()
             )
-            kind = f", a {shape}" if shape is not None else ""
             raise XeGPUConfigError(
                 f"{values}: invalid for GPU kernel {index}{kind}: {exc}"
             ) from None
@@ -492,8 +502,9 @@ def _check_gemm(kernel: KernelParams, shape: GemmShape, specs: XeGPUSpecs) -> No
             matmul_costmodel.estimate_performance(
                 *shape.mnk, wg_tile, sg_tile, k_tile, specs, verbose=False
             )
-    if (sg_tile is not None or kernel.load_tiles is not None) and shape.mnk is not None:
-        # Lighthouse infers the rest around the forced subgroup tile, or the
+    if shape.mnk is not None:
+        # Lighthouse infers the rest around the forced subgroup tile (fails
+        # here if its selection finds nothing for the block sizes), or the
         # subgroup tile forced load tiles must fit.
         sg_tile = _selected_sg_tile(shape, sg_tile)
     if kernel.load_tiles is not None:
@@ -544,7 +555,7 @@ def _selected_sg_tile(
     return params["sg_m"], params["sg_n"]
 
 
-_REDUCTION_SG_ROWS = 8
+REDUCTION_SG_ROWS = 8
 """The rows of lighthouse's inferred reduction subgroup tile
 (``infer_xegpu_reduction_params``)."""
 
@@ -559,9 +570,13 @@ def _check_reduction(
     if load_tile is not None and len(load_tile) != 2:
         raise ValueError("the load tile of a reduction kernel is [m, n]")
     if shape.rows is None:
-        raise ValueError("forced parameters need a 2D row reduction")
-    rows = _REDUCTION_SG_ROWS
-    if kernel.sg_tile is not None:
+        if kernel.forced():
+            raise ValueError("forced parameters need a 2D row reduction")
+        return
+    rows = REDUCTION_SG_ROWS
+    if kernel.sg_tile is None:
+        _check_reduction_tiles(shape, specs)
+    else:
         rows, cols = kernel.sg_tile
         if cols != 0 or rows == 0:
             raise ValueError(
@@ -580,6 +595,28 @@ def _check_reduction(
         # The subgroup tile lighthouse lays the reduced tile out in: its rows,
         # all columns.
         reduction_tiles((rows, shape.cols), shape.load_bits, load_tile)
+
+
+def _check_reduction_tiles(shape: ReductionShape, specs: XeGPUSpecs) -> None:
+    """The workgroup tile of a reduction with lighthouse's subgroup rows: whole
+    subgroups, at most the maximum, and whole block rows of columns."""
+    assert shape.rows is not None
+    rows = REDUCTION_SG_ROWS
+    if shape.rows % rows:
+        raise ValueError(
+            f"{shape.rows} rows per workgroup are not a multiple of the {rows}-row "
+            "subgroups"
+        )
+    if shape.rows // rows > specs.max_nb_threads:
+        raise ValueError(
+            f"{shape.rows // rows} subgroups of {rows} rows exceed the maximum of "
+            f"{specs.max_nb_threads}"
+        )
+    if shape.cols is not None and shape.cols % BLOCK_COLS:
+        raise ValueError(
+            f"{shape.cols} columns are not a multiple of {BLOCK_COLS} (a block load "
+            "row)"
+        )
 
 
 def _check_elementwise(kernel: KernelParams, shape: ElementwiseShape) -> None:

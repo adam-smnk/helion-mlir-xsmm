@@ -56,13 +56,13 @@ from .xpu_params import check_params
 from .xpu_params import kernel_shape
 from .xpu_params import take_params
 from .xpu_params import xegpu_params
+from .xpu_search import search_space
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
     from collections.abc import Sequence
 
     from helion._compiler.device_ir import DeviceIR
-    from helion.autotuner.config_spec import BlockSizeSpec
     from helion.autotuner.config_spec import ConfigSpec
 
 _RUNTIME_LIB = "libmlir_levelzero_runtime.so"
@@ -72,10 +72,6 @@ _NO_PATTERN = "Could not apply any of the defined patterns"
 """Lighthouse's failure when no kernel class (GEMM, attention, reduction, or the
 backend's elementwise class) matches."""
 _IR_ONLY = "HELION_MLIR_XPU_STOP_AT=xegpu-wg or xevm (IR only)"
-_MIN_WG_TILE = 32
-"""Smallest matmul M/N block size searched: lighthouse's subgroup tiles are 16
-(small dims) or 32..128."""
-_DPAS_K = 16
 _LLVM_BUILD = (
     "an LLVM built with -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=SPIRV "
     "-DMLIR_ENABLE_LEVELZERO_RUNNER=1 and Python bindings, at the commit of the "
@@ -214,14 +210,15 @@ class XpuTarget(MLIRTarget):
     ) -> XpuLowering:
         """The XeGPU stage list, after checking that ``module`` (inlined) is in
         what it compiles (:func:`check_xegpu_capabilities`) and that its
-        recorded XeGPU parameters fit its kernels (:func:`check_params`). Tags
+        recorded XeGPU parameters, forced or inferred, fit its kernels
+        (:func:`check_params`): configs that cannot lower fail here, before any
+        lighthouse stage. Tags
         each grid loop (GPU kernel) with its index for the per-kernel stages."""
         self.resolve_pipeline(pipeline)
         self.check_stop_at(stop_at)
         loops = check_xegpu_capabilities(module, entry)
         params = take_params(module)
-        if params:
-            check_params(params, [kernel_shape(loop) for loop in loops])
+        check_params(params, [kernel_shape(loop) for loop in loops])
         i64 = ir.IntegerType.get_signless(64)
         for index, loop in enumerate(loops):
             loop.attributes[xpu_transforms.KERNEL_ATTR] = ir.IntegerAttr.get(i64, index)
@@ -271,33 +268,10 @@ class XpuTarget(MLIRTarget):
         return "xpu"
 
     def adjust_config_spec(self, config_spec: ConfigSpec, device_ir: DeviceIR) -> None:
-        """Matmul tiles XeGPU can lower: M and N tiles of at least
-        :data:`_MIN_WG_TILE` (subgroup tiles are multiples of DPAS 8x16 and the
-        workgroup holds several), K tiles of at least DPAS K (16) and below K (the
-        K loop must stay); each clamped to what the dimension allows."""
-        block_sizes = config_spec.block_sizes
-
-        def spec(block_id: int | None) -> BlockSizeSpec | None:
-            if block_id is None:
-                return None
-            try:
-                return block_sizes.block_id_lookup(block_id)
-            except KeyError:
-                return None
-
-        for fact in config_spec.matmul_facts:
-            for block_id, minimum in (
-                (fact.m_block_id, _MIN_WG_TILE),
-                (fact.n_block_id, _MIN_WG_TILE),
-                (fact.k_block_id, _DPAS_K),
-            ):
-                if (block := spec(block_id)) is not None:
-                    block.update_min(min(minimum, block.max_size))
-            k_block = spec(fact.k_block_id)
-            if k_block is not None and fact.static_k is not None and fact.static_k > 1:
-                below_k = 1 << ((fact.static_k - 1).bit_length() - 1)
-                if below_k >= k_block.min_size:
-                    k_block.update_max(below_k)
+        """The XPU search space (:func:`xpu_search.search_space`): block sizes
+        that divide their sizes and fit each kernel class's XeGPU tiles, defaults
+        that lower, and the ``xegpu_*`` keys as per-kernel fragments."""
+        search_space(config_spec, device_ir)
 
     def validate_environment(self, stop_at: str | None = None) -> None:
         """Lowering to ``xegpu-wg`` or ``xevm`` needs nothing; binaries need

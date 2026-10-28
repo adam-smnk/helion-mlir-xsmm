@@ -890,7 +890,8 @@ def test_config_keys_are_registered() -> None:
     assert XEGPU_CONFIG_KEYS <= helion_config_spec.VALID_KEYS
     backend = MLIRBackend()
     assert all(backend.supports_config_key(key) for key in XEGPU_CONFIG_KEYS)
-    # Not autotuned yet.
+    # Searched per kernel: the XPU target adds them to a kernel's config spec
+    # (``xpu_search``), not to Helion's global backend tunables.
     assert not XEGPU_CONFIG_KEYS & helion_config_spec.BACKEND_TUNABLE_KEYS
 
 
@@ -980,5 +981,6 @@ def test_xpu_block_size_bounds_for_autotuning() -> None:
     get_target("xpu").adjust_config_spec(spec, hf.device_ir)
     m, n, k = spec.block_sizes
     assert (m.min_size, n.min_size, k.min_size) == (32, 32, 16)
-    # K tiles stay below K: the K loop must remain.
-    assert k.max_size == N // 2
+    # K tiles stay below K (the K loop must remain) and within the K tiles of
+    # lighthouse's cost model.
+    assert k.max_size == 64
