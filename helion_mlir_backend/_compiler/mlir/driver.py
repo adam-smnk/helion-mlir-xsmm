@@ -2,7 +2,7 @@
 
 Every call runs the kernel's host code up to its device loops (``host_code.py``),
 evaluates each entry argument's host expression in the host locals, calls the
-memref-ABI entry, then finishes the host code and returns its return value.
+memref-ABI entry (runtime scalars by value), then finishes the host code and returns its return value.
 """
 
 from __future__ import annotations
@@ -118,9 +118,9 @@ def call_entry(
     The entry's target checks each tensor (e.g. its device) and prepares and
     finishes the call. Tensors are passed contiguous (a copy for strided ones,
     copied back for inouts). An input that overlaps an inout is cloned so the
-    ``restrict`` arguments hold; overlapping inouts are rejected. ``sizes`` (each
-    argument's size expressions) lets runtime sizes the kernel assumes equal be
-    checked.
+    ``restrict`` arguments hold; overlapping inouts are rejected. Runtime scalars
+    are passed by value. ``sizes`` (each argument's size expressions) lets runtime
+    sizes the kernel assumes equal be checked.
     """
     target = entry.target
     tensors = [
@@ -152,17 +152,14 @@ def call_entry(
         else tensor.contiguous()
         for tensor, role in zip(tensors, roles, strict=True)
     ]
-    # Runtime scalars are 0-d CPU tensors on every target: the entry reads them
-    # on the host (an XPU kernel gets the value as an argument).
-    scalars = [
-        torch.tensor(value, dtype=arg.dtype)
+    buffers = iter(staged)
+    arguments = [
+        value if arg.role == "scalar" else next(buffers)
         for arg, value in zip(entry.args, values, strict=True)
-        if arg.role == "scalar"
     ]
-    buffers = [*staged, *scalars]
-    target.prepare_call(buffers)
-    entry(buffers)
-    target.finish_call(buffers)
+    target.prepare_call(staged)
+    entry(arguments)
+    target.finish_call(staged)
     for tensor, copy, role in zip(tensors, staged, roles, strict=True):
         if role == "inout" and copy is not tensor:
             tensor.copy_(copy)

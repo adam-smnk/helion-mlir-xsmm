@@ -7,6 +7,7 @@ dialect only registers the ops defined before it is loaded."""
 from .align_operand_rows import align_operand_rows
 from .dialect import HelionTransformDialect
 from .hoist_allocas import hoist_allocas
+from .hoist_invariant_scalars import hoist_invariant_scalars
 from .legalize_for_llvm import legalize_for_llvm
 from .legalize_host_ops import legalize_host_ops
 from .loop_bounds import loop_bounds
@@ -35,6 +36,7 @@ __all__ = [
     "InferXeGPUElementwiseLayoutOp",
     "align_operand_rows",
     "hoist_allocas",
+    "hoist_invariant_scalars",
     "infer_xegpu_elementwise_layout",
     "legalize_for_llvm",
     "legalize_host_ops",

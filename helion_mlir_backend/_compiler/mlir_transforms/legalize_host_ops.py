@@ -1,7 +1,7 @@
 """``legalize_host_ops``: what a bufferized GPU entry function does outside its
 kernels runs on the host, and its buffers are device memory. Copies and fills of
 whole buffers become GPU runtime calls; any other host access to device memory,
-host buffers the kernels would read, and runtime scalars read in a kernel are
+and kernel arguments of a float type the device lacks (e.g. ``f64``), are
 definite failures (``HOST_OPS_ERROR`` messages)."""
 
 from mlir import ir
@@ -12,11 +12,13 @@ from mlir.dialects.transform import DiagnosedSilenceableFailure
 
 from .dialect import HelionTransformDialect
 from .dialect import transform_op
+from .hoist_invariant_scalars import defined_outside
+from .hoist_invariant_scalars import is_pure
 
 HOST_OPS_ERROR = "legalize_host_ops"
 """Prefix of the failure messages: ``legalize_host_ops: <what>; <reason>``."""
 HOST_MEMORY = "host code touches device memory"
-DEVICE_SCALAR = "runtime scalar read on the device"
+KERNEL_ARGUMENT = "kernel argument of an unsupported type"
 
 # Kernels: everything nested in them runs on the device.
 _KERNELS = frozenset({"scf.forall", "scf.parallel", "gpu.launch"})
@@ -62,22 +64,6 @@ def _is_buffer(value: ir.Value) -> bool:
     return isinstance(value.type, ir.MemRefType)
 
 
-def _root(value: ir.Value) -> ir.Value:
-    """The buffer ``value`` is a view of (through ``_VIEWS``)."""
-    while isinstance(value, ir.OpResult) and value.owner.name in _VIEWS:
-        value = value.owner.operands[0]
-    return value
-
-
-def _in_kernel(op: ir.Operation) -> bool:
-    parent = op.parent
-    while parent is not None and parent.name != "func.func":
-        if parent.name in _KERNELS:
-            return True
-        parent = parent.parent
-    return False
-
-
 def _is_contiguous(value: ir.Value) -> bool:
     memref_type = ir.MemRefType(value.type)
     layout = memref_type.layout
@@ -86,30 +72,28 @@ def _is_contiguous(value: ir.Value) -> bool:
     )
 
 
-def _host_args(func: ir.Operation, role_attr: str, role: str) -> dict[ir.Value, str]:
-    """The function's arguments whose ``role_attr`` is ``role``: host buffers, by
-    the name of the value they pass (``helion.name``, else ``argN``)."""
-    if "arg_attrs" not in func.attributes:
-        return {}
-    args = func.regions[0].blocks[0].arguments
-    found = {}
-    for index, attrs in enumerate(ir.ArrayAttr(func.attributes["arg_attrs"])):
-        attrs = ir.DictAttr(attrs)
-        if role_attr in attrs and ir.StringAttr(attrs[role_attr]).value == role:
-            name = (
-                ir.StringAttr(attrs["helion.name"]).value
-                if "helion.name" in attrs
-                else f"arg{index}"
+def _argument_name(func: ir.Operation, value: ir.Value) -> str:
+    """How a failure names a kernel argument: the host expression (``helion.name``)
+    of a function argument, else the op computing it."""
+    if isinstance(value, ir.BlockArgument) and value.owner.owner == func:
+        if "arg_attrs" in func.attributes:
+            attrs = ir.DictAttr(
+                ir.ArrayAttr(func.attributes["arg_attrs"])[value.arg_number]
             )
-            found[args[index]] = name
-    return found
+            if "helion.name" in attrs:
+                return f"'{ir.StringAttr(attrs['helion.name']).value}'"
+        return f"argument {value.arg_number}"
+    if isinstance(value, ir.OpResult):
+        return f"the result of '{value.owner.name}'"
+    return "a block argument"
 
 
 class _Legalizer:
     """Checks and rewrites one function's host code."""
 
-    def __init__(self, host_args: dict[ir.Value, str]) -> None:
-        self.host_args = host_args
+    def __init__(self, func: ir.Operation, max_float_width: int) -> None:
+        self.func = func
+        self.max_float_width = max_float_width
         self.copies: list[ir.Operation] = []
         self.fills: list[ir.Operation] = []
         self.failure: tuple[ir.Operation, str, str] | None = None
@@ -118,13 +102,11 @@ class _Legalizer:
         if self.failure is None:
             self.failure = (op, what, reason)
 
-    def is_host(self, value: ir.Value) -> bool:
-        return _root(value) in self.host_args
-
     def visit(self, block: ir.Block) -> None:
         for op in block.operations:
             op = op.operation
             if op.name in _KERNELS:
+                self.check_kernel_arguments(op)
                 continue
             self.check(op)
             if op.name in _CONTROL_FLOW:
@@ -142,15 +124,13 @@ class _Legalizer:
             return
         if name in _VIEWS:
             return
-        if name == "memref.load" and self.is_host(op.operands[0]):
-            return  # A runtime scalar, read on the host.
-        if name == "memref.copy" and self._whole_device_buffers(op.operands):
+        if name == "memref.copy" and _whole_buffers(op.operands):
             self.copies.append(op)
             return
         if (
             name == "linalg.fill"
             and len(buffers) == 1
-            and self._whole_device_buffers(buffers)
+            and _whole_buffers(buffers)
             and _fill_width(op) in (16, 32)
         ):
             self.fills.append(op)
@@ -168,31 +148,34 @@ class _Legalizer:
             f"'{name}' outside the kernels accesses a device buffer from the host",
         )
 
-    def _whole_device_buffers(self, values: list[ir.Value]) -> bool:
-        return all(
-            _is_buffer(value) and not self.is_host(value) and _is_contiguous(value)
-            for value in values
-        )
+    def check_kernel_arguments(self, kernel: ir.Operation) -> None:
+        """The host values ``kernel`` uses become its arguments: floats wider than
+        the device's (``max_float_width``) fail. Constants do not count: outlining
+        rematerializes them in the kernel."""
+        failure: list[tuple[ir.Operation, ir.Value]] = []
 
-    def check_host_args(self) -> None:
-        """Host buffers are only read outside the kernels."""
-        for arg, name in self.host_args.items():
-            pending = [arg]
-            while pending:
-                value = pending.pop()
-                for use in value.uses:
-                    owner = use.owner
-                    if _in_kernel(owner) or owner.name == "gpu.launch_func":
-                        self.fail(
-                            owner,
-                            DEVICE_SCALAR,
-                            f"'{name}' is a host buffer, read by '{owner.name}' in a "
-                            "kernel; runtime scalars must be read outside the grid "
-                            "loops",
-                        )
-                        return
-                    if owner.name in _VIEWS:
-                        pending.append(owner.results[0])
+        def visit(op: ir.Operation) -> ir.WalkResult:
+            for value in op.operands:
+                if (
+                    isinstance(value.type, ir.FloatType)
+                    and value.type.width > self.max_float_width
+                    and defined_outside(value, kernel)
+                    and not _is_constant(value)
+                ):
+                    failure.append((op, value))
+                    return ir.WalkResult.INTERRUPT
+            return ir.WalkResult.ADVANCE
+
+        kernel.walk(visit, ir.WalkOrder.PRE_ORDER)
+        if failure:
+            op, value = failure[0]
+            self.fail(
+                op,
+                KERNEL_ARGUMENT,
+                f"{_argument_name(self.func, value)} ({value.type}) is used by "
+                f"'{op.name}' in a kernel, which would take it as an argument; the "
+                f"device has no floats wider than {self.max_float_width} bits",
+            )
 
     def rewrite(self, rewriter: transform.TransformRewriter) -> None:
         for copy in self.copies:
@@ -206,6 +189,19 @@ class _Legalizer:
             with ir.InsertionPoint(fill), fill.location:
                 gpu.MemsetOp(None, [], dest, value)
             rewriter.erase_op(fill)
+
+
+def _whole_buffers(values: list[ir.Value]) -> bool:
+    return all(_is_buffer(value) and _is_contiguous(value) for value in values)
+
+
+def _is_constant(value: ir.Value) -> bool:
+    """A result of an op with no operands and no effects (e.g. ``arith.constant``)."""
+    return (
+        isinstance(value, ir.OpResult)
+        and not list(value.owner.operands)
+        and is_pure(value.owner.operation)
+    )
 
 
 def _fill_width(fill: ir.Operation) -> int | None:
@@ -225,19 +221,19 @@ class LegalizeHostOpsOp(HelionTransformDialect.Operation, name="legalize_host_op
       ``gpu.memcpy``; a ``linalg.fill`` of one with 16- or 32-bit values a
       ``gpu.memset``.
     - Scalar and vector code, views and metadata of buffers, ``gpu`` ops, control
-      flow and calls stay.
-    - Arguments whose ``role_attr`` attribute is ``host_role`` are host buffers
-      (runtime scalars): loads of them on the host stay (outlining passes the
-      values to the kernels), any use in a kernel is a definite failure.
+      flow and calls stay. Scalars (e.g. runtime scalars, function arguments by
+      value) are computed on the host; outlining passes the values the kernels
+      use as kernel arguments.
+    - A kernel using a float wider than ``max_float_width`` bits computed on the
+      host (it would take it as an argument; constants excepted) is a definite
+      failure: hoist conversions to the kernel's types out of it first
+      (``hoist_invariant_scalars``).
     - Any other op reading, writing or creating a buffer is a definite failure.
     """
 
     target: ext.Operand[transform.AnyOpType]
-    role_attr: ir.StringAttr = ext.attribute(
-        default_factory=lambda: ir.StringAttr.get("helion.role")
-    )
-    host_role: ir.StringAttr = ext.attribute(
-        default_factory=lambda: ir.StringAttr.get("scalar")
+    max_float_width: ir.IntegerAttr = ext.attribute(
+        default_factory=lambda: ir.IntegerAttr.get(ir.IntegerType.get_signless(64), 32)
     )
 
     @staticmethod
@@ -251,9 +247,7 @@ class LegalizeHostOpsOp(HelionTransformDialect.Operation, name="legalize_host_op
             func = func.operation
             if not func.regions or not func.regions[0].blocks:
                 continue
-            host_args = _host_args(func, op.role_attr.value, op.host_role.value)
-            legalizer = _Legalizer(host_args)
-            legalizer.check_host_args()
+            legalizer = _Legalizer(func, op.max_float_width.value)
             legalizer.visit(func.regions[0].blocks[0])
             if legalizer.failure is not None:
                 failed, what, reason = legalizer.failure
@@ -263,12 +257,9 @@ class LegalizeHostOpsOp(HelionTransformDialect.Operation, name="legalize_host_op
         return DiagnosedSilenceableFailure.Success
 
 
-def legalize_host_ops(
-    target: ir.Value, role_attr: str = "helion.role", host_role: str = "scalar"
-) -> LegalizeHostOpsOp:
+def legalize_host_ops(target: ir.Value, max_float_width: int = 32) -> LegalizeHostOpsOp:
     """snake_case wrapper to create a LegalizeHostOpsOp."""
+    i64 = ir.IntegerType.get_signless(64)
     return LegalizeHostOpsOp(
-        target=target,
-        role_attr=ir.StringAttr.get(role_attr),
-        host_role=ir.StringAttr.get(host_role),
+        target=target, max_float_width=ir.IntegerAttr.get(i64, max_float_width)
     )

@@ -5,8 +5,9 @@ loop, an ``scf.for`` K loop inside), so the pipeline skips lighthouse's workgrou
 tiling and starts from Helion's tiles. Each root loop becomes one ``gpu.launch``;
 the entry function stays on the host and launches the kernels in program order on
 one stream, then synchronizes (``gpu-async-region``): phases of a kernel with
-``hl.barrier()`` are separate launches. Runtime scalars stay host buffers, read on
-the host and passed to the kernels by value.
+``hl.barrier()`` are separate launches. Runtime scalars are entry arguments by
+value; the scalar code computed from them is hoisted out of the grid loops, so
+each kernel gets the values it uses (e.g. an ``f32`` scale, never an ``f64``).
 
 XeGPU parameters (subgroup, load and prefetch tiles, prefetch depths) come from
 the config's ``xegpu_*`` keys, per GPU kernel (``xpu_params``), else from
@@ -45,6 +46,7 @@ from ..mlir.support.debug import xpu_stop_at
 from ..mlir.support.errors import UnsupportedOperationError
 from ..mlir.support.errors import UnsupportedTargetError
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
+from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
 from .base import MLIRTarget
 from .xpu_checks import check_xegpu_capabilities
 from .xpu_params import XEGPU_CONFIG_KEYS
@@ -105,10 +107,12 @@ class XpuLowering:
 def _translated(exc: Exception, stage: str) -> Exception:
     message = str(exc)
     if match := re.search(rf"{HOST_OPS_ERROR}: ([^;\n]+); ([^\n]+)", message):
+        if match.group(1) == KERNEL_ARGUMENT:
+            alternatives = ["f32 (or narrower) math on runtime scalars", _CPU]
+        else:
+            alternatives = ["keep host code to scalars and tensor allocation", _CPU]
         return UnsupportedOperationError(
-            match.group(1),
-            reason=match.group(2),
-            alternatives=["keep host code to scalars and tensor allocation", _CPU],
+            match.group(1), reason=match.group(2), alternatives=alternatives
         )
     if match := re.search(rf"([\w-]+): {_NO_PATTERN}", message):
         return UnsupportedOperationError(
@@ -241,8 +245,7 @@ class XpuTarget(MLIRTarget):
 
     def prepare_call(self, buffers: Sequence[torch.Tensor]) -> None:
         """Wait for torch's work on the buffers (e.g. host-code ``torch.zeros``):
-        the kernels run on the Level Zero runtime's own queue. Runtime scalars are
-        CPU tensors, read on the host."""
+        the kernels run on the Level Zero runtime's own queue."""
         devices = {t.device for t in buffers if t.device.type == "xpu"}
         if len(devices) > 1:
             raise ValueError(

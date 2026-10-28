@@ -1,8 +1,9 @@
 """Lower a generated module with lighthouse and JIT its memref-ABI entry function.
 
 :func:`compile_entry` returns a :class:`CompiledEntry` that takes the entry's
-buffers in argument order; :func:`lower_entry` only lowers, possibly to a stage
-before the end of the target's pipeline (IR tests). The device target
+arguments in order (tensors for memrefs, Python numbers for runtime scalars,
+passed by value); :func:`lower_entry` only lowers, possibly to a stage before
+the end of the target's pipeline (IR tests). The device target
 (``targets/``) supplies the lighthouse lowering and the JIT runner. Failures keep
 their exception type and get a note naming the stage. Lighthouse lowering runs in a forked process, killed after
 the compile timeout; only the lowered module comes back. Compiled entries are
@@ -29,6 +30,7 @@ import warnings
 
 import mlir.ir as ir
 from mlir.passmanager import PassManager
+import torch
 
 from helion_mlir_backend._compiler.mlir.in_place import update_carried_values_in_place
 from helion_mlir_backend._compiler.mlir.support.debug import DebugOptions
@@ -40,11 +42,11 @@ from helion_mlir_backend._compiler.targets import resolve_target
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from collections.abc import Sequence
     from multiprocessing.connection import Connection
     from typing import BinaryIO
 
     from lighthouse.execution.runner import Runner
-    import torch
 
     from helion_mlir_backend._compiler.targets import MLIRTarget
     from helion_mlir_backend._compiler.targets.base import Lowering
@@ -81,7 +83,7 @@ class EntryArg:
     """``in``, ``inout`` or ``scalar``."""
     tensor_param: int | None
     shape: tuple[int, ...]
-    """``-1`` for a size only known at run time."""
+    """``-1`` for a size only known at run time; ``()`` for a scalar."""
     dtype: torch.dtype
 
 
@@ -97,8 +99,10 @@ class CompiledEntry:
         # The ctypes callable of the packed C interface, looked up once.
         object.__setattr__(self, "_func", self.runner.engine.lookup(self.name))
 
-    def __call__(self, buffers: list[torch.Tensor]) -> None:
-        packed, _buffer = _packed_memref_args(buffers)
+    def __call__(self, values: Sequence[torch.Tensor | float | int | bool]) -> None:
+        """Call the entry with one value per argument: a tensor for a memref, a
+        Python number for a runtime scalar."""
+        packed, _storage = _packed_args(self.args, values)
         try:
             self._func(packed)
         except Exception as exc:
@@ -108,30 +112,52 @@ class CompiledEntry:
 
 _WORD = ctypes.sizeof(ctypes.c_int64)
 
+# The C type of each runtime scalar type the entry takes by value, and the
+# Python type its values are converted to (as ``torch.tensor(value, dtype)`` did).
+_SCALAR_CTYPES: dict[torch.dtype, tuple[type, type]] = {
+    torch.float64: (ctypes.c_double, float),
+    torch.float32: (ctypes.c_float, float),
+    torch.int64: (ctypes.c_int64, int),
+    torch.int32: (ctypes.c_int32, int),
+    torch.bool: (ctypes.c_bool, bool),
+}
 
-def _packed_memref_args(buffers: list[torch.Tensor]) -> tuple[int, ctypes.Array]:
+
+def _packed_args(
+    args: Sequence[EntryArg], values: Sequence[torch.Tensor | float | int | bool]
+) -> tuple[int, tuple[object, ...]]:
     """The address of the packed arguments of a C-interface entry -- one pointer
-    per argument to a pointer to its memref descriptor -- and the buffer holding
-    them, which must outlive the call.
+    per argument: to a pointer to its memref descriptor, or to the value of a
+    runtime scalar -- and the storage they point to, which must outlive the call.
 
     The descriptors (``allocated``, ``aligned``, ``offset``, sizes, strides), the
     descriptor pointers and the packed arguments are all 64-bit words of one
-    buffer.
+    buffer; each scalar is a C value of its own type.
     """
     words: list[int] = []
-    starts = []
-    for tensor in buffers:
+    starts: list[int] = []
+    scalars: dict[int, ctypes._SimpleCData] = {}
+    for index, (arg, value) in enumerate(zip(args, values, strict=True)):
+        if arg.role == "scalar":
+            c_type, python_type = _SCALAR_CTYPES[arg.dtype]
+            scalars[index] = c_type(python_type(value))
+            continue
         starts.append(len(words))
-        data = tensor.data_ptr()
-        words += (data, data, 0, *tensor.shape, *tensor.stride())
+        data = value.data_ptr()
+        words += (data, data, 0, *value.shape, *value.stride())
     pointers = len(words)
-    count = len(buffers)
-    buffer = (ctypes.c_int64 * (pointers + 2 * count))()
+    buffer = (ctypes.c_int64 * (pointers + len(starts) + len(args)))()
     base = ctypes.addressof(buffer)
     words += [base + _WORD * start for start in starts]
-    words += [base + _WORD * (pointers + i) for i in range(count)]
+    descriptor = iter(range(pointers, pointers + len(starts)))
+    words += [
+        ctypes.addressof(scalars[index])
+        if index in scalars
+        else base + _WORD * next(descriptor)
+        for index in range(len(args))
+    ]
     buffer[:] = words
-    return base + _WORD * (pointers + count), buffer
+    return base + _WORD * (pointers + len(starts)), (buffer, scalars)
 
 
 def entry_args(module: ir.Module, entry: str) -> tuple[EntryArg, ...]:
@@ -156,23 +182,29 @@ def entry_args(module: ir.Module, entry: str) -> tuple[EntryArg, ...]:
     args = []
     for arg_type, attrs in zip(arg_types, ir.ArrayAttr(arg_attrs), strict=True):
         attrs = ir.DictAttr(attrs)
-        memref = ir.MemRefType(arg_type)
-        dtype = mlir_dtype_to_torch(str(memref.element_type))
-        if dtype is None:
-            raise ValueError(
-                f"'{entry}' takes a memref of unsupported {memref.element_type}"
+        role = ir.StringAttr(attrs["helion.role"]).value
+        if role == "scalar":
+            shape: tuple[int, ...] = ()
+            element_type = arg_type
+        else:
+            memref = ir.MemRefType(arg_type)
+            shape = tuple(
+                -1 if ir.ShapedType.is_dynamic_size(size) else size
+                for size in memref.shape
             )
+            element_type = memref.element_type
+        dtype = mlir_dtype_to_torch(str(element_type))
+        if dtype is None or (role == "scalar" and dtype not in _SCALAR_CTYPES):
+            kind = "scalar" if role == "scalar" else "memref"
+            raise ValueError(f"'{entry}' takes a {kind} of unsupported {element_type}")
         args.append(
             EntryArg(
                 ir.StringAttr(attrs["helion.name"]).value,
-                ir.StringAttr(attrs["helion.role"]).value,
+                role,
                 ir.IntegerAttr(attrs["helion.param"]).value
                 if "helion.param" in attrs
                 else None,
-                tuple(
-                    -1 if ir.ShapedType.is_dynamic_size(size) else size
-                    for size in memref.shape
-                ),
+                shape,
                 dtype,
             )
         )

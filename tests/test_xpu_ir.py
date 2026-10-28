@@ -81,6 +81,23 @@ def matmul_scaled(a: torch.Tensor, b: torch.Tensor, scale: float) -> torch.Tenso
     return out
 
 
+@_kernel(helion.Config(block_sizes=[64, 128]))
+def scale_shift(x: torch.Tensor, alpha: float, beta: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = x[tile] * alpha + beta
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 128]))
+def scale_in_f64(x: torch.Tensor, alpha: float) -> torch.Tensor:
+    """f64 math on f32 tiles: the kernel needs ``alpha`` as an f64."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = (x[tile].to(torch.float64) * alpha).to(torch.float32)
+    return out
+
+
 @_kernel(GEMM)
 def matmul_transposed_b(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """``a @ b.T`` with ``b`` of shape (N, K): Helion emits a ``linalg.contract``
@@ -330,27 +347,63 @@ def test_matmul_transposed_b(stop_at: str) -> None:
 
 
 @pytest.mark.isolated
-def test_runtime_scalar_is_read_on_the_host() -> None:
-    text = lower_xpu(matmul_scaled, [*_gemm_args(), 0.5])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_runtime_scalar_is_passed_by_value(dtype: torch.dtype) -> None:
+    text = lower_xpu(matmul_scaled, [*_gemm_args(dtype), 0.5])
     _check_gemm_kernel(text, grid=(4, 4), threads=512)
     host = _host_function(text, "matmul_scaled")
     scalar = re.search(
-        r"(%arg\d+): memref<f64> \{helion\.name = \"scale\", helion\.role = \"scalar\"",
-        host,
+        r"(%arg\d+): f64 \{helion\.name = \"scale\", helion\.role = \"scalar\"", host
     )
     assert scalar, host
-    load = re.search(rf"(%\w+) = memref\.load {scalar.group(1)}\[\]", host)
-    assert load, host
-    assert host.index(load.group(0)) < host.index("gpu.launch_func")
-    # The kernel gets the value, not the host buffer.
-    assert re.search(rf"args\([^\n]*{load.group(1)} : f64", host)
-    assert scalar.group(1) + " :" not in host[host.index("gpu.launch_func") :]
+    # The conversion to the accumulator's type runs on the host: the kernel takes
+    # the f32 value.
+    cast = re.search(rf"(%\w+) = arith\.truncf {scalar.group(1)} : f64 to f32", host)
+    assert cast, host
+    assert host.index(cast.group(0)) < host.index("gpu.launch_func")
+    assert re.search(rf"args\([^\n]*{cast.group(1)} : f32", host)
+    kernel = text[text.index("gpu.module") :]
+    assert re.search(r"gpu\.func @matmul_scaled_kernel\([^)]*: f32", kernel)
+    assert "f64" not in kernel
 
 
 @pytest.mark.isolated
 def test_runtime_scalar_kernel_lowers_to_xevm() -> None:
-    text = lower_xpu(matmul_scaled, [*_gemm_args(), 0.5], "xevm")
+    text = lower_xpu(matmul_scaled, [*_gemm_args(torch.bfloat16), 0.5], "xevm")
     _check_xevm(text, "matmul_scaled", launches=1)
+    kernel = re.search(
+        r"llvm\.func spir_kernelcc @matmul_scaled_kernel\(([^)]*)\)", text
+    )
+    assert kernel, text
+    assert ": f32" in kernel.group(1)
+    assert "f64" not in text[text.index("gpu.module") :]
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("dtype", "element"), [(torch.float32, "f32"), (torch.bfloat16, "bf16")]
+)
+def test_float_and_int_scalars_reach_the_kernel_in_its_type(
+    dtype: torch.dtype, element: str
+) -> None:
+    text = lower_xpu(scale_shift, [xpu_tensor(1024, 1024, dtype=dtype), 0.5, 3], "xevm")
+    _check_xevm(text, "scale_shift", launches=1)
+    host = _host_function(text, "scale_shift")
+    assert re.search(r"%arg\d+: f64 \{helion\.name = \"alpha\"", host)
+    assert re.search(r"%arg\d+: i64 \{helion\.name = \"beta\"", host)
+    kernel = re.search(r"llvm\.func spir_kernelcc @scale_shift_kernel\(([^)]*)\)", text)
+    assert kernel, text
+    # Both scalars converted on the host (alpha truncated, beta converted to float).
+    assert kernel.group(1).count(f": {element},") == 2, kernel.group(1)
+    assert "f64" not in text[text.index("gpu.module") :]
+
+
+@pytest.mark.isolated
+def test_f64_kernel_argument_is_unsupported() -> None:
+    with pytest.raises(UnsupportedOperationError, match="kernel argument") as info:
+        lower_xpu(scale_in_f64, [xpu_tensor(1024, 1024), 0.5])
+    assert "'alpha' (f64) is used by" in str(info.value)
+    assert "no floats wider than 32 bits" in str(info.value)
 
 
 @pytest.mark.isolated
@@ -630,7 +683,7 @@ def test_xpu_target_without_an_xpu() -> None:
     target.validate_environment("xevm")
     with pytest.raises(NotImplementedError, match="compiled for XPU tensors"):
         target.check_tensor("x", torch.empty(2))
-    # Runtime scalars stay CPU tensors: nothing to synchronize.
+    # No XPU tensors: nothing to synchronize.
     target.prepare_call([torch.tensor(1.0)])
     if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
         assert target.hardware_name() == "xpu"
@@ -659,15 +712,14 @@ def test_generate_mlir_for_fake_xpu_tensors() -> None:
 HOST_CODE = """
 func.func @k(%out: memref<64x64xf32> {helion.name = "out", helion.role = "inout"},
              %x: memref<64x64xf32> {helion.name = "x", helion.role = "in"},
-             %s: memref<f64> {helion.name = "s", helion.role = "scalar"}) {
+             %s: f64 {helion.name = "s", helion.role = "scalar"}) {
   %zero = arith.constant 0.0 : f32
-  %scale = memref.load %s[] : memref<f64>
   %tmp = gpu.alloc () : memref<64x64xf32>
   memref.copy %x, %tmp : memref<64x64xf32> to memref<64x64xf32>
   linalg.fill ins(%zero : f32) outs(%out : memref<64x64xf32>)
   scf.forall (%i) in (64) {
     %v = memref.load %tmp[%i, %i] : memref<64x64xf32>
-    %t = arith.truncf %scale : f64 to f32
+    %t = arith.truncf %s : f64 to f32
     %r = arith.mulf %v, %t : f32
     memref.store %r, %out[%i, %i] : memref<64x64xf32>
   }
@@ -692,9 +744,54 @@ def test_host_copies_and_fills_become_gpu_runtime_calls() -> None:
     assert "linalg.fill" not in text
     assert re.search(r"gpu\.memcpy\s+%\w+, %arg1 :", text)
     assert re.search(r"gpu\.memset\s+%arg0, %\w+ : memref<64x64xf32>, f32", text)
-    # Host reads of the runtime scalar and the kernel stay.
-    assert "memref.load %arg2[]" in text
+    # The kernel stays; the runtime scalar's conversion moves out of it, so the
+    # kernel takes an f32.
     assert "memref.store" in text
+    assert text.index("arith.truncf %arg2 : f64 to f32") < text.index("scf.forall")
+
+
+SCALAR_CODE = """
+func.func @k(%out: memref<64xf32>, %vout: memref<64x4xf32>, %s: f64, %n: i64) {
+  %c0 = arith.constant 0 : index
+  %c4 = arith.constant 4 : index
+  %c64 = arith.constant 64 : index
+  %c7 = arith.constant 7 : i64
+  %two = arith.constant 2.0 : f32
+  scf.forall (%i) in (64) {
+    %acc = scf.for %k = %c0 to %c64 step %c4 iter_args(%a = %two) -> (f32) {
+      %t = arith.truncf %s : f64 to f32
+      %f = arith.sitofp %n : i64 to f32
+      %u = arith.mulf %t, %f : f32
+      %ki = arith.index_cast %k : index to i64
+      %kf = arith.sitofp %ki : i64 to f32
+      %w = arith.mulf %u, %kf : f32
+      %d = arith.divsi %c7, %n : i64
+      %df = arith.sitofp %d : i64 to f32
+      %b = arith.addf %a, %w : f32
+      %c = arith.addf %b, %df : f32
+      scf.yield %c : f32
+    }
+    memref.store %acc, %out[%i] : memref<64xf32>
+    %t0 = arith.truncf %s : f64 to f32
+    %v = vector.broadcast %t0 : f32 to vector<4xf32>
+    vector.store %v, %vout[%i, %c0] : memref<64x4xf32>, vector<4xf32>
+  }
+  return
+}
+"""
+
+
+def test_invariant_scalar_code_moves_out_of_the_kernels() -> None:
+    text = _legalize(SCALAR_CODE)
+    kernel = text[text.index("scf.forall") :]
+    host = text[: text.index("scf.forall")]
+    # Scalar code of the runtime scalars, also from the nested loop.
+    for op in ("arith.truncf %arg2", "arith.sitofp %arg3", "arith.mulf %0, %1"):
+        assert op in host, op
+    # Code of the loops' induction variables, code that may trap (and what uses
+    # it) and vector code stay.
+    for op in ("arith.index_cast", "arith.divsi", "vector.broadcast", "arith.addf"):
+        assert op in kernel, op
 
 
 STRIDED_COPY = """
@@ -726,18 +823,23 @@ STRIDED_COPY = """
         (
             [
                 (
-                    "    %t = arith.truncf",
-                    "    %w = memref.load %s[] : memref<f64>\n    %t = arith.truncf",
+                    "    %t = arith.truncf %s : f64 to f32",
+                    (
+                        "    %ii = arith.index_cast %i : index to i64\n"
+                        "    %if = arith.sitofp %ii : i64 to f64\n"
+                        "    %p = arith.mulf %if, %s : f64\n"
+                        "    %t = arith.truncf %p : f64 to f32"
+                    ),
                 )
             ],
-            "'s' is a host buffer, read by 'memref.load' in a kernel",
+            "'s' (f64) is used by 'arith.mulf' in a kernel",
         ),
         (
             [("  memref.copy %x, %tmp", STRIDED_COPY + "  memref.copy %x, %tmp")],
             "'memref.copy' outside the kernels accesses a device buffer",
         ),
     ],
-    ids=["host-store", "host-alloc", "scalar-in-kernel", "strided-copy"],
+    ids=["host-store", "host-alloc", "f64-kernel-argument", "strided-copy"],
 )
 def test_host_access_to_device_memory_is_unsupported(
     edits: list[tuple[str, str]], match: str

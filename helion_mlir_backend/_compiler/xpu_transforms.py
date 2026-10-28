@@ -82,11 +82,20 @@ def prepare_for_xegpu() -> ir.Module:
 def legalize_host_ops() -> ir.Module:
     """Schedule: every function's host code, after bufferization, legalized for
     device buffers (``legalize_host_ops``: copies and fills as GPU runtime calls,
-    a definite failure for other host accesses of device memory)."""
+    a definite failure for other host accesses of device memory).
+
+    First, the scalar code of the grid loops (the future kernels) that does not
+    depend on them moves out (``hoist_invariant_scalars``): e.g. the conversion
+    of an ``f64`` runtime scalar to an ``f32`` kernel's type runs on the host, so
+    the kernel takes the ``f32`` value. A kernel that would still take a float
+    wider than 32 bits (the XPU has no native ``f64``) fails.
+    """
     ht.HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
-        ht.legalize_host_ops(funcs)
+        grid_loops = lh_transform.match_op(named_seq.bodyTarget, "scf.forall")
+        ht.hoist_invariant_scalars(grid_loops)
+        ht.legalize_host_ops(funcs, max_float_width=32)
         lh_transform.cleanup(named_seq.bodyTarget)
         transform.yield_()
     return schedule

@@ -41,7 +41,9 @@ Kernels on `xpu` tensors (or with `target="xpu"` / `HELION_MLIR_TARGET=xpu`) use
 XPU target: lighthouse's XeGPU pipeline (`xegpu`, the only XPU pipeline), with
 Helion's grid loops as the workgroup tiles. Each top-level `hl.tile` loop becomes one
 kernel launch; the launches of a kernel (`hl.barrier()` phases included) run in
-program order on one stream. Runtime scalars stay on the host.
+program order on one stream. Runtime scalars are passed by value and converted to the
+kernel's types on the host, so a kernel never takes an `f64` (a kernel that would, e.g.
+one doing `f64` math on a scalar, is rejected).
 
 Status: IR only. Without an XPU, kernels lower to annotated XeGPU (`xegpu-wg`) and to
 LLVM/XeVM without device binaries (`xevm`):

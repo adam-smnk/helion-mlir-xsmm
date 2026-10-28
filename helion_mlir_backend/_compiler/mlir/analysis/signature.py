@@ -8,7 +8,7 @@ view of a declared parameter holding the same elements in the same order (a
 reshape) is not a ref: it lowers to a reshape of that parameter. Any other view
 (a slice, a transpose) is a ref of its own, which the host code computes.
 
-Runtime scalars are symbolic ints/floats with a host origin (non-constexpr scalar
+Runtime scalars are symbolic ints/floats/bools with a host origin (non-constexpr scalar
 parameters); Helion keys them by type only, so their values are call arguments.
 """
 
@@ -178,7 +178,7 @@ def _runtime_scalar(hf: HostFunction, node: torch.fx.Node) -> ScalarArg | None:
     key = node.args[0]
     value = node.meta.get("val")
     if (
-        not isinstance(value, (torch.SymInt, torch.SymFloat))
+        not isinstance(value, (torch.SymInt, torch.SymFloat, torch.SymBool))
         or not value.node.expr.free_symbols
         or block_id_from_key(key) is not None
         or symbol_origin_info(hf, value) is not None
@@ -189,6 +189,8 @@ def _runtime_scalar(hf: HostFunction, node: torch.fx.Node) -> ScalarArg | None:
         return None
     if isinstance(value, torch.SymFloat):
         return ScalarArg(key, symbol_origin.origin.host_str(), torch.float64)
+    if isinstance(value, torch.SymBool):
+        return ScalarArg(key, symbol_origin.origin.host_str(), torch.bool)
     return ScalarArg(key, symbol_origin.origin.host_str(), torch.int64, value.node.expr)
 
 
