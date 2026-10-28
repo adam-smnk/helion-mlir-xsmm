@@ -74,7 +74,8 @@ def lower_mlir(
     without JIT-compiling it: the IR a call would run, or an earlier stage of it.
 
     ``target`` and ``pipeline`` as for :func:`compile_mlir` (``pipeline``
-    defaults to the config's ``mlir_pipeline``, then the target's). ``stop_at`` is
+    defaults to the config's ``mlir_pipeline``, then the target's; the config's
+    ``xegpu_*`` keys apply on the XPU). ``stop_at`` is
     a stage of the target's lowering: on the XPU ``"xegpu-wg"`` (annotated
     XeGPU), ``"xevm"`` (LLVM/XeVM, no device binary) or ``"binary"``; default:
     ``HELION_MLIR_XPU_STOP_AT`` on the XPU, else the full lowering (the LLVM
@@ -92,6 +93,7 @@ def lower_mlir(
         pipeline = config.get(PIPELINE_CONFIG_KEY)
     with env:
         module = get_backend_class("mlir")().generate_mlir(hf, config, env)
+    mlir_target.configure(module, config)
     return lower_entry(
         module, hf.name, target=mlir_target, pipeline=pipeline, stop_at=stop_at
     )

@@ -29,7 +29,7 @@ def install() -> bool:
 
     register_compiler_backend(MLIRBackend)
     _patch_bound_kernel(BoundKernel, MLIRBackend, mlir_compile_config)
-    _allow_pipeline_config_key()
+    _allow_config_keys()
     _register_autotune_cache()
     _accept_mlir_module_globals()
     install_trace_mode()
@@ -72,13 +72,18 @@ def _register_autotune_cache() -> None:
     autotuner.cache_classes[CPU_AUTOTUNE_CACHE] = MLIRAutotuneCache
 
 
-def _allow_pipeline_config_key() -> None:
-    """Let configs carry ``mlir_pipeline``: Helion accepts only keys in ``VALID_KEYS``."""
+def _allow_config_keys() -> None:
+    """Let configs carry ``mlir_pipeline`` and the targets' lowering keys (e.g.
+    ``xegpu_sg_tiles``): Helion accepts only keys in ``VALID_KEYS``. Backends
+    that do not support them drop them from configs."""
     import helion.autotuner.config_spec as config_spec
 
     from helion_mlir_backend._compiler.mlir.support.debug import PIPELINE_CONFIG_KEY
+    from helion_mlir_backend._compiler.targets import target_config_keys
 
-    config_spec.VALID_KEYS = config_spec.VALID_KEYS | {PIPELINE_CONFIG_KEY}
+    config_spec.VALID_KEYS = (
+        config_spec.VALID_KEYS | {PIPELINE_CONFIG_KEY} | target_config_keys()
+    )
 
 
 def _patch_bound_kernel(

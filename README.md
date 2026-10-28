@@ -31,6 +31,9 @@ Selects compilation pipeline:
   - `opt`: Optimizing pipeline (default). Vectorization, parallelization etc.
   - `scalar`: Scalar lowering. A simple serial fallback; mostly useful for debugging.
   - `xegpu`: The XPU target's pipeline (its only one; CPU pipelines are rejected on the XPU).
+* **xegpu\_sg\_tiles**, **xegpu\_load\_tiles**, **xegpu\_prefetch\_tiles**,
+**xegpu\_prefetch\_depths**: XeGPU parameters per GPU kernel on the XPU, ignored on
+the CPU (see [XeGPU parameters](#xegpu-parameters)).
 
 ## XPU (experimental)
 
@@ -57,6 +60,39 @@ Supported for now: static shapes with block sizes dividing the sizes they tile, 
 grid loops with one matmul (f16/bf16 inputs, f32 accumulation, a K loop; epilogues
 and transposed operands included) or row reductions (e.g. softmax). Other kernels,
 e.g. elementwise-only ones, raise `UnsupportedOperationError`.
+
+### XeGPU parameters
+
+The workgroup tile and the K tile are the kernel's `block_sizes` (the grid tiles and
+the inner K tile). The other XeGPU parameters are inferred by lighthouse (its tuned
+database or cost model), or given in the config, per GPU kernel: each key is a list
+with one entry per top-level `hl.tile` loop, in program order (across `hl.barrier()`
+phases). An entry that is `None`, and every kernel past the end of a shorter list,
+keeps lighthouse's inference.
+
+| Key | Entry | Applies to |
+|-----|-------|------------|
+| `xegpu_sg_tiles` | `[sg_m, sg_n]` subgroup tile (`threads` = 16 x subgroups); `[rows, 0]` for a row reduction | GEMM, reduction kernels |
+| `xegpu_load_tiles` | `[a_m, a_k, b_k, b_n]`: A and B tiles loaded per instruction | GEMM kernels |
+| `xegpu_prefetch_tiles` | `[a_m, a_k, b_k, b_n]`: A and B prefetch tiles, in the operand's stored orientation (`[n, k]` for a transposed B) | GEMM kernels |
+| `xegpu_prefetch_depths` | `[a_nb, b_nb]`: K iterations A and B are prefetched ahead | GEMM kernels |
+
+```python
+config = helion.Config(
+    block_sizes=[256, 256, 32, 128, 256, 32],  # two GEMM kernels (hl.barrier)
+    xegpu_sg_tiles=[[64, 32], None],           # kernel 1: inferred
+    xegpu_load_tiles=[None, [16, 16, 32, 16]],
+    xegpu_prefetch_depths=[[2, 2]],            # kernel 1: inferred
+)
+```
+
+Before lowering, forced parameters are checked against each kernel's shapes with
+lighthouse's XeGPU constraints (`matmul_constraints`, the cost model's register and
+DPAS limits); invalid ones, malformed entries and lists longer than the number of
+kernels raise `XeGPUConfigError` (an `MLIRBackendError`, so the autotuner skips the
+config). The CPU target ignores the `xegpu_*` keys, so one config can serve both
+devices. The autotuner does not search them yet; on the XPU it searches matmul tiles
+of at least 32 (M, N) and 16 (K), with K tiles below K.
 
 Device binaries and execution need an LLVM built with the SPIR-V target and the Level
 Zero runtime (`-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=SPIRV -DMLIR_ENABLE_LEVELZERO_RUNNER=1`

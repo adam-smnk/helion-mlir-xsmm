@@ -23,6 +23,7 @@ from helion import exc
 from helion._compiler.backend import Backend
 
 from ..targets import resolve_target
+from ..targets import target_config_keys
 from .support.debug import PIPELINE_CONFIG_KEY
 from .support.errors import MLIRBackendError
 
@@ -59,8 +60,9 @@ class MLIRBackend(Backend):
     def supports_config_key(self, key: str) -> bool:
         """Only block sizes shape the generated IR; ``mlir_pipeline`` picks the
         target's lighthouse pipeline (default on the CPU: ``HELION_MLIR_PIPELINE``,
-        else ``opt``)."""
-        return key in _CONFIG_KEYS
+        else ``opt``). Each target's lowering keys (``xegpu_*`` on the XPU) are
+        accepted on every device: the other targets ignore them."""
+        return key in _CONFIG_KEYS or key in target_config_keys()
 
     def supports_precompile(self) -> bool:
         return False

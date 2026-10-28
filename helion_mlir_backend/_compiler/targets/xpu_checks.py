@@ -25,14 +25,17 @@ _DPAS_ACCUMULATOR = "f32"
 _CPU = "target='cpu' (CPU tensors)"
 
 
-def check_xegpu_capabilities(module: ir.Module, entry: str) -> None:
+def check_xegpu_capabilities(module: ir.Module, entry: str) -> list[ir.Operation]:
     """Raise :class:`UnsupportedOperationError` if ``entry`` of the inlined
-    ``module`` is outside what the XeGPU pipeline compiles."""
+    ``module`` is outside what the XeGPU pipeline compiles; returns its grid
+    loops (top-level ``scf.forall``), one GPU kernel each, in program order."""
     func = _function(module, entry)
     _check_static_arguments(func)
-    for loop in _grid_loops(func):
+    loops = _grid_loops(func)
+    for loop in loops:
         _check_full_tiles(loop)
         _check_kernel_class(loop)
+    return loops
 
 
 def _function(module: ir.Module, name: str) -> ir.Operation:

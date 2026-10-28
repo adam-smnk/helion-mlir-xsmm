@@ -62,7 +62,8 @@ def compile_kernel(
     ``target`` names the device target (default: ``HELION_MLIR_TARGET``, else
     the one for ``env.device``). ``pipeline`` defaults to the config's
     ``mlir_pipeline``, then the target's default (``HELION_MLIR_PIPELINE``, else
-    ``opt`` on the CPU).
+    ``opt`` on the CPU). The target's config keys (e.g. ``xegpu_*`` on the XPU)
+    apply to its lowering; other targets ignore them.
     """
     mlir_target = resolve_target(env.device, target)
     if pipeline is None:
@@ -77,6 +78,7 @@ def compile_kernel(
             name: builder.context.sizes.ref(name)
             for name in builder.context.signature.refs
         }
+    mlir_target.configure(module, config)
     entry = compile_entry(module, hf.name, target=mlir_target, pipeline=pipeline)
     host_globals = host_function.__globals__
     arg_exprs = [

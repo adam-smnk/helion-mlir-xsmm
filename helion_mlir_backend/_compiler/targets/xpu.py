@@ -8,6 +8,13 @@ one stream, then synchronizes (``gpu-async-region``): phases of a kernel with
 ``hl.barrier()`` are separate launches. Runtime scalars stay host buffers, read on
 the host and passed to the kernels by value.
 
+XeGPU parameters (subgroup, load and prefetch tiles, prefetch depths) come from
+the config's ``xegpu_*`` keys, per GPU kernel (``xpu_params``), else from
+lighthouse's inference. Each grid loop is tagged with its kernel index before
+lowering, so the outlining and layout stages apply each kernel's parameters to
+its own ``gpu.launch`` and ``gpu.func`` (lighthouse's stages apply one parameter
+set to all kernels).
+
 Only the IR stages run without an XPU-capable LLVM build: ``xegpu-wg`` (annotated
 XeGPU) and ``xevm`` (LLVM/XeVM without device binaries). Binaries need the SPIR-V
 target, execution the Level Zero runtime (``libmlir_levelzero_runtime.so``).
@@ -40,9 +47,21 @@ from ..mlir.support.errors import UnsupportedTargetError
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from .base import MLIRTarget
 from .xpu_checks import check_xegpu_capabilities
+from .xpu_params import XEGPU_CONFIG_KEYS
+from .xpu_params import KernelParams
+from .xpu_params import attach_params
+from .xpu_params import check_params
+from .xpu_params import kernel_shape
+from .xpu_params import take_params
+from .xpu_params import xegpu_params
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from collections.abc import Sequence
+
+    from helion._compiler.device_ir import DeviceIR
+    from helion.autotuner.config_spec import BlockSizeSpec
+    from helion.autotuner.config_spec import ConfigSpec
 
 _RUNTIME_LIB = "libmlir_levelzero_runtime.so"
 _PIPELINES = ("xegpu",)
@@ -50,6 +69,10 @@ _CPU = "target='cpu' (CPU tensors)"
 _NO_PATTERN = "Could not apply any of the defined patterns"
 """Lighthouse's failure when no kernel class (GEMM, attention, reduction) matches."""
 _IR_ONLY = "HELION_MLIR_XPU_STOP_AT=xegpu-wg or xevm (IR only)"
+_MIN_WG_TILE = 32
+"""Smallest matmul M/N block size searched: lighthouse's subgroup tiles are 16
+(small dims) or 32..128."""
+_DPAS_K = 16
 _LLVM_BUILD = (
     "an LLVM built with -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=SPIRV "
     "-DMLIR_ENABLE_LEVELZERO_RUNNER=1 and Python bindings, at the commit of the "
@@ -99,9 +122,12 @@ def _translated(exc: Exception, stage: str) -> Exception:
     return exc
 
 
-def _stages(stop_at: str) -> list[tuple[str, Stage]]:
-    """The XeGPU stage list, up to ``stop_at``; lighthouse's dialects must be
-    loaded (schedules use its transform ops)."""
+def _stages(
+    entry: str, kernels: Sequence[KernelParams], stop_at: str
+) -> list[tuple[str, Stage]]:
+    """The XeGPU stage list of ``entry``, whose tagged grid loops are GPU kernels
+    with parameters ``kernels``, up to ``stop_at``; lighthouse's dialects must
+    be loaded (schedules use its transform ops)."""
     context = ir.Context.current
     schedules = [
         ("prepare", xpu_transforms.prepare_for_xegpu()),
@@ -110,9 +136,10 @@ def _stages(stop_at: str) -> list[tuple[str, Stage]]:
         ("vectorized", xegpu.vectorize_schedule()),
         ("bufferized", xegpu.bufferize_schedule()),
         ("host-legalized", xpu_transforms.legalize_host_ops()),
-        ("gpu-outlining", xegpu.outline_gpu_func_schedule()),
+        # Lighthouse's outline_gpu_func and annotate_layouts schedules, per kernel.
+        ("gpu-outlining", xpu_transforms.outline_kernels(entry, kernels)),
         ("xegpu-initial", xegpu.vector_to_xegpu_schedule()),
-        ("xegpu-wg", xegpu.annotate_layouts_schedule()),
+        ("xegpu-wg", xpu_transforms.annotate_kernels(entry, kernels)),
     ]
     if stop_at != "xegpu-wg":
         binary_format = "skip" if stop_at == "xevm" else "fatbin"
@@ -156,6 +183,7 @@ class XpuTarget(MLIRTarget):
 
     name = "xpu"
     pipelines = _PIPELINES
+    config_keys = XEGPU_CONFIG_KEYS
     stop_points = XPU_STOP_POINTS
 
     def __init__(self) -> None:
@@ -168,6 +196,10 @@ class XpuTarget(MLIRTarget):
     def default_stop_at(self) -> str | None:
         return xpu_stop_at()
 
+    def configure(self, module: ir.Module, config: Mapping[str, object]) -> None:
+        """Record the config's per-kernel ``xegpu_*`` parameters on ``module``."""
+        attach_params(module, xegpu_params(config))
+
     def lowering(
         self,
         module: ir.Module,
@@ -176,13 +208,22 @@ class XpuTarget(MLIRTarget):
         stop_at: str | None = None,
     ) -> XpuLowering:
         """The XeGPU stage list, after checking that ``module`` (inlined) is in
-        what it compiles (:func:`check_xegpu_capabilities`)."""
+        what it compiles (:func:`check_xegpu_capabilities`) and that its
+        recorded XeGPU parameters fit its kernels (:func:`check_params`). Tags
+        each grid loop (GPU kernel) with its index for the per-kernel stages."""
         self.resolve_pipeline(pipeline)
         self.check_stop_at(stop_at)
-        check_xegpu_capabilities(module, entry)
+        loops = check_xegpu_capabilities(module, entry)
+        params = take_params(module)
+        if params:
+            check_params(params, [kernel_shape(loop) for loop in loops])
+        i64 = ir.IntegerType.get_signless(64)
+        for index, loop in enumerate(loops):
+            loop.attributes[xpu_transforms.KERNEL_ATTR] = ir.IntegerAttr.get(i64, index)
+        kernels = [*params, *[KernelParams()] * (len(loops) - len(params))]
         # Loads lighthouse's dialects, which building the schedules needs.
         BackendDriver(module, entry, result_to_args=False, benchmark=False)
-        stages = _stages(stop_at or self.stop_points[-1])
+        stages = _stages(entry, kernels, stop_at or self.stop_points[-1])
         return XpuLowering(stages, DebugOptions.from_env().dump_stages)
 
     def runner(self, module: ir.Module) -> Runner:
@@ -224,6 +265,35 @@ class XpuTarget(MLIRTarget):
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             return torch.xpu.get_device_name()
         return "xpu"
+
+    def adjust_config_spec(self, config_spec: ConfigSpec, device_ir: DeviceIR) -> None:
+        """Matmul tiles XeGPU can lower: M and N tiles of at least
+        :data:`_MIN_WG_TILE` (subgroup tiles are multiples of DPAS 8x16 and the
+        workgroup holds several), K tiles of at least DPAS K (16) and below K (the
+        K loop must stay); each clamped to what the dimension allows."""
+        block_sizes = config_spec.block_sizes
+
+        def spec(block_id: int | None) -> BlockSizeSpec | None:
+            if block_id is None:
+                return None
+            try:
+                return block_sizes.block_id_lookup(block_id)
+            except KeyError:
+                return None
+
+        for fact in config_spec.matmul_facts:
+            for block_id, minimum in (
+                (fact.m_block_id, _MIN_WG_TILE),
+                (fact.n_block_id, _MIN_WG_TILE),
+                (fact.k_block_id, _DPAS_K),
+            ):
+                if (block := spec(block_id)) is not None:
+                    block.update_min(min(minimum, block.max_size))
+            k_block = spec(fact.k_block_id)
+            if k_block is not None and fact.static_k is not None and fact.static_k > 1:
+                below_k = 1 << ((fact.static_k - 1).bit_length() - 1)
+                if below_k >= k_block.min_size:
+                    k_block.update_max(below_k)
 
     def validate_environment(self, stop_at: str | None = None) -> None:
         """Lowering to ``xegpu-wg`` or ``xevm`` needs nothing; binaries need

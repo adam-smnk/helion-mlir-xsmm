@@ -20,15 +20,28 @@ if TYPE_CHECKING:
 
     import torch
 
-__all__ = ["CpuTarget", "MLIRTarget", "XpuTarget", "get_target", "resolve_target"]
+__all__ = [
+    "CpuTarget",
+    "MLIRTarget",
+    "XpuTarget",
+    "get_target",
+    "resolve_target",
+    "target_config_keys",
+]
 
 _FACTORIES: dict[str, Callable[[], MLIRTarget] | None] = {
     "cpu": CpuTarget,
     "xpu": XpuTarget,
 }
+_TARGET_CLASSES: tuple[type[MLIRTarget], ...] = (CpuTarget, XpuTarget)
 _DEVICE_TARGETS = {"cpu": "cpu", "xpu": "xpu"}
 """The target of each ``torch.device`` type under ``auto``."""
 _INSTANCES: dict[str, MLIRTarget] = {}
+
+
+def target_config_keys() -> frozenset[str]:
+    """The config keys of every target's lowering (:attr:`MLIRTarget.config_keys`)."""
+    return frozenset().union(*(cls.config_keys for cls in _TARGET_CLASSES))
 
 
 def get_target(name: str) -> MLIRTarget:

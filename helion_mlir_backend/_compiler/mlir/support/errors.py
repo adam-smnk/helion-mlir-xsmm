@@ -54,6 +54,14 @@ class UnsupportedTargetError(UnsupportedOperationError, NotImplementedError):
     """
 
 
+class XeGPUConfigError(MLIRBackendError, ValueError):
+    """Raised for ``xegpu_*`` config values the XPU target cannot apply: malformed
+    entries, more entries than the kernel has GPU kernels, or tiles outside
+    lighthouse's XeGPU constraints for the kernel's shapes.
+
+    Also a :class:`ValueError`; the autotuner skips such configs."""
+
+
 class ShapeError(MLIRBackendError):
     """Raised when shape inference fails."""
 

@@ -16,6 +16,7 @@ from typing import Protocol
 import mlir.ir as ir
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from collections.abc import Sequence
 
     from helion._compiler.device_ir import DeviceIR
@@ -40,6 +41,9 @@ class MLIRTarget(abc.ABC):
     """``cpu`` or ``xpu``; also part of JIT and autotune cache keys."""
     pipelines: ClassVar[tuple[str, ...]]
     """The names of the target's lighthouse pipelines."""
+    config_keys: ClassVar[frozenset[str]] = frozenset()
+    """Config keys of the target's lowering, besides ``block_sizes`` and
+    ``mlir_pipeline`` (other targets ignore them: a config can serve several)."""
     stop_points: ClassVar[tuple[str, ...]] = ()
     """The stages, in order, a lowering can stop after to inspect its IR; the last
     is the full lowering. Empty: only full lowerings."""
@@ -77,6 +81,14 @@ class MLIRTarget(abc.ABC):
     def is_full(self, stop_at: str | None) -> bool:
         """Whether a lowering stopping at ``stop_at`` is complete (JIT-able)."""
         return stop_at is None or stop_at == self.stop_points[-1]
+
+    def configure(self, module: ir.Module, config: Mapping[str, object]) -> None:
+        """Record in ``module`` (generated with ``config``) what its
+        :attr:`config_keys` ask of :meth:`lowering`, as module attributes: equal
+        modules then lower equally (the JIT cache is keyed by module text).
+        Raises ``MLIRBackendError`` for malformed values (default: nothing to
+        record)."""
+        return
 
     @abc.abstractmethod
     def lowering(
