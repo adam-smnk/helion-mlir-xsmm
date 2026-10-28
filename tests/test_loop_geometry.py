@@ -232,7 +232,7 @@ def test_sfc_remap_applies_to_normalized_forall() -> None:
     import mlir.ir as ir
 
     from helion_mlir_backend._compiler.execution import inline_module
-    from helion_mlir_backend._compiler.execution import pipeline_descriptor
+    from helion_mlir_backend._compiler.targets.cpu import pipeline_descriptor
 
     module = inline_module(
         generate_mlir(f32_matmul_32, [torch.randn(128, 64), torch.randn(64, 128)])

@@ -102,7 +102,7 @@ packages = ["helion_mlir_backend"]
 
 [tool.uv.sources]
 torch = { index = "pytorch" }
-lighthouse = { git = "https://github.com/llvm/lighthouse", rev = "eb90452" }
+lighthouse = { git = "https://github.com/llvm/lighthouse", rev = "f75ba24" }
 
 [[tool.uv.index]]
 name = "pytorch"

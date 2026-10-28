@@ -92,6 +92,7 @@ pre-commit run -a
 | `HELION_MLIR_DUMP_PRE_LOWERING` | After inlining / all pre-passes, immediately before the lighthouse lowering schedule |
 | `HELION_MLIR_DUMP_LOWERED` | After lighthouse lowering (LLVM dialect, expanded memref descriptors) |
 | `HELION_MLIR_PIPELINE=opt\|scalar` | Selects compilation pipeline (default: `opt`) |
+| `HELION_MLIR_TARGET=auto\|cpu\|xpu` | Selects the device target (default: `auto`, from the kernel's tensors; an explicit `target=` of `generate_mlir`/`compile_mlir` wins). `meta` tensors need a named target; `xpu` is reserved (not implemented yet) |
 
 ## License
 

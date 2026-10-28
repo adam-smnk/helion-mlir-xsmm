@@ -7,6 +7,9 @@ import os
 
 _FALSE_VALUES = ("", "0", "false", "no")
 PIPELINES = ("opt", "scalar")
+"""The CPU target's lighthouse pipelines."""
+TARGETS = ("auto", "cpu", "xpu")
+"""``HELION_MLIR_TARGET`` values; ``auto`` follows the device."""
 PIPELINE_CONFIG_KEY = "mlir_pipeline"
 """Config key naming the lighthouse pipeline (``opt``/``scalar``) of one config."""
 
@@ -41,6 +44,15 @@ def default_pipeline() -> str:
             f"HELION_MLIR_PIPELINE={pipeline!r}; expected one of {PIPELINES}"
         )
     return pipeline
+
+
+def target_override() -> str | None:
+    """``HELION_MLIR_TARGET`` (``cpu`` or ``xpu``); ``None`` if unset or ``auto``
+    (the target follows the device of the kernel's tensors)."""
+    target = os.environ.get("HELION_MLIR_TARGET", "").strip() or "auto"
+    if target not in TARGETS:
+        raise ValueError(f"HELION_MLIR_TARGET={target!r}; expected one of {TARGETS}")
+    return None if target == "auto" else target
 
 
 def compile_timeout() -> float | None:

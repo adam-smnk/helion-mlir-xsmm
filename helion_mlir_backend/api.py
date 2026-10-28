@@ -18,15 +18,22 @@ def generate_mlir(
     args: list[object],
     *,
     config: object | None = None,
+    target: str | None = None,
 ) -> ir.Module:
     """Lower a Helion kernel to an MLIR Linalg-on-Tensors module.
 
     The module holds one private tensor function per phase and a public
-    memref-ABI entry function named after the kernel.
+    memref-ABI entry function named after the kernel. ``target`` (``"cpu"`` or
+    ``"xpu"``; default: ``HELION_MLIR_TARGET``, else the device of ``args``)
+    names the device target the module is generated for.
     """
     from helion._compiler.backend_registry import get_backend_class
 
+    from helion_mlir_backend._compiler.targets import resolve_target
+
     hf, config, env = _compile(kernel, args, config)
+    # Codegen is target-neutral; the target is only checked to exist.
+    resolve_target(env.device, target)
     with env:
         return get_backend_class("mlir")().generate_mlir(hf, config, env)
 
@@ -36,19 +43,22 @@ def compile_mlir(
     args: list[object],
     *,
     config: object | None = None,
+    target: str | None = None,
     pipeline: str | None = None,
 ) -> Callable[..., object]:
     """Compile a Helion kernel for ``args``' shapes and dtypes into a callable.
 
     The callable has the kernel's signature and Helion semantics: it runs the
     kernel's host code on each call and returns the kernel's return value.
-    ``pipeline`` is ``"opt"`` or ``"scalar"`` (default: ``HELION_MLIR_PIPELINE``,
-    else ``"opt"``).
+    ``target`` (``"cpu"`` or ``"xpu"``; default: ``HELION_MLIR_TARGET``, else the
+    device of ``args``) names the device target. ``pipeline`` is one of the
+    target's pipelines; on the CPU ``"opt"`` or ``"scalar"`` (default:
+    ``HELION_MLIR_PIPELINE``, else ``"opt"``).
     """
     from helion_mlir_backend._compiler.mlir.driver import compile_kernel
 
     hf, config, env = _compile(kernel, args, config)
-    return compile_kernel(hf, config, env, pipeline=pipeline)
+    return compile_kernel(hf, config, env, target=target, pipeline=pipeline)
 
 
 def _compile(

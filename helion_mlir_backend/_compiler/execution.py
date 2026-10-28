@@ -1,11 +1,12 @@
 """Lower a generated module with lighthouse and JIT its memref-ABI entry function.
 
 :func:`compile_entry` returns a :class:`CompiledEntry` that takes the entry's
-buffers in argument order. Failures keep their exception type and get a note
-naming the stage. Lighthouse lowering runs in a forked process, killed after the
-compile timeout; only the lowered module comes back. Compiled entries are cached
-in-process by module text and pipeline, so equal modules (e.g. configs that clamp
-to the same tiles) JIT once.
+buffers in argument order. The device target (``targets/``) supplies the
+lighthouse lowering and the JIT runner. Failures keep their exception type and get
+a note naming the stage. Lighthouse lowering runs in a forked process, killed after
+the compile timeout; only the lowered module comes back. Compiled entries are
+cached in-process by module text, target and pipeline, so equal modules (e.g.
+configs that clamp to the same tiles) JIT once.
 """
 
 from __future__ import annotations
@@ -25,32 +26,30 @@ import tempfile
 from typing import TYPE_CHECKING
 import warnings
 
-from lighthouse.execution.runner import Runner
-from lighthouse.ingress.torch.compile import TorchMemoryManager
-from lighthouse.pipeline.descriptor import Descriptor
-from lighthouse.pipeline.driver import BackendDriver
 import mlir.ir as ir
 from mlir.passmanager import PassManager
 
 from helion_mlir_backend._compiler.mlir.in_place import update_carried_values_in_place
-from helion_mlir_backend._compiler.mlir.support.debug import PIPELINES
 from helion_mlir_backend._compiler.mlir.support.debug import DebugOptions
 from helion_mlir_backend._compiler.mlir.support.debug import compile_timeout
-from helion_mlir_backend._compiler.mlir.support.debug import default_pipeline
 from helion_mlir_backend._compiler.mlir.support.errors import CompileTimeoutError
 from helion_mlir_backend._compiler.mlir.support.type_utils import mlir_dtype_to_torch
+from helion_mlir_backend._compiler.targets import resolve_target
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from multiprocessing.connection import Connection
     from typing import BinaryIO
 
+    from lighthouse.execution.runner import Runner
     import torch
+
+    from helion_mlir_backend._compiler.targets import MLIRTarget
+    from helion_mlir_backend._compiler.targets.base import Lowering
 
 log = logging.getLogger(__name__)
 
-_PIPELINE_FILES = {"opt": "./pipeline.yaml", "scalar": "./scalar.yaml"}
-_JIT_CACHE: OrderedDict[tuple[str, str], CompiledEntry] = OrderedDict()
+_JIT_CACHE: OrderedDict[tuple[str, str, str], CompiledEntry] = OrderedDict()
 _JIT_CACHE_SIZE = 128
 
 
@@ -58,15 +57,6 @@ def _dump_if(enabled: bool, label: str, module: ir.Module) -> None:
     if enabled:
         print(f"=== {label} ===", flush=True)
         print(module, flush=True)
-
-
-def pipeline_descriptor(pipeline: str | None = None) -> Descriptor:
-    """The lighthouse pipeline by name (default: :func:`default_pipeline`)."""
-    if pipeline is None:
-        pipeline = default_pipeline()
-    if pipeline not in _PIPELINE_FILES:
-        raise ValueError(f"unknown pipeline {pipeline!r}; expected one of {PIPELINES}")
-    return Descriptor(_PIPELINE_FILES[pipeline], base_path=os.path.dirname(__file__))
 
 
 def inline_module(module: ir.Module) -> ir.Module:
@@ -98,6 +88,8 @@ class CompiledEntry:
     name: str
     args: tuple[EntryArg, ...]
     runner: Runner
+    target: MLIRTarget
+    """The target compiled for: its checks and hooks apply to every call."""
 
     def __post_init__(self) -> None:
         # The ctypes callable of the packed C interface, looked up once.
@@ -186,20 +178,28 @@ def entry_args(module: ir.Module, entry: str) -> tuple[EntryArg, ...]:
 
 
 def compile_entry(
-    module: ir.Module, entry: str, *, pipeline: str | None = None
+    module: ir.Module,
+    entry: str,
+    *,
+    target: MLIRTarget | None = None,
+    pipeline: str | None = None,
 ) -> CompiledEntry:
-    """Inline, lower and JIT-compile ``entry`` (consumes ``module``), or reuse the
-    entry compiled from an identical module with the same pipeline."""
+    """Inline, lower and JIT-compile ``entry`` (consumes ``module``) for ``target``
+    (default: :func:`resolve_target` for the CPU), or reuse the entry compiled from
+    an identical module for the same target and pipeline. ``pipeline`` defaults to
+    the target's."""
+    if target is None:
+        target = resolve_target()
     if pipeline is None:
-        pipeline = default_pipeline()
+        pipeline = target.default_pipeline()
     debug = DebugOptions.from_env()
     if debug.dump_ir or debug.dump_pre_lowering or debug.dump_lowered:
-        return _compile_entry(module, entry, pipeline, debug)
-    key = (hashlib.sha256(str(module).encode()).hexdigest(), pipeline)
+        return _compile_entry(module, entry, target, pipeline, debug)
+    key = (hashlib.sha256(str(module).encode()).hexdigest(), target.name, pipeline)
     if (compiled := _JIT_CACHE.get(key)) is not None:
         _JIT_CACHE.move_to_end(key)
         return compiled
-    compiled = _compile_entry(module, entry, pipeline, debug)
+    compiled = _compile_entry(module, entry, target, pipeline, debug)
     _JIT_CACHE[key] = compiled
     if len(_JIT_CACHE) > _JIT_CACHE_SIZE:
         _JIT_CACHE.popitem(last=False)
@@ -207,35 +207,42 @@ def compile_entry(
 
 
 def _compile_entry(
-    module: ir.Module, entry: str, pipeline: str, debug: DebugOptions
+    module: ir.Module,
+    entry: str,
+    target: MLIRTarget,
+    pipeline: str,
+    debug: DebugOptions,
 ) -> CompiledEntry:
+    target.validate_environment()
     args = entry_args(module, entry)
     _dump_if(debug.dump_ir, "MLIR before inlining", module)
     with _stage("inlining"):
         inline_module(module)
     _dump_if(debug.dump_pre_lowering, "MLIR before lighthouse lowering", module)
     with _stage(f"lowering with the lighthouse '{pipeline}' pipeline"):
-        lowered = _lower(module, entry, pipeline)
+        lowered = _lower(module, entry, target, pipeline)
     _dump_if(debug.dump_lowered, "MLIR after lighthouse lowering", lowered)
     with _stage("JIT compilation"):
-        runner = Runner(lowered, mem_manager_cls=TorchMemoryManager, shared_libs=[])
-    return CompiledEntry(entry, args, runner)
+        runner = target.runner(lowered)
+    return CompiledEntry(entry, args, runner, target)
 
 
-def _lower(module: ir.Module, entry: str, pipeline: str) -> ir.Module:
-    """Lower ``module`` with lighthouse, in a forked process under the compile
-    timeout: native passes cannot be interrupted, only killed with their process."""
+def _lower(
+    module: ir.Module, entry: str, target: MLIRTarget, pipeline: str
+) -> ir.Module:
+    """Lower ``module`` with the target's lighthouse ``pipeline``, in a forked
+    process under the compile timeout: native passes cannot be interrupted, only
+    killed with their process. The lowering is built here and applied there."""
     with module.context, ir.Location.unknown():
-        driver = BackendDriver(module, entry, result_to_args=False, benchmark=False)
-        driver.add_stage(pipeline_descriptor(pipeline))
+        lowering = target.lowering(module, entry, pipeline)
         timeout = compile_timeout()
         if timeout is None or "fork" not in multiprocessing.get_all_start_methods():
-            return driver.apply(module)
+            return lowering.apply(module)
     receiver, sender = multiprocessing.Pipe(duplex=False)
     with _anonymous_file() as stderr:
         child = multiprocessing.get_context("fork").Process(
             target=_lower_in_child,
-            args=(driver, module, sender, stderr.fileno()),
+            args=(lowering, module, sender, stderr.fileno()),
             daemon=True,
         )
         with warnings.catch_warnings():
@@ -278,9 +285,9 @@ def _anonymous_file() -> BinaryIO:
 
 
 def _lower_in_child(
-    driver: BackendDriver, module: ir.Module, sender: Connection, stderr: int
+    lowering: Lowering, module: ir.Module, sender: Connection, stderr: int
 ) -> None:
-    """Forked: apply the parent's driver to the parent's module (both copied on
+    """Forked: apply the parent's lowering to the parent's module (both copied on
     write) and send back the lowered module as bytecode. What lighthouse prints
     goes to ``stderr``: diagnostics of a lowering that succeeds are not errors."""
     os.dup2(stderr, 2)
@@ -288,7 +295,7 @@ def _lower_in_child(
     gc.disable()
     try:
         with module.context, ir.Location.unknown():
-            lowered = driver.apply(module)
+            lowered = lowering.apply(module)
         sender.send((True, _bytecode(lowered)))
     except Exception as exc:
         sender.send((False, _picklable(exc)))

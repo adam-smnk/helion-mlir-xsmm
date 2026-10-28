@@ -41,6 +41,13 @@ class UnsupportedOperationError(MLIRBackendError):
         self.alternatives = alternatives
 
 
+class UnsupportedTargetError(UnsupportedOperationError, NotImplementedError):
+    """Raised for a device (or target name) no MLIR target compiles for.
+
+    Also a :class:`NotImplementedError`, what device checks raised before targets.
+    """
+
+
 class ShapeError(MLIRBackendError):
     """Raised when shape inference fails."""
 

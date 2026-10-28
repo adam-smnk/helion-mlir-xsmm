@@ -15,7 +15,7 @@ from tests.harness import blocked_matmul_cases
 
 from helion_mlir_backend import generate_mlir
 from helion_mlir_backend._compiler.execution import inline_module
-from helion_mlir_backend._compiler.execution import pipeline_descriptor
+from helion_mlir_backend._compiler.targets.cpu import pipeline_descriptor
 
 _AMX_FEATURES = ["amx_bf16", "amx_tile", "amx_int8"]
 

@@ -13,6 +13,7 @@ import sympy
 import torch
 
 from ..execution import compile_entry
+from ..targets import resolve_target
 from .codegen import MLIRModuleBuilder
 from .host_code import build_host_function
 from .support import UnsupportedOperationError
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 
     from ..execution import CompiledEntry
     from ..execution import EntryArg
+    from ..targets import MLIRTarget
 
 
 def mlir_compile_config(
@@ -52,13 +54,17 @@ def compile_kernel(
     config: Config,
     env: CompileEnvironment,
     *,
+    target: str | None = None,
     pipeline: str | None = None,
 ) -> Callable[..., object]:
     """A callable with the kernel's own signature and Helion call semantics.
 
-    ``pipeline`` defaults to the config's ``mlir_pipeline``, then
-    ``HELION_MLIR_PIPELINE``, then ``opt``.
+    ``target`` names the device target (default: ``HELION_MLIR_TARGET``, else
+    the one for ``env.device``). ``pipeline`` defaults to the config's
+    ``mlir_pipeline``, then the target's default (``HELION_MLIR_PIPELINE``, else
+    ``opt`` on the CPU).
     """
+    mlir_target = resolve_target(env.device, target)
     if pipeline is None:
         pipeline = config.get(PIPELINE_CONFIG_KEY)
     with env:
@@ -71,7 +77,7 @@ def compile_kernel(
             name: builder.context.sizes.ref(name)
             for name in builder.context.signature.refs
         }
-    entry = compile_entry(module, hf.name, pipeline=pipeline)
+    entry = compile_entry(module, hf.name, target=mlir_target, pipeline=pipeline)
     host_globals = host_function.__globals__
     arg_exprs = [
         compile(arg.name, f"<helion-mlir-arg:{arg.name}>", "eval") for arg in entry.args
@@ -107,13 +113,16 @@ def call_entry(
 ) -> list[torch.Tensor]:
     """Call ``entry`` with one value per argument; returns the inout tensors.
 
-    Tensors are passed contiguous (a copy for strided ones, copied back for inouts).
-    An input that overlaps an inout is cloned so the ``restrict`` arguments hold;
-    overlapping inouts are rejected. ``sizes`` (each argument's size expressions)
-    lets runtime sizes the kernel assumes equal be checked.
+    The entry's target checks each tensor (e.g. its device) and prepares and
+    finishes the call. Tensors are passed contiguous (a copy for strided ones,
+    copied back for inouts). An input that overlaps an inout is cloned so the
+    ``restrict`` arguments hold; overlapping inouts are rejected. ``sizes`` (each
+    argument's size expressions) lets runtime sizes the kernel assumes equal be
+    checked.
     """
+    target = entry.target
     tensors = [
-        _checked_tensor(arg, value)
+        _checked_tensor(target, arg, value)
         for arg, value in zip(entry.args, values, strict=True)
         if arg.role != "scalar"
     ]
@@ -146,22 +155,22 @@ def call_entry(
         for arg, value in zip(entry.args, values, strict=True)
         if arg.role == "scalar"
     ]
-    entry([*staged, *scalars])
+    buffers = [*staged, *scalars]
+    target.prepare_call(buffers)
+    entry(buffers)
+    target.finish_call(buffers)
     for tensor, copy, role in zip(tensors, staged, roles, strict=True):
         if role == "inout" and copy is not tensor:
             tensor.copy_(copy)
     return inouts
 
 
-def _checked_tensor(arg: EntryArg, value: object) -> torch.Tensor:
+def _checked_tensor(target: MLIRTarget, arg: EntryArg, value: object) -> torch.Tensor:
     if not isinstance(value, torch.Tensor):
         raise TypeError(
             f"'{arg.name}' must be a torch.Tensor, got {type(value).__name__}"
         )
-    if value.device.type != "cpu":
-        raise NotImplementedError(
-            f"'{arg.name}' is on {value.device}; only CPU is supported"
-        )
+    target.check_tensor(arg.name, value)
     if (
         value.dim() != len(arg.shape)
         or value.dtype != arg.dtype

@@ -30,7 +30,7 @@ def install() -> bool:
     register_compiler_backend(MLIRBackend)
     _patch_bound_kernel(BoundKernel, MLIRBackend, mlir_compile_config)
     _allow_pipeline_config_key()
-    _register_cpu_autotune_cache()
+    _register_autotune_cache()
     _accept_mlir_module_globals()
     install_trace_mode()
     install_original_args_capture()
@@ -61,13 +61,15 @@ def _accept_mlir_module_globals() -> None:
     CompileEnvironment._helion_mlir_module_globals = True
 
 
-def _register_cpu_autotune_cache() -> None:
+def _register_autotune_cache() -> None:
     from helion import autotuner
 
+    from helion_mlir_backend._compiler.mlir.autotune import AUTOTUNE_CACHE
     from helion_mlir_backend._compiler.mlir.autotune import CPU_AUTOTUNE_CACHE
-    from helion_mlir_backend._compiler.mlir.autotune import CpuAutotuneCache
+    from helion_mlir_backend._compiler.mlir.autotune import MLIRAutotuneCache
 
-    autotuner.cache_classes[CPU_AUTOTUNE_CACHE] = CpuAutotuneCache
+    autotuner.cache_classes[AUTOTUNE_CACHE] = MLIRAutotuneCache
+    autotuner.cache_classes[CPU_AUTOTUNE_CACHE] = MLIRAutotuneCache
 
 
 def _allow_pipeline_config_key() -> None:
