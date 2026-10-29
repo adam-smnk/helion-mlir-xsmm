@@ -1,6 +1,7 @@
-"""Helion XPU kernels of KernelBench level 1 problems, at the shapes and dtypes of
-AI-bench's ``mlir-gpu-bench`` variant (``AI-bench/problems/specs/KernelBench/
-level1/<name>.yaml``), for IR-level tests (``test_xpu_kernelbench.py``).
+"""Helion XPU kernels of KernelBench level 1 and level 2 problems, at the shapes
+and dtypes of AI-bench's ``mlir-gpu-bench`` variant (``AI-bench/problems/specs/
+KernelBench/level<n>/<name>.yaml``), for IR-level tests
+(``test_xpu_kernelbench.py``).
 
 The XeGPU pipeline compiles static, nicely shaped kernels: the block sizes below
 divide every size they tile (no masking), so each problem's block sizes are
@@ -30,6 +31,10 @@ chosen per shape:
 - Attention (97, bf16 ``[32, 32, 512, 64]``): written fused and tiled as flash
   attention (online softmax over K/V tiles), block sizes ``[1, 1, query rows,
   K/V rows]``; see :data:`ATTENTION_BLOCKS` for the hardware rationale.
+- Level 2 (``LEVEL2_PROBLEMS``): ``nn.Linear`` (``x @ weight.T + bias``, the
+  weight stored ``[out, in]``) and its whole elementwise epilogue fused in one
+  GEMM kernel, in f32 on the accumulator, rounded to bf16 once at the store;
+  see :data:`LINEAR_BLOCKS` for the hardware rationale.
 """
 
 from __future__ import annotations
@@ -51,11 +56,13 @@ BF16 = torch.bfloat16
 F32 = torch.float32
 
 
-def _kernel(block_sizes: list[int]) -> Callable[[Callable[..., object]], object]:
+def _kernel(
+    block_sizes: list[int], **xegpu: object
+) -> Callable[[Callable[..., object]], object]:
     return helion.kernel(
         backend="mlir",
         static_shapes=True,
-        config=helion.Config(block_sizes=block_sizes),
+        config=helion.Config(block_sizes=block_sizes, **xegpu),
     )
 
 
@@ -406,17 +413,180 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor
     return out
 
 
+# --- Level 2: nn.Linear + elementwise epilogue -------------------------------------
+#
+# ``epilogue(x @ weight.T + bias)`` of bf16 ``x: [M, K]``, ``weight: [N, K]`` (as
+# ``nn.Linear`` stores it: the GEMM reads B transposed) and ``bias: [N]``, in one
+# kernel per problem (a Helion kernel cannot close over an epilogue): the f32
+# accumulator plus the bias row (broadcast over the tile's rows), the epilogue in
+# f32, one rounding to bf16 at the store. The models' scalar inits are
+# ``hl.constexpr`` arguments, as AI-bench's level 1 XPU kernels take them.
+
+
+def _linear_subtract_multiply_relu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    subtract_value: hl.constexpr,
+    multiply_value: hl.constexpr,
+) -> torch.Tensor:
+    """KernelBench level 2 9: ``relu((linear(x) - subtract) * multiply)``."""
+    m, k = x.size()
+    n, _ = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], weight[tn, tk].T)
+        y = acc + bias[tn]
+        out[tm, tn] = torch.relu((y - subtract_value) * multiply_value).to(x.dtype)
+    return out
+
+
+def _linear_multiply_leaky_relu(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    multiplier: hl.constexpr,
+    negative_slope: hl.constexpr,
+) -> torch.Tensor:
+    """KernelBench level 2 12: ``leaky_relu(linear(x) * multiplier)``."""
+    m, k = x.size()
+    n, _ = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], weight[tn, tk].T)
+        y = (acc + bias[tn]) * multiplier
+        out[tm, tn] = F.leaky_relu(y, negative_slope=negative_slope).to(x.dtype)
+    return out
+
+
+def _linear_mish_mish(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """KernelBench level 2 29: ``mish(mish(linear(x)))``."""
+    m, k = x.size()
+    n, _ = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], weight[tn, tk].T)
+        y = acc + bias[tn]
+        out[tm, tn] = F.mish(F.mish(y)).to(x.dtype)
+    return out
+
+
+def _linear_scaling_residual_add(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    scaling_factor: hl.constexpr,
+) -> torch.Tensor:
+    """KernelBench level 2 40: ``y * scaling_factor + y`` of ``y = linear(x)``."""
+    m, k = x.size()
+    n, _ = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], weight[tn, tk].T)
+        y = acc + bias[tn]
+        out[tm, tn] = (y * scaling_factor + y).to(x.dtype)
+    return out
+
+
+def _linear_swish_scaling(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    scaling_factor: hl.constexpr,
+) -> torch.Tensor:
+    """KernelBench level 2 59: ``y * sigmoid(y) * scaling_factor`` of
+    ``y = linear(x)``."""
+    m, k = x.size()
+    n, _ = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], weight[tn, tk].T)
+        y = acc + bias[tn]
+        out[tm, tn] = (y * torch.sigmoid(y) * scaling_factor).to(x.dtype)
+    return out
+
+
+def _linear_relu_divide(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    divisor: hl.constexpr,
+) -> torch.Tensor:
+    """KernelBench level 2 63: ``relu(linear(x)) / divisor``."""
+    m, k = x.size()
+    n, _ = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], weight[tn, tk].T)
+        y = acc + bias[tn]
+        out[tm, tn] = (torch.relu(y) / divisor).to(x.dtype)
+    return out
+
+
+def _linear_sigmoid_scaling_residual_add(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    scaling_factor: hl.constexpr,
+) -> torch.Tensor:
+    """KernelBench level 2 70: ``sigmoid(y) * scaling_factor + y`` of
+    ``y = linear(x)``."""
+    m, k = x.size()
+    n, _ = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], weight[tn, tk].T)
+        y = acc + bias[tn]
+        out[tm, tn] = (torch.sigmoid(y) * scaling_factor + y).to(x.dtype)
+    return out
+
+
+def _linear_swish_divide_clamp_tanh_clamp(
+    x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    """KernelBench level 2 81: ``clamp(tanh(clamp(swish(y) / 2, -1, 1)), -1, 1)``
+    of ``y = linear(x)``."""
+    m, k = x.size()
+    n, _ = weight.size()
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], weight[tn, tk].T)
+        y = acc + bias[tn]
+        y = torch.clamp(y * torch.sigmoid(y) / 2.0, min=-1.0, max=1.0)
+        out[tm, tn] = torch.clamp(torch.tanh(y), min=-1.0, max=1.0).to(x.dtype)
+    return out
+
+
 # --- Problems ---------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
 class Problem:
-    """A KernelBench level 1 problem at its ``mlir-gpu-bench`` variant."""
+    """A KernelBench problem at its ``mlir-gpu-bench`` variant."""
 
     name: str
     """The KernelBench file name, without ``.py``."""
     kind: str
-    """``matmul``, ``elementwise``, ``reduction`` or ``attention``."""
+    """``matmul``, ``elementwise``, ``reduction``, ``attention`` or ``linear``
+    (level 2: ``nn.Linear`` and an epilogue)."""
     fn: Callable[..., object]
     shapes: tuple[tuple[int, ...], ...]
     """The input shapes, in argument order."""
@@ -424,10 +594,19 @@ class Problem:
     block_sizes: list[int]
     grid: tuple[int, ...]
     """The workgroup grid: the output size over the workgroup tile."""
+    scalars: tuple[float, ...] = ()
+    """``hl.constexpr`` arguments after the tensors (a model's scalar inits)."""
+    xegpu: dict[str, object] = field(default_factory=dict, compare=False)
+    """``xegpu_*`` config keys besides the block sizes (default: inferred)."""
     kernel: object = field(init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "kernel", _kernel(self.block_sizes)(self.fn))
+        kernel = _kernel(self.block_sizes, **self.xegpu)(self.fn)
+        object.__setattr__(self, "kernel", kernel)
+
+    def args(self, *tensors: object) -> list[object]:
+        """``tensors`` (one per shape) and the scalars, as the kernel takes them."""
+        return [*tensors, *(hl.constexpr(value) for value in self.scalars)]
 
 
 _GEMM_BLOCKS = [256, 256, 32]
@@ -594,3 +773,102 @@ RANK3_PROBLEMS: tuple[Problem, ...] = (
     ),
 )
 """Rank-3+ problems: block size 1 on the leading dims (folded away)."""
+
+
+LINEAR_BLOCKS = [256, 256, 32]
+"""Level 2 GEMM block sizes ``[M tile, N tile, K tile]``, picked from the hardware
+(Xe2: DPAS 8x16x16 bf16 -> f32, 16-lane subgroups, at most 32 subgroups per
+workgroup with the large register file, 2D block reads of at most 32 rows x 64
+bytes) and lighthouse's GEMM parameters for these shapes (its selector's
+workgroup and subgroup tiles; the K step and A loads of AI-bench's tuned
+``kb_params_level2-*.json`` for the lighthouse path):
+
+- 256x256 workgroups of 32 subgroups (inferred ``[8, 4]`` subgroups of 32x64:
+  4x4 DPAS blocks). Per subgroup the f32 accumulator takes 128 of the 256
+  64-byte registers, a K step's A (32x32) and B (32x64) bf16 tiles 32 + 64:
+  the large register file is needed, and 32 subgroups of it fill one Xe core
+  (8 vector engines x 4 threads). Per K step a workgroup reads 2x256x32 bf16
+  for 256x256x32 MACs: 128 flops per byte. The grid of 1024x8192 outputs is
+  4x32 (128 workgroups: 4 waves on B70's 32 Xe cores), of 16384x4096 64x16.
+- K steps of 32: two DPAS K steps per load, and an A tile of 32x32 bf16 (64
+  bytes wide) per subgroup, read with one 2D block read (``xegpu_load_tiles``
+  ``[32, 32, ...]``, as lighthouse's tuned parameters; inferred would be eight
+  8x16 reads). B (the weight, stored ``[N, K]``) is read transposed in 16x16
+  tiles (32-bit pairs: the transposed block read takes 32-bit elements, 8
+  wide), lighthouse's choice.
+- The epilogue runs once on the subgroup's 32x64 f32 accumulator in registers
+  (small next to the 8192/32 = 256 K steps, but its temporaries share the 32
+  registers the K loop leaves); the bias row is a gather of the subgroup's 64
+  columns (4 elements per lane), once per workgroup.
+"""
+LINEAR_SKINNY_BLOCKS = [128, 256, 32]
+"""59's ``M = 128`` (128 x 32768 x 32768): one 128-row workgroup tile, so the
+weight (2 GiB of bf16, the dominant traffic at 128 flops per byte) is read
+exactly once over the 1x128 grid (128 workgroups). 32 subgroups of 16x64
+(inferred ``[8, 4]``, as lighthouse's selector and tuned parameters), A tiles
+16x32 in one 2D block read (the tuned parameters read 8x16)."""
+_A_LOAD = {"xegpu_load_tiles": [[32, 32, 16, 16]]}
+_SKINNY_A_LOAD = {"xegpu_load_tiles": [[16, 32, 16, 16]]}
+
+
+def _linear(
+    name: str,
+    fn: Callable[..., object],
+    mnk: tuple[int, int, int],
+    scalars: tuple[float, ...] = (),
+) -> Problem:
+    """``fn`` of ``x: [M, K]``, ``weight: [N, K]`` and ``bias: [N]``."""
+    m, n, k = mnk
+    blocks, xegpu = (
+        (LINEAR_SKINNY_BLOCKS, _SKINNY_A_LOAD) if m < 256 else (LINEAR_BLOCKS, _A_LOAD)
+    )
+    shapes = ((m, k), (n, k), (n,))
+    # A dim of one tile is no grid dim (59: 1x128 launches 128 workgroups).
+    grid = tuple(tiles for tiles in (m // blocks[0], n // blocks[1]) if tiles > 1)
+    return Problem(name, "linear", fn, shapes, BF16, blocks, grid, scalars, xegpu)
+
+
+_LINEAR_MNK = (1024, 8192, 8192)
+
+LEVEL2_PROBLEMS: tuple[Problem, ...] = (
+    _linear(
+        "9_Matmul_Subtract_Multiply_ReLU",
+        _linear_subtract_multiply_relu,
+        _LINEAR_MNK,
+        (2.0, 1.5),
+    ),
+    _linear(
+        "12_Gemm_Multiply_LeakyReLU",
+        _linear_multiply_leaky_relu,
+        _LINEAR_MNK,
+        (2.0, 0.1),
+    ),
+    _linear("29_Matmul_Mish_Mish", _linear_mish_mish, _LINEAR_MNK),
+    _linear(
+        "40_Matmul_Scaling_ResidualAdd",
+        _linear_scaling_residual_add,
+        (16384, 4096, 4096),
+        (0.5,),
+    ),
+    _linear(
+        "59_Matmul_Swish_Scaling",
+        _linear_swish_scaling,
+        (128, 32768, 32768),
+        (2.0,),
+    ),
+    _linear("63_Gemm_ReLU_Divide", _linear_relu_divide, _LINEAR_MNK, (2.0,)),
+    _linear(
+        "70_Gemm_Sigmoid_Scaling_ResidualAdd",
+        _linear_sigmoid_scaling_residual_add,
+        _LINEAR_MNK,
+        (2.0,),
+    ),
+    _linear(
+        "81_Gemm_Swish_Divide_Clamp_Tanh_Clamp",
+        _linear_swish_divide_clamp_tanh_clamp,
+        _LINEAR_MNK,
+    ),
+)
+"""KernelBench level 2 problems with an ``mlir-gpu-bench`` variant: ``nn.Linear``
+(``(M, N, K)`` = batch, out, in features) and its epilogue, the spec's scalar
+inits as ``hl.constexpr``. bf16 like the variant (also the weight and bias)."""

@@ -62,7 +62,11 @@ Supported for now: static shapes with block sizes dividing the sizes they tile, 
 grid loops of one of these kernel classes:
 
 - one matmul: f16/bf16 inputs, f32 accumulation, a K loop; epilogues, casts of the
-  result and transposed operands (A, B or both) included;
+  result and transposed operands (A, B or both) included. E.g. `nn.Linear` with its
+  activations fused: `x @ weight.T` (the weight stored `[out, in]`), a bias row
+  broadcast over the tile's rows and any elementwise epilogue (scales, residual adds
+  of the result, ReLU/LeakyReLU, sigmoid/swish, tanh, clamps, Mish) on the f32
+  accumulator, rounded once at the store;
 - row reductions (lighthouse's 2D class): softmax, log-softmax, L1/L2 norms and other
   multi-pass row kernels; row results may also be stored as such (`out[tile_m] =
   acc.sum(-1)`, or a `keepdim` column);
@@ -120,6 +124,11 @@ per-instruction tile.
 shapes (`tests/test_xpu_kernelbench.py`, kernels and block sizes in
 `tests/kernelbench_xpu.py`): the matmuls 1, 2, 6, 7, 9, 13, 16, 17 and 18 (bf16), the
 elementwise 19-22, 25 and 27-32 (bf16), and the reductions 23, 24, 38 and 39 (f32).
+So do the level 2 problems with an `mlir-gpu-bench` variant, `nn.Linear` with its
+epilogue in one kernel (bf16, `LEVEL2_PROBLEMS`): 9, 12, 29, 40, 59, 63, 70 and 81
+(block sizes `[256, 256, 32]`, `[128, 256, 32]` for 59's 128 rows, A loaded in one
+block read per subgroup tile); their sources also run on the CPU target against the
+KernelBench models.
 
 ### XeGPU parameters
 
