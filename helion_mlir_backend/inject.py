@@ -32,6 +32,7 @@ def install() -> bool:
     _allow_config_keys()
     _register_autotune_cache()
     _accept_mlir_module_globals()
+    _keep_runtime_slice_sizes(MLIRBackend)
     install_trace_mode()
     install_original_args_capture()
     return True
@@ -59,6 +60,46 @@ def _accept_mlir_module_globals() -> None:
 
     CompileEnvironment.to_fake = to_fake
     CompileEnvironment._helion_mlir_module_globals = True
+
+
+def _keep_runtime_slice_sizes(MLIRBackend: type) -> None:
+    """Give a ``:`` slice of a dim known only at run time a reduction block.
+
+    The MLIR backend does not pad factory shapes to powers of two
+    (``MLIRBackend.pad_factory_tensors_to_power_of_2``). On such backends
+    Helion sizes ``:`` slices with ``try_concretize_symint``, which turns a
+    dim of a ``static_shapes=False`` kernel into the example input's size
+    without a guard: ``row / row.size(1)`` then divides by that size for
+    every input of the shape bucket. A dim that is a compile-time constant
+    (static or ``hl.specialize``) stays that constant; one known only at
+    run time gets a reduction block, as with padding, whose size the kernel
+    reads at run time.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.compile_environment import _has_unbacked
+    import sympy
+    import torch
+
+    if getattr(CompileEnvironment, "_helion_mlir_runtime_slice_sizes", False):
+        return
+    original = CompileEnvironment.try_concretize_symint
+
+    def try_concretize_symint(
+        self: CompileEnvironment, size: int | torch.SymInt
+    ) -> int | torch.SymInt:
+        if not isinstance(self.backend, MLIRBackend) or not isinstance(
+            size, torch.SymInt
+        ):
+            return original(self, size)
+        expr = self.shape_env.replace(size._sympy_())
+        if isinstance(expr, sympy.Integer):
+            return int(expr)
+        if _has_unbacked(expr):
+            return original(self, size)
+        return self.allocate_reduction_dimension(size).var
+
+    CompileEnvironment.try_concretize_symint = try_concretize_symint
+    CompileEnvironment._helion_mlir_runtime_slice_sizes = True
 
 
 def _register_autotune_cache() -> None:

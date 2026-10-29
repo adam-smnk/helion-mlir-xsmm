@@ -67,6 +67,17 @@ class MLIRBackend(Backend):
     def supports_precompile(self) -> bool:
         return False
 
+    @property
+    def pad_factory_tensors_to_power_of_2(self) -> bool:
+        """No: MLIR needs no power-of-two shapes (Triton does), and the
+        padding changes semantics. With it, a dim used in an on-device
+        factory (``hl.zeros([tile, dim])``) gets a reduction block of
+        next_pow2(dim), and every ``.size()`` of a ``:`` slice of that dim
+        anywhere in the loop returns the padded size (64 for 40). Without
+        it, Helion keeps ``:`` slices and factory dims at their real sizes,
+        as for Pallas."""
+        return False
+
     def autotune(
         self,
         bound_kernel: BoundKernel,

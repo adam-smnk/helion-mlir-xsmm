@@ -1,7 +1,9 @@
 """Regressions of contractions the CPU opt pipeline got wrong or rejected:
 operand ops fused into a contraction that raising it to ``linalg.contract``
 dropped (``split_contraction_operands``), and dot products of a 1x1 output
-tile vectorized to an invalid ``vector.contract`` (``vectorize_linalg``)."""
+tile vectorized to an invalid ``vector.contract`` (``vectorize_linalg``).
+Also attention whose head dim is not a power of two, which Helion's
+power-of-two factory padding broke (``test_slice_sizes.py``)."""
 
 from __future__ import annotations
 
@@ -90,12 +92,18 @@ def _normalized_error(out: torch.Tensor, ref: torch.Tensor) -> float:
 
 
 def _check_attention(
-    heads: int, seq: int, dim: int, dtype: torch.dtype, blocks: tuple[int, int]
+    heads: int,
+    seq: int,
+    dim: int,
+    dtype: torch.dtype,
+    blocks: tuple[int, int],
+    *,
+    vnni: bool = False,
 ) -> None:
     torch.manual_seed(0)
     q, k, v = (torch.randn(heads, seq, dim).to(dtype) for _ in range(3))
     out = _attention_kernel(*blocks)(
-        q, k, v, hl.constexpr(dim**-0.5), hl.constexpr(False)
+        q, k, v, hl.constexpr(dim**-0.5), hl.constexpr(vnni)
     )
     ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
     tolerance = 1e-2 if dtype == torch.bfloat16 else 1e-5
@@ -114,6 +122,20 @@ def test_attention_f32_sequence_length_1() -> None:
     vectorized to a ``vector.contract`` of a ``vector<f32>`` accumulator.
     AI-bench's 97 at B=1, H=2, S=1, D=32 in f32 (blocks 1, 1)."""
     _check_attention(2, 1, 32, torch.float32, (1, 1))
+
+
+def test_attention_bf16_vnni_head_dim_40() -> None:
+    """The ``acc`` factory padded D=40 to 64, so ``q_tile.size(1) // 2`` in
+    the VNNI reshape was 32: ``aten.view`` of a 64x40 tile to [64, 32, 2]
+    failed. 97's VNNI kernel at heads=2, S=64, D=40 unpadded (blocks 64, 64)."""
+    _check_attention(2, 64, 40, torch.bfloat16, (64, 64), vnni=True)
+
+
+def test_attention_f32_head_dim_7() -> None:
+    """``acc`` padded D=7 to 8, which failed to broadcast with the 7 wide
+    P@V product in Helion's tracing. AI-bench's 97 at B=1, H=2, S=16, D=7
+    in f32 (blocks 16, 16)."""
+    _check_attention(2, 16, 7, torch.float32, (16, 16))
 
 
 @helion.kernel(backend="mlir", config=helion.Config(block_sizes=[16, 16]))
