@@ -1,5 +1,9 @@
 # The optimizing (opt) pipeline.
 Pipeline:
+  # As Lighthouse's x86 pipeline: no asserts in Linalg op bodies (torch-mlir's
+  # reciprocal asserts a nonzero input, which a zero-padded partial tile is
+  # not; eager PyTorch returns inf).
+  - schedule: "asserts.py[gen=remove_asserts]"
   # Cleanup freshly imported IR.
   - pass: symbol-dce
   - pass: cse

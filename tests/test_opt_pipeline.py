@@ -688,6 +688,66 @@ def test_forward_rows_leaves_rank_1_alone() -> None:
     assert after == before
 
 
+@helion.kernel(backend="mlir", config=helion.Config(block_sizes=[8]))
+def reciprocal_rows_kernel(x: torch.Tensor) -> torch.Tensor:
+    """Rows scaled by the reciprocal of their sum of magnitudes (AI-bench's
+    38_L1Norm_, in one pass)."""
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(x.size(0)):
+        row = x[tile_m, :]
+        out[tile_m, :] = row * (1.0 / row.abs().sum(-1, keepdim=True))
+    return out
+
+
+def _softmax(x: torch.Tensor) -> torch.Tensor:
+    """AI-bench's 23_Softmax kernel: row softmax in passes over column chunks."""
+    m, n = x.shape
+    hl.specialize(n)
+    block_n = hl.register_block_size(n)
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        top = hl.full([tile_m, block_n], float("-inf"), dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            top = torch.maximum(top, x[tile_m, tile_n].to(torch.float32))
+        row_top = torch.amax(top, dim=-1, keepdim=True)
+        total = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            total = total + torch.exp(x[tile_m, tile_n].to(torch.float32) - row_top)
+        inv = 1.0 / total.sum(-1, keepdim=True)
+        for tile_n in hl.tile(n, block_size=block_n):
+            e = torch.exp(x[tile_m, tile_n].to(torch.float32) - row_top)
+            out[tile_m, tile_n] = (e * inv).to(x.dtype)
+    return out
+
+
+softmax_kernel = helion.kernel(
+    _softmax, backend="mlir", config=helion.Config(block_sizes=[64, 2])
+)
+
+
+def test_ragged_reciprocal_runs() -> None:
+    """Regression: torch-mlir's reciprocal asserts its input is nonzero; the
+    zero-padded rows of the partial last row tile (9 rows, tiles of 8) failed
+    it and aborted the kernel."""
+    torch.manual_seed(0)
+    x = torch.randn(9, 16)
+    expected = x / x.abs().sum(-1, keepdim=True)
+    torch.testing.assert_close(reciprocal_rows_kernel(x), expected)
+
+
+def test_ragged_softmax_runs() -> None:
+    """Regression: as for the reciprocal, on a 33x64 input in tiles of 2 rows."""
+    torch.manual_seed(0)
+    x = torch.randn(33, 64)
+    torch.testing.assert_close(softmax_kernel(x), torch.softmax(x, dim=-1))
+
+
+def test_lowered_reciprocal_has_no_asserts() -> None:
+    # A cf.assert lowers to a call to abort (its message is dropped).
+    text = str(lower_mlir(reciprocal_rows_kernel, [torch.randn(9, 16)]))
+    assert "@abort" not in text
+
+
 # A cast of VNNI pairs between the reshapes of flattened transfers.
 CAST_BETWEEN_RESHAPES = """
 func.func @f(%src: memref<64xf32>, %dst: memref<64xbf16>) {
