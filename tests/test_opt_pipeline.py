@@ -14,6 +14,7 @@ import helion.language as hl
 from lighthouse.schedule.builders import schedule_boilerplate
 import lighthouse.transform as lh_transform
 from mlir import ir
+from mlir import passmanager
 from mlir.dialects import transform
 import pytest
 import torch
@@ -32,6 +33,7 @@ from helion_mlir_backend._compiler.helion_transforms import lower_transposes
 from helion_mlir_backend._compiler.helion_transforms import materialize_operand_pads
 from helion_mlir_backend._compiler.helion_transforms import schedule_amx_loads
 from helion_mlir_backend._compiler.helion_transforms import split_bf16_loads
+from helion_mlir_backend._compiler.helion_transforms import split_contraction_operands
 from helion_mlir_backend._compiler.helion_transforms import split_copies
 from helion_mlir_backend._compiler.helion_transforms import split_transfers
 from helion_mlir_backend._compiler.helion_transforms import unroll_transfers
@@ -39,6 +41,9 @@ from helion_mlir_backend._compiler.helion_transforms import version_padded_opera
 from helion_mlir_backend._compiler.mlir_transforms import HelionTransformDialect
 from helion_mlir_backend._compiler.mlir_transforms import (
     forward_rows as forward_rows_op,
+)
+from helion_mlir_backend._compiler.mlir_transforms import (
+    split_contraction_operands as split_contraction_operands_op,
 )
 
 if TYPE_CHECKING:
@@ -1340,3 +1345,206 @@ def test_schedule_amx_loads_keeps_tile_register_limit() -> None:
     )
     text = _apply(lambda: schedule_amx_loads(distance=5), _amx_block(body, 5))
     assert _amx_order(text) == ["L", "L", "D", "L", "D", "L", "D", "L", "D", "L", "D"]
+
+
+# A contraction generic, as elementwise fusion leaves it: $A, $B, $C are the
+# element types of the inputs and the init, $BODY computes %r from %x, %y and
+# %acc (the block arguments).
+_CONTRACTION = """
+#a = affine_map<(m, n, k) -> (m, k)>
+#b = affine_map<(m, n, k) -> (k, n)>
+#c = affine_map<(m, n, k) -> (m, n)>
+func.func @f(%a: tensor<$Mx8x$A>, %b: tensor<8x16x$B>, %c: tensor<$Mx16x$C>)
+    -> tensor<$Mx16x$C> {
+  %0 = linalg.generic {indexing_maps = [#a, #b, #c],
+      iterator_types = ["parallel", "parallel", "reduction"]}
+      ins(%a, %b : tensor<$Mx8x$A>, tensor<8x16x$B>) outs(%c : tensor<$Mx16x$C>) {
+  ^bb0(%x: $A, %y: $B, %acc: $C):
+$BODY
+    linalg.yield %r : $C
+  } -> tensor<$Mx16x$C>
+  return %0 : tensor<$Mx16x$C>
+}
+"""
+
+
+def _contraction(body: str, a: str = "f32", b: str = "f32", c: str = "f32") -> str:
+    return (
+        _CONTRACTION.replace("$BODY", body)
+        .replace("$M", "4")
+        .replace("$A", a)
+        .replace("$B", b)
+        .replace("$C", c)
+    )
+
+
+def _split_and_raise(source: str) -> tuple[str, str]:
+    """``source`` after ``split_contraction_operands``, and then raised to
+    named contractions as ``linalg_contract_fold_unit_dims`` does."""
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.parse(source)
+        schedule = split_contraction_operands()
+        schedule.body.operations[0].apply(module.operation)
+        module.operation.verify()
+        split = str(module)
+        passmanager.PassManager.parse(
+            "builtin.module(func.func(linalg-morph-ops{generic-to-category}))"
+        ).run(module.operation)
+        return split, str(module)
+
+
+def _contract_inputs(text: str) -> str:
+    """The input types of the one ``linalg.contract`` in ``text``."""
+    (line,) = [line for line in text.splitlines() if "linalg.contract" in line]
+    return line[line.index("ins(") : line.index(") outs(")].split(" : ")[1]
+
+
+def test_split_contraction_operands_exp() -> None:
+    body = """    %e = math.exp %x : f32
+    %m = arith.mulf %e, %y : f32
+    %r = arith.addf %acc, %m : f32"""
+    split, raised = _split_and_raise(_contraction(body))
+    # exp over A's 4x8 elements, then the contraction of its result.
+    assert split.count("math.exp") == 1
+    assert "outs(%0 : tensor<4x8xf32>)" in split
+    assert "linalg.elementwise <exp> ins(%arg0 : tensor<4x8xf32>)" in raised
+    assert _contract_inputs(raised) == "tensor<4x8xf32>, tensor<8x16xf32>"
+
+
+def test_split_contraction_operands_keeps_trailing_cast() -> None:
+    # The bf16 rounding of A (a fused `.to(bf16)`): split, A is a bf16 tensor.
+    body = """    %t = arith.truncf %x : f32 to bf16
+    %e = arith.extf %t : bf16 to f32
+    %ye = arith.extf %y : bf16 to f32
+    %m = arith.mulf %e, %ye : f32
+    %r = arith.addf %acc, %m : f32"""
+    split, raised = _split_and_raise(_contraction(body, b="bf16"))
+    assert "arith.truncf %in : f32 to bf16" in split
+    assert split.count("arith.extf") == 2
+    assert _contract_inputs(raised) == "tensor<4x8xbf16>, tensor<8x16xbf16>"
+
+
+def test_split_contraction_operands_splits_casts_of_mixed_inputs() -> None:
+    # bf16 A widened, f32 B: the vectorizer casts no float inputs of a
+    # linalg.contract, so A is widened in an elementwise op of its own.
+    body = """    %e = arith.extf %x : bf16 to f32
+    %m = arith.mulf %e, %y : f32
+    %r = arith.addf %acc, %m : f32"""
+    split, raised = _split_and_raise(_contraction(body, a="bf16"))
+    assert "outs(%0 : tensor<4x8xf32>)" in split
+    assert _contract_inputs(raised) == "tensor<4x8xf32>, tensor<8x16xf32>"
+
+
+def test_split_contraction_operands_runtime_shape() -> None:
+    body = """    %e = math.exp %y : f32
+    %m = arith.mulf %x, %e : f32
+    %r = arith.addf %m, %acc : f32"""
+    source = _contraction(body).replace("tensor<4x", "tensor<?x")
+    split, raised = _split_and_raise(source)
+    # Only B is split: its shape is static.
+    assert "tensor.dim" not in split and "outs(%0 : tensor<8x16xf32>)" in split
+    source = source.replace("%e = math.exp %y", "%e = math.exp %x")
+    source = source.replace("arith.mulf %x, %e", "arith.mulf %e, %y")
+    split, raised = _split_and_raise(source)
+    assert "tensor.dim %arg0, %c0" in split
+    assert "tensor.empty(%dim) : tensor<?x8xf32>" in split
+    assert _contract_inputs(raised) == "tensor<?x8xf32>, tensor<8x16xf32>"
+
+
+_MUL_ADD = """    %m = arith.mulf %x, %y : f32
+    %r = arith.addf %acc, %m : f32"""
+_EXP_A = "    %e = math.exp %x : f32\n"
+_SPLIT_UNCHANGED = {
+    # Nothing to split: what linalg.contract computes.
+    "plain": _contraction(_MUL_ADD),
+    "widened_bf16": _contraction(
+        """    %xe = arith.extf %x : bf16 to f32
+    %ye = arith.extf %y : bf16 to f32
+    %m = arith.mulf %xe, %ye : f32
+    %r = arith.addf %acc, %m : f32""",
+        a="bf16",
+        b="bf16",
+    ),
+    "widened_i8": _contraction(
+        """    %xe = arith.extsi %x : i8 to i32
+    %ye = arith.extsi %y : i8 to i32
+    %m = arith.muli %xe, %ye : i32
+    %r = arith.addi %acc, %m : i32""",
+        a="i8",
+        b="i8",
+        c="i32",
+    ),
+    # Not understood: an op on the product, the accumulator or the result
+    # (no elementwise fusion makes them), a chain op with another use.
+    "unary_product": _contraction(
+        _EXP_A
+        + """    %m = arith.mulf %e, %y : f32
+    %n = arith.negf %m : f32
+    %r = arith.addf %acc, %n : f32"""
+    ),
+    "unary_accumulator": _contraction(
+        _EXP_A
+        + """    %m = arith.mulf %e, %y : f32
+    %n = arith.negf %acc : f32
+    %r = arith.addf %n, %m : f32"""
+    ),
+    "unary_result": _contraction(
+        _EXP_A
+        + """    %m = arith.mulf %e, %y : f32
+    %s = arith.addf %acc, %m : f32
+    %r = arith.negf %s : f32"""
+    ),
+    "shared_chain_op": _contraction(
+        _EXP_A
+        + """    %m = arith.mulf %e, %y : f32
+    %s = arith.addf %acc, %m : f32
+    %r = arith.addf %s, %e : f32"""
+    ),
+    # Not a contraction of mul+add.
+    "max_plus": _contraction(
+        _EXP_A
+        + """    %m = arith.addf %e, %y : f32
+    %r = arith.maximumf %acc, %m : f32"""
+    ),
+    "square": _contraction(
+        """    %e = math.exp %x : f32
+    %m = arith.mulf %e, %e : f32
+    %r = arith.addf %acc, %m : f32"""
+    ),
+    # A binary op of a captured value: no contraction body upstream raises.
+    "scaled": _contraction(
+        """    %cst = arith.constant 2.0 : f32
+    %e = arith.mulf %x, %cst : f32
+    %m = arith.mulf %e, %y : f32
+    %r = arith.addf %acc, %m : f32"""
+    ),
+    # Maps that are not projected permutations.
+    "strided_map": _contraction(_EXP_A + _MUL_ADD.replace("%x, %y", "%e, %y")).replace(
+        "#a = affine_map<(m, n, k) -> (m, k)>",
+        "#a = affine_map<(m, n, k) -> (m, k floordiv 2)>",
+    ),
+    # Buffers.
+    "memref": """
+#a = affine_map<(m, n, k) -> (m, k)>
+#b = affine_map<(m, n, k) -> (k, n)>
+#c = affine_map<(m, n, k) -> (m, n)>
+func.func @f(%a: memref<4x8xf32>, %b: memref<8x16xf32>, %c: memref<4x16xf32>) {
+  linalg.generic {indexing_maps = [#a, #b, #c],
+      iterator_types = ["parallel", "parallel", "reduction"]}
+      ins(%a, %b : memref<4x8xf32>, memref<8x16xf32>) outs(%c : memref<4x16xf32>) {
+  ^bb0(%x: f32, %y: f32, %acc: f32):
+    %e = math.exp %x : f32
+    %m = arith.mulf %e, %y : f32
+    %r = arith.addf %acc, %m : f32
+    linalg.yield %r : f32
+  }
+  return
+}
+""",
+}
+
+
+@pytest.mark.parametrize("case", sorted(_SPLIT_UNCHANGED))
+def test_split_contraction_operands_leaves_others_alone(case: str) -> None:
+    before, after = _apply_bare(split_contraction_operands_op, _SPLIT_UNCHANGED[case])
+    assert after == before

@@ -220,6 +220,18 @@ def split_bf16_loads() -> ir.Module:
     return schedule
 
 
+def split_contraction_operands() -> ir.Module:
+    """Schedule: every function's contraction operands computed in the body
+    of a ``linalg.generic`` (e.g. fused ``exp`` or bf16 rounding), which the
+    raising to ``linalg.contract`` would drop, as elementwise generics."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.split_contraction_operands(funcs)
+        transform.yield_()
+    return schedule
+
+
 def split_copies() -> ir.Module:
     """Schedule: every function's out-of-bounds n-D memref copies row by row,
     split on an in-bounds check."""

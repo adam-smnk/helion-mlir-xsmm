@@ -20,6 +20,10 @@ Pipeline:
 
   ## Small transposes stay one vector transpose: register tiling unrolls narrow ones per element.
   - schedule: "helion_transforms.py[gen=pin_transposes]"
+  ## Contraction operands computed in a generic's body (fused above, e.g. an
+  ## exp or a bf16 rounding) as elementwise ops: raising the generic to a
+  ## linalg.contract (next step, and linalg-categorize-ops) drops them.
+  - schedule: "helion_transforms.py[gen=split_contraction_operands]"
   # Simplify shapes.
   - schedule: "linalg.py[gen=linalg_contract_fold_unit_dims]"
   - include: cleanup.yaml

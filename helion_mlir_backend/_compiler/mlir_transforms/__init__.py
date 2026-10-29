@@ -25,6 +25,7 @@ from .pin_transposes import pin_transposes
 from .rank_reduce_transfers import rank_reduce_transfers
 from .schedule_amx_loads import schedule_amx_loads
 from .split_bf16_loads import split_bf16_loads
+from .split_contraction_operands import split_contraction_operands
 from .split_copies import split_copies
 from .split_transfers import split_transfers
 from .tile_sizes import tile_sizes
@@ -63,6 +64,7 @@ __all__ = [
     "rank_reduce_transfers",
     "schedule_amx_loads",
     "split_bf16_loads",
+    "split_contraction_operands",
     "split_copies",
     "split_transfers",
     "tile_sizes",
