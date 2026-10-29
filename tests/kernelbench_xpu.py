@@ -9,8 +9,10 @@ chosen per shape:
 
 - Matmuls (bf16 operands, f32 accumulator, a bf16 result as PyTorch's matmul of
   bf16 tensors): block sizes ``[M tile, N tile, K tile]``, the workgroup tile and
-  the K-loop step. 256x256 workgroups (lighthouse's subgroup inference picks
-  32 subgroups of 32x64) with K steps of 32; a 128x128 workgroup tile for the
+  the K-loop step. 256x256 workgroups of 32 subgroups (lighthouse's inference
+  picks 64x32 subgroup tiles for the shapes in its tuned parameter database,
+  1, 2, 7, 9 and 13, and 32x64 for the transposed 16-18) with K steps of 32;
+  a 128x128 workgroup tile for the
   256x256 output of 6_large_K (4 workgroups), a 16 K step for K = 32
   (9_Tall_skinny; the K loop must stay, DPAS K is 16). Transposed operands
   (16-18: A stored ``[K, M]``, B ``[N, K]``, as the specs give them) are loaded
@@ -627,10 +629,13 @@ from the hardware (Xe2, large register file) for a head dim of 64:
   32x32x4 = 4096 workgroups fill the GPU.
 - K/V tiles of 64 rows: per subgroup, ``Q @ K^T`` is 16x64 (2x4 DPAS 8x16
   blocks, 4 K steps of 16 over the head dim) and ``P @ V`` 16x64 over 64 K/V
-  rows (4 K steps): 32 DPAS each per step. The K or V tile (64x64 bf16, 128
-  registers of 64 bytes) with Q (16), the scores (32) and the accumulator (32)
-  fits the 256-register file; 128 rows (256 registers) would spill. 64 is
-  also lighthouse's attention reduction tile, and whole 32x32 V blocks.
+  rows (4 K steps): 32 DPAS each per step. In 64-byte registers Q (16x64
+  bf16) takes 32, the scores and the accumulator (16x64 f32) 64 each: 160 of
+  the 256-register file, plus the K or V tile (64x64 bf16, 128 registers)
+  would be 288 if it stayed resident whole. Whether the compiler streams it
+  (block reads per DPAS step) or spills is open until measured on hardware;
+  K/V tiles of 32 (64 registers) are the fallback. 64 is also lighthouse's
+  attention reduction tile, and whole 32x32 V blocks.
 - 2D block loads: Q in 16x16 blocks, V in 32x32 blocks (the VNNI-transformed
   B operand), K transposed (``Q @ K^T`` of K stored ``[seq, head dim]``) in
   16x8 blocks of 32-bit pairs; the output is stored in 8x16 blocks.
