@@ -233,6 +233,19 @@ def split_copies() -> ir.Module:
     return schedule
 
 
+def forward_rows() -> ir.Module:
+    """Schedule: every function's vectors built from whole rows and used row by
+    row forwarded as rows."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.forward_rows(funcs)
+        lh_transform.cleanup(named_seq.bodyTarget)
+
+        transform.yield_()
+    return schedule
+
+
 def split_transfers() -> ir.Module:
     """Schedule: split every function's out-of-bounds memref transfers on an
     in-bounds check."""

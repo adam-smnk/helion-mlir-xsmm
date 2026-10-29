@@ -105,6 +105,9 @@ Pipeline:
   - pass: "func.func(convert-linalg-to-loops)"
   ## n-D transfers as 2-D ones, contiguous ones then 1-D: no per-element staging.
   - schedule: "helion_transforms.py[gen=unroll_transfers]"
+  # Canonicalization rebuilds the unrolled rows of a vector (e.g. around a VNNI
+  # pack's transpose) element by element: forwarded as rows when used as rows.
+  - schedule: "helion_transforms.py[gen=forward_rows]"
   - schedule: "vectorization.py[gen=flatten_vector_ops]"
   ## n-D elementwise ops (e.g. between reshapes of flattened transfers) as 1-D:
   ## lowered n-D, they unroll into per-row ops and shuffles.

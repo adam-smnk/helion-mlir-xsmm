@@ -11,7 +11,10 @@ from typing import TYPE_CHECKING
 
 import helion
 import helion.language as hl
+from lighthouse.schedule.builders import schedule_boilerplate
+import lighthouse.transform as lh_transform
 from mlir import ir
+from mlir.dialects import transform
 import pytest
 import torch
 
@@ -21,6 +24,7 @@ from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler.helion_transforms import align_operand_rows
 from helion_mlir_backend._compiler.helion_transforms import amx_move_offsets
 from helion_mlir_backend._compiler.helion_transforms import fold_empty_slices
+from helion_mlir_backend._compiler.helion_transforms import forward_rows
 from helion_mlir_backend._compiler.helion_transforms import hoist_allocas
 from helion_mlir_backend._compiler.helion_transforms import legalize_for_llvm
 from helion_mlir_backend._compiler.helion_transforms import linearize_vector_ops
@@ -32,6 +36,10 @@ from helion_mlir_backend._compiler.helion_transforms import split_copies
 from helion_mlir_backend._compiler.helion_transforms import split_transfers
 from helion_mlir_backend._compiler.helion_transforms import unroll_transfers
 from helion_mlir_backend._compiler.helion_transforms import version_padded_operands
+from helion_mlir_backend._compiler.mlir_transforms import HelionTransformDialect
+from helion_mlir_backend._compiler.mlir_transforms import (
+    forward_rows as forward_rows_op,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -454,6 +462,230 @@ def test_ragged_bf16_scalar_mul_runs() -> None:
     actual = scalar_mul_kernel(a, hl.constexpr(3.0))
     expected = (a.float() * 3.0).to(torch.bfloat16)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
+
+
+def _apply_bare(make_op: Callable[[ir.Value], object], source: str) -> tuple[str, str]:
+    """``source`` as printed, and after the transform op alone (no cleanup)."""
+    with ir.Context(), ir.Location.unknown():
+        HelionTransformDialect.load()
+        module = ir.Module.parse(source)
+        before = str(module)
+        with schedule_boilerplate() as (schedule, named_seq):
+            make_op(lh_transform.match_op(named_seq.bodyTarget, "func.func"))
+            transform.yield_()
+        schedule.body.operations[0].apply(module.operation)
+        module.operation.verify()
+        return before, str(module)
+
+
+# Rows of the 16x16x2 VNNI transpose, scaled down: four rows read and rebuilt
+# before the bitcast and the row extracts (the input side), four shuffled rows
+# rebuilt, bitcast and extracted to be written (the output side).
+ROWS_INPUT_SIDE = """
+func.func @f(%r0: vector<8xbf16>, %r1: vector<8xbf16>, %r2: vector<8xbf16>,
+             %r3: vector<8xbf16>) -> (vector<4xi32>, vector<4xi32>) {
+  %a:8 = vector.to_elements %r0 : vector<8xbf16>
+  %b:8 = vector.to_elements %r1 : vector<8xbf16>
+  %c:8 = vector.to_elements %r2 : vector<8xbf16>
+  %d:8 = vector.to_elements %r3 : vector<8xbf16>
+  %v = vector.from_elements %a#0, %a#1, %a#2, %a#3, %a#4, %a#5, %a#6, %a#7,
+      %b#0, %b#1, %b#2, %b#3, %b#4, %b#5, %b#6, %b#7,
+      %c#0, %c#1, %c#2, %c#3, %c#4, %c#5, %c#6, %c#7,
+      %d#0, %d#1, %d#2, %d#3, %d#4, %d#5, %d#6, %d#7 : vector<4x4x2xbf16>
+  %i = vector.bitcast %v : vector<4x4x2xbf16> to vector<4x4x1xi32>
+  %s = vector.shape_cast %i : vector<4x4x1xi32> to vector<4x4xi32>
+  %e0 = vector.extract %s[0] : vector<4xi32> from vector<4x4xi32>
+  %e3 = vector.extract %s[3] : vector<4xi32> from vector<4x4xi32>
+  return %e0, %e3 : vector<4xi32>, vector<4xi32>
+}
+"""
+
+ROWS_OUTPUT_SIDE = """
+func.func @f(%r0: vector<4xi32>, %r1: vector<4xi32>, %r2: vector<4xi32>,
+             %r3: vector<4xi32>, %m: memref<4x64xbf16>, %j: index) {
+  %c0 = arith.constant 0 : index
+  %a:4 = vector.to_elements %r0 : vector<4xi32>
+  %b:4 = vector.to_elements %r1 : vector<4xi32>
+  %c:4 = vector.to_elements %r2 : vector<4xi32>
+  %d:4 = vector.to_elements %r3 : vector<4xi32>
+  %v = vector.from_elements %a#0, %a#1, %a#2, %a#3, %b#0, %b#1, %b#2, %b#3,
+      %c#0, %c#1, %c#2, %c#3, %d#0, %d#1, %d#2, %d#3 : vector<4x4x1xi32>
+  %p = vector.bitcast %v : vector<4x4x1xi32> to vector<4x4x2xbf16>
+  %e0 = vector.extract %p[0] : vector<4x2xbf16> from vector<4x4x2xbf16>
+  %f0 = vector.shape_cast %e0 : vector<4x2xbf16> to vector<8xbf16>
+  vector.transfer_write %f0, %m[%c0, %j] {in_bounds = [true]}
+      : vector<8xbf16>, memref<4x64xbf16>
+  %e1 = vector.extract %p[1] : vector<4x2xbf16> from vector<4x4x2xbf16>
+  %f1 = vector.shape_cast %e1 : vector<4x2xbf16> to vector<8xbf16>
+  vector.transfer_write %f1, %m[%c0, %j] {in_bounds = [true]}
+      : vector<8xbf16>, memref<4x64xbf16>
+  return
+}
+"""
+
+# Built from two rows, written whole: to a memref and to a tensor.
+ROWS_WHOLE_WRITES = """
+func.func @f(%r0: vector<4xf32>, %r1: vector<4xf32>, %m: memref<8x4xf32>,
+             %t: tensor<8x4xf32>, %i: index) -> tensor<8x4xf32> {
+  %c0 = arith.constant 0 : index
+  %a:4 = vector.to_elements %r0 : vector<4xf32>
+  %b:4 = vector.to_elements %r1 : vector<4xf32>
+  %v = vector.from_elements %a#0, %a#1, %a#2, %a#3, %b#0, %b#1, %b#2, %b#3
+      : vector<2x4xf32>
+  vector.transfer_write %v, %m[%i, %c0] {in_bounds = [true, true]}
+      : vector<2x4xf32>, memref<8x4xf32>
+  %w = vector.transfer_write %v, %t[%i, %c0] {in_bounds = [true, true]}
+      : vector<2x4xf32>, tensor<8x4xf32>
+  return %w : tensor<8x4xf32>
+}
+"""
+
+
+def test_forward_rows_input_side() -> None:
+    _, text = _apply_bare(forward_rows_op, ROWS_INPUT_SIDE)
+    assert "from_elements" not in text
+    # Each row cast flat: no 2-D bitcast (lowered one element at a time).
+    assert text.count("vector.bitcast %arg0 : vector<8xbf16> to vector<4xi32>") == 1
+    assert text.count("vector.bitcast %arg3 : vector<8xbf16> to vector<4xi32>") == 1
+    assert "x1xi32" not in text
+    assert "return %4, %7 : vector<4xi32>, vector<4xi32>" in text
+
+
+def test_forward_rows_output_side() -> None:
+    text = _apply(forward_rows, ROWS_OUTPUT_SIDE)
+    assert "from_elements" not in text and "to_elements" not in text
+    assert "vector.bitcast %arg0 : vector<4xi32> to vector<8xbf16>" in text
+    assert "vector.bitcast %arg1 : vector<4xi32> to vector<8xbf16>" in text
+    assert text.count("vector.transfer_write") == 2
+    assert "shape_cast" not in text
+
+
+def test_forward_rows_whole_writes() -> None:
+    text = _apply(forward_rows, ROWS_WHOLE_WRITES)
+    assert "from_elements" not in text and "to_elements" not in text
+    writes = re.findall(r"vector\.transfer_write (%\w+), (%\w+)\[", text)
+    assert writes.count(("%arg0", "%arg2")) == writes.count(("%arg1", "%arg2")) == 1
+    # On the tensor, chained: the second row into the first row's result.
+    assert ("%arg0", "%arg3") in writes and ("%arg1", "%1") in writes
+
+
+# Each left alone: not whole rows in order, or a use not row by row.
+_TWO_ROWS = """
+func.func @f(%r0: vector<4xf32>, %r1: vector<4xf32>, %s: f32, %m: memref<8x4xf32>,
+             %i: index) -> {result_type} {{
+  %c0 = arith.constant 0 : index
+  %a:4 = vector.to_elements %r0 : vector<4xf32>
+  %b:4 = vector.to_elements %r1 : vector<4xf32>
+  %v = vector.from_elements {elements} : {built_type}
+  {use}
+}}
+"""
+_ROWS = "%a#0, %a#1, %a#2, %a#3, %b#0, %b#1, %b#2, %b#3"
+_EXTRACT = (
+    "%e = vector.extract %v[1] : vector<4xf32> from vector<2x4xf32>\n"
+    "  return %e : vector<4xf32>"
+)
+_UNCHANGED = {
+    "partial_row": ("%a#0, %a#1, %b#0, %b#1, %a#2, %a#3, %b#2, %b#3", _EXTRACT),
+    "out_of_order": ("%a#1, %a#0, %a#2, %a#3, %b#0, %b#1, %b#2, %b#3", _EXTRACT),
+    "row_twice_in_part": ("%a#0, %a#1, %a#2, %a#3, %a#0, %a#1, %b#2, %b#3", _EXTRACT),
+    "scalar": ("%a#0, %a#1, %a#2, %a#3, %b#0, %b#1, %b#2, %s", _EXTRACT),
+    "returned": (_ROWS, "return %v : vector<2x4xf32>"),
+    "flattened": (
+        _ROWS,
+        (
+            "%f = vector.shape_cast %v : vector<2x4xf32> to vector<8xf32>\n"
+            "  return %f : vector<8xf32>"
+        ),
+    ),
+    "leading_dim_changed": (
+        _ROWS,
+        (
+            "%f = vector.shape_cast %v : vector<2x4xf32> to vector<4x2xf32>\n"
+            "  %e = vector.extract %f[0] : vector<2xf32> from vector<4x2xf32>\n"
+            "  return %e : vector<2xf32>"
+        ),
+    ),
+    "element_extract": (
+        _ROWS,
+        "%e = vector.extract %v[1, 2] : f32 from vector<2x4xf32>\n  return %e : f32",
+    ),
+    "dynamic_extract": (
+        _ROWS,
+        (
+            "%e = vector.extract %v[%i] : vector<4xf32> from vector<2x4xf32>\n"
+            "  return %e : vector<4xf32>"
+        ),
+    ),
+    "masked_write": (
+        _ROWS,
+        (
+            "%k = vector.create_mask %i, %i : vector<2x4xi1>\n"
+            "  vector.transfer_write %v, %m[%c0, %c0], %k {in_bounds = [true, true]}"
+            " : vector<2x4xf32>, memref<8x4xf32>\n  return"
+        ),
+    ),
+    "out_of_bounds_write": (
+        _ROWS,
+        (
+            "vector.transfer_write %v, %m[%i, %c0] {in_bounds = [false, true]}"
+            " : vector<2x4xf32>, memref<8x4xf32>\n  return"
+        ),
+    ),
+    "permuted_write": (
+        _ROWS,
+        (
+            "vector.transfer_write %v, %m[%c0, %c0] {in_bounds = [true, true],"
+            " permutation_map = affine_map<(d0, d1) -> (d1, d0)>}"
+            " : vector<2x4xf32>, memref<8x4xf32>\n  return"
+        ),
+    ),
+    "one_row_use_other_not": (
+        _ROWS,
+        (
+            "%e = vector.extract %v[1] : vector<4xf32> from vector<2x4xf32>\n"
+            "  return %v : vector<2x4xf32>"
+        ),
+    ),
+}
+
+
+def _unchanged_case(elements: str, use: str) -> str:
+    result = re.search(r"return( %\w+ : ([^\n]+))?$", use)
+    result_type = result.group(2) if result.group(1) else "()"
+    return _TWO_ROWS.format(
+        elements=elements,
+        built_type="vector<2x4xf32>",
+        use=use,
+        result_type=result_type,
+    )
+
+
+def test_forward_rows_forwards_whole_rows_of_the_template() -> None:
+    # The cases below differ from this one only in what they name.
+    before, after = _apply_bare(forward_rows_op, _unchanged_case(_ROWS, _EXTRACT))
+    assert "from_elements" in before and "from_elements" not in after
+    assert "return %arg1 : vector<4xf32>" in after
+
+
+@pytest.mark.parametrize("case", sorted(_UNCHANGED))
+def test_forward_rows_leaves_others_alone(case: str) -> None:
+    before, after = _apply_bare(forward_rows_op, _unchanged_case(*_UNCHANGED[case]))
+    assert after == before
+
+
+RANK_1_ROWS = """
+func.func @f(%r0: vector<4xf32>) -> vector<4xf32> {
+  %a:4 = vector.to_elements %r0 : vector<4xf32>
+  %v = vector.from_elements %a#0, %a#1, %a#2, %a#3 : vector<4xf32>
+  return %v : vector<4xf32>
+}
+"""
+
+
+def test_forward_rows_leaves_rank_1_alone() -> None:
+    before, after = _apply_bare(forward_rows_op, RANK_1_ROWS)
+    assert after == before
 
 
 # A cast of VNNI pairs between the reshapes of flattened transfers.

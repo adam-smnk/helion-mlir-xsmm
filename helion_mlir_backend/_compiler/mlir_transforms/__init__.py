@@ -8,6 +8,7 @@ from .align_operand_rows import align_operand_rows
 from .carry_loop_inits import carry_loop_inits
 from .dialect import HelionTransformDialect
 from .fold_loop_unit_dims import fold_loop_unit_dims
+from .forward_rows import forward_rows
 from .hoist_allocas import hoist_allocas
 from .hoist_invariant_scalars import hoist_invariant_scalars
 from .legalize_for_llvm import legalize_for_llvm
@@ -43,6 +44,7 @@ __all__ = [
     "align_operand_rows",
     "carry_loop_inits",
     "fold_loop_unit_dims",
+    "forward_rows",
     "hoist_allocas",
     "hoist_invariant_scalars",
     "infer_xegpu_elementwise_layout",
