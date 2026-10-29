@@ -1820,13 +1820,13 @@ class TestPaddedPackingAndMultiPhaseExecution:
         [
             ((64, 128, 96), None),
             ((64, 128, 96), (32, 64, 64)),
-            ((100, 130, 70), None),
             ((40, 198, 33), None),
         ],
     )
     def test_matmul_bf16_trans_a(self, mkn, block_sizes, trans_b):
         """bf16 with A given as ``[K, M]``: packed per tile by the fused kernel,
-        with its tile choice or the given ``block_sizes``."""
+        with its tile choice or the given ``block_sizes``. ``(40, 198, 33)``:
+        partial M and N tiles (several, with remainders) and a K tail."""
         from helion_mlir_utils.matmul import matmul
 
         m, k, n = mkn
@@ -1870,10 +1870,8 @@ class TestPaddedPackingAndMultiPhaseExecution:
     @pytest.mark.parametrize(
         "mkn",
         [
-            (40, 100, 50),
             (100, 130, 100),
             (33, 66, 35),
-            (70, 198, 70),
             (70, 201, 40),
             (20, 50, 40),
         ],
@@ -1881,7 +1879,11 @@ class TestPaddedPackingAndMultiPhaseExecution:
     def test_matmul_bf16_ragged(self, mkn, linear):
         """bf16 matmuls of unaligned shapes, odd K included: partial edge tiles,
         the K tail masked, the epilogue fused; ``linear``: B transposed (packed
-        per tile from ``[N, K]``) with a fused bias."""
+        per tile from ``[N, K]``) with a fused bias. Several partial tiles per
+        dim (100x130x100), two with remainders of 1 and 3 (33x66x35), odd K
+        (201), M below one tile (20, the zero-padded path). Each shape is a
+        compile of seconds: shapes giving the same tiles, chunks and tail as
+        one of these are left out."""
         from helion_mlir_utils.matmul import matmul
 
         m, k, n = mkn
@@ -1903,7 +1905,7 @@ class TestPaddedPackingAndMultiPhaseExecution:
 
     @pytest.mark.parametrize(
         "mkn",
-        [(64, 256, 128), (40, 66, 100), (50, 100, 70), (64, 4096, 64), (300, 128, 64)],
+        [(64, 256, 128), (40, 66, 100), (64, 4096, 64), (300, 128, 64)],
     )
     def test_matmul_prepacked_vnni(self, mkn):
         """A weight packed once into VNNI panels (``pack_b_vnni_t``) is read in

@@ -231,6 +231,19 @@ Run tests with pytest:
 pytest -v
 ```
 
+A whole-suite run is parallel (`pytest-xdist`, `-n auto`: one worker per
+physical core) and takes about 2 minutes on 8 cores (about 8 minutes with
+`-n 0`). Runs that name files or node ids, or select with `-k`, stay in one
+process; pass `-n <count>` to force workers. More workers than physical cores
+(`-n logical`, `-n 12`) were slower. Tests marked `isolated` run in a child of a
+fork server, so a native crash fails only that test; `-m "not slow"` skips the
+longest groups.
+
+Most of the time is compilation: each kernel shape is a new compile (Helion
+tracing, MLIR lowering, LLVM JIT). XPU IR tests that check both stages take
+them from one lowering (`tests/harness.py`, `lower_xpu_stages`: the `xegpu-wg`
+IR is the module after that stage on the way to `xevm`).
+
 ## Linting
 
 This repo uses `pre-commit` with linter rules aligned with Helion style.

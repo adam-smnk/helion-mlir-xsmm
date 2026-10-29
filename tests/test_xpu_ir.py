@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from tests.harness import lower_xpu
+from tests.harness import lower_xpu_stages
 from tests.harness import xpu_tensor
 from tests.kernelbench_xpu import attention
 
@@ -367,50 +368,43 @@ def _launch_args(text: str, entry: str) -> list[list[str]]:
 # --- Supported kernels -------------------------------------------------------
 
 
+# Tests lowering to both stages check the ``xegpu-wg`` IR and the ``xevm`` IR of
+# one lowering (``lower_xpu_stages``).
+
+
 @pytest.mark.isolated
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_matmul_lowers_to_xegpu(dtype: torch.dtype) -> None:
-    text = lower_xpu(matmul, _gemm_args(dtype))
+def test_matmul_lowers_to_xegpu_and_xevm(dtype: torch.dtype) -> None:
+    text, lowered = lower_xpu_stages(matmul, _gemm_args(dtype))
     _check_gemm_kernel(text, grid=(4, 4), threads=512)
     assert text.count("gpu.launch_func") == 1
+    _check_xevm(lowered, "matmul", launches=1)
 
 
 @pytest.mark.isolated
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_matmul_lowers_to_xevm(dtype: torch.dtype) -> None:
-    _check_xevm(lower_xpu(matmul, _gemm_args(dtype), "xevm"), "matmul", launches=1)
-
-
-@pytest.mark.isolated
-@pytest.mark.parametrize("stop_at", ["xegpu-wg", "xevm"])
-def test_matmul_relu_epilogue(stop_at: str) -> None:
-    text = lower_xpu(matmul_relu, _gemm_args(), stop_at)
-    if stop_at == "xevm":
-        _check_xevm(text, "matmul_relu", launches=1)
-        return
+def test_matmul_relu_epilogue() -> None:
+    text, lowered = lower_xpu_stages(matmul_relu, _gemm_args())
     _check_gemm_kernel(text, grid=(4, 4), threads=512)
     # The epilogue runs in the kernel, on the accumulator before the store.
     kernel = text[text.index("gpu.module") :]
     assert re.search(r"arith\.maximumf|arith\.cmpf", kernel)
+    _check_xevm(lowered, "matmul_relu", launches=1)
 
 
 @pytest.mark.isolated
-@pytest.mark.parametrize("stop_at", ["xegpu-wg", "xevm"])
-def test_matmul_transposed_b(stop_at: str) -> None:
-    text = lower_xpu(matmul_transposed_b, _gemm_args(), stop_at)
-    if stop_at == "xevm":
-        _check_xevm(text, "matmul_transposed_b", launches=1)
-        return
+def test_matmul_transposed_b() -> None:
+    text, lowered = lower_xpu_stages(matmul_transposed_b, _gemm_args())
     _check_gemm_kernel(text, grid=(4, 4), threads=512)
     # B tiles load as (N, K) tiles, transposed in registers for DPAS.
     assert "vector.transpose" in text
     assert "order = [0, 1]" in text
+    _check_xevm(lowered, "matmul_transposed_b", launches=1)
 
 
 @pytest.mark.isolated
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_runtime_scalar_is_passed_by_value(dtype: torch.dtype) -> None:
-    text = lower_xpu(matmul_scaled, [*_gemm_args(dtype), 0.5])
+    text, lowered = lower_xpu_stages(matmul_scaled, [*_gemm_args(dtype), 0.5])
     _check_gemm_kernel(text, grid=(4, 4), threads=512)
     host = _host_function(text, "matmul_scaled")
     scalar = re.search(
@@ -426,18 +420,14 @@ def test_runtime_scalar_is_passed_by_value(dtype: torch.dtype) -> None:
     kernel = text[text.index("gpu.module") :]
     assert re.search(r"gpu\.func @matmul_scaled_kernel\([^)]*: f32", kernel)
     assert "f64" not in kernel
-
-
-@pytest.mark.isolated
-def test_runtime_scalar_kernel_lowers_to_xevm() -> None:
-    text = lower_xpu(matmul_scaled, [*_gemm_args(torch.bfloat16), 0.5], "xevm")
-    _check_xevm(text, "matmul_scaled", launches=1)
+    # Lowered, the kernel still takes the f32 value.
+    _check_xevm(lowered, "matmul_scaled", launches=1)
     kernel = re.search(
-        r"llvm\.func spir_kernelcc @matmul_scaled_kernel\(([^)]*)\)", text
+        r"llvm\.func spir_kernelcc @matmul_scaled_kernel\(([^)]*)\)", lowered
     )
-    assert kernel, text
+    assert kernel, lowered
     assert ": f32" in kernel.group(1)
-    assert "f64" not in text[text.index("gpu.module") :]
+    assert "f64" not in lowered[lowered.index("gpu.module") :]
 
 
 @pytest.mark.isolated
@@ -470,26 +460,23 @@ def test_f64_kernel_argument_is_unsupported() -> None:
 @pytest.mark.isolated
 def test_barrier_phases_launch_in_order_on_one_stream() -> None:
     args = [xpu_tensor(N, N, dtype=torch.float16) for _ in range(3)]
-    text = lower_xpu(two_phase_matmul, args)
+    text, lowered = lower_xpu_stages(two_phase_matmul, args)
     _check_gemm_kernel(text, grid=(4, 4), threads=512)
     assert text.count("gpu.launch_func") == 2
     first, second = _launch_args(text, "two_phase_matmul")
     assert {"a", "b", "tmp"} <= set(first) and "c" not in first
     assert {"tmp", "c", "out"} <= set(second) and "a" not in second
-    _check_xevm(lower_xpu(two_phase_matmul, args, "xevm"), "two_phase_matmul", 2)
+    _check_xevm(lowered, "two_phase_matmul", 2)
 
 
 @pytest.mark.isolated
-@pytest.mark.parametrize("stop_at", ["xegpu-wg", "xevm"])
-def test_softmax_row_reduction(stop_at: str) -> None:
-    text = lower_xpu(softmax, [xpu_tensor(4096, 4096)], stop_at)
-    if stop_at == "xevm":
-        _check_xevm(text, "softmax", launches=1)
-        return
+def test_softmax_row_reduction() -> None:
+    text, lowered = lower_xpu_stages(softmax, [xpu_tensor(4096, 4096)])
     assert "known_grid_size = array<i32: 64, 1, 1>" in text
     assert "vector.multi_reduction" in text
     assert "xegpu.load_nd" in text and "xegpu.store_nd" in text
     assert "sg_layout" in text
+    _check_xevm(lowered, "softmax", launches=1)
 
 
 def _layouts(text: str, op: str) -> list[str]:
@@ -500,7 +487,7 @@ def _layouts(text: str, op: str) -> list[str]:
 @pytest.mark.isolated
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_elementwise_kernel_lowers_to_xegpu(dtype: torch.dtype) -> None:
-    text = lower_xpu(relu, [xpu_tensor(4096, 4096, dtype=dtype)])
+    text, lowered = lower_xpu_stages(relu, [xpu_tensor(4096, 4096, dtype=dtype)])
     # 32x256 workgroup tiles: 8 subgroups of 32x32 (inferred), the widest block
     # loads (32 bf16 or 16 f32 columns), 8x16 block stores.
     load_cols = 32 if dtype == torch.bfloat16 else 16
@@ -513,9 +500,7 @@ def test_elementwise_kernel_lowers_to_xegpu(dtype: torch.dtype) -> None:
     ]
     assert "known_block_size = array<i32: 128, 1, 1>" in text
     assert "known_grid_size = array<i32: 128, 16, 1>" in text
-    _check_xevm(
-        lower_xpu(relu, [xpu_tensor(4096, 4096, dtype=dtype)], "xevm"), "relu", 1
-    )
+    _check_xevm(lowered, "relu", 1)
 
 
 def _bf16_natives(text: str) -> list[str]:
@@ -526,11 +511,10 @@ def _bf16_natives(text: str) -> list[str]:
 @pytest.mark.isolated
 def test_elementwise_bf16_math_and_casts() -> None:
     args = [xpu_tensor(1024, 1024, dtype=torch.bfloat16)]
-    text = lower_xpu(gelu_tanh_cast, args)
+    text, lowered = lower_xpu_stages(gelu_tanh_cast, args)
     # bf16 loads, f32 stores: each with its own block tile.
     assert re.search(r"xegpu\.load_nd [^\n]*inst_data = \[32, 32\][^\n]*xbf16>", text)
     assert re.search(r"xegpu\.store_nd [^\n]*inst_data = \[8, 16\][^\n]*xf32>", text)
-    lowered = lower_xpu(gelu_tanh_cast, args, "xevm")
     _check_xevm(lowered, "gelu_tanh_cast", 1)
     # bf16 math runs in f32 (the fast exp too: upstream's math-to-xevm would
     # call a bf16 native exp otherwise).
@@ -542,11 +526,10 @@ def test_elementwise_bf16_math_and_casts() -> None:
 @pytest.mark.isolated
 def test_elementwise_several_inputs_and_outputs() -> None:
     args = [xpu_tensor(1024, 1024, dtype=torch.bfloat16) for _ in range(2)]
-    text = lower_xpu(two_in_two_out, args)
+    text, lowered = lower_xpu_stages(two_in_two_out, args)
     assert len(_layouts(text, "xegpu.load_nd")) == 2
     assert len(_layouts(text, "xegpu.store_nd")) == 2
     assert "known_grid_size = array<i32: 16, 8, 1>" in text
-    lowered = lower_xpu(two_in_two_out, args, "xevm")
     _check_xevm(lowered, "two_in_two_out", 1)
     assert _bf16_natives(lowered) == []
 
@@ -557,22 +540,22 @@ def test_elementwise_broadcast_row() -> None:
         xpu_tensor(1024, 1024, dtype=torch.bfloat16),
         xpu_tensor(1024, dtype=torch.bfloat16),
     ]
-    text = lower_xpu(bias_relu, args)
+    text, lowered = lower_xpu_stages(bias_relu, args)
     # The 64x128 tiles are anchored; the bias row's layout is propagated.
     assert len(_layouts(text, "xegpu.load_nd")) == 1
     assert len(_layouts(text, "xegpu.store_nd")) == 1
-    _check_xevm(lower_xpu(bias_relu, args, "xevm"), "bias_relu", 1)
+    _check_xevm(lowered, "bias_relu", 1)
 
 
 @pytest.mark.isolated
 def test_elementwise_1d_tiles_gather_and_scatter() -> None:
     args = [xpu_tensor(1 << 20)]
-    text = lower_xpu(sigmoid_1d, args)
+    text, lowered = lower_xpu_stages(sigmoid_1d, args)
     layout = "#xegpu.layout<sg_layout = [2], sg_data = [1024], inst_data = [16]>"
     assert _layouts(text, "xegpu.load") == [layout]
     assert _layouts(text, "xegpu.store") == [layout]
     assert "known_block_size = array<i32: 32, 1, 1>" in text
-    _check_xevm(lower_xpu(sigmoid_1d, args, "xevm"), "sigmoid_1d", 1)
+    _check_xevm(lowered, "sigmoid_1d", 1)
 
 
 @pytest.mark.isolated
@@ -597,14 +580,14 @@ def test_row_reduction_results(name: str, layout: str) -> None:
     anchored too."""
     kernel = {"row_sums": row_sums, "row_maxima": row_maxima}[name]
     args = [xpu_tensor(4096, 8192)]
-    text = lower_xpu(kernel, args)
+    text, lowered = lower_xpu_stages(kernel, args)
     assert _layouts(text, "xegpu.store") == [layout]
     assert _layouts(text, "xegpu.load_nd") == [
         "#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 64], inst_data = [8, 16]>"
     ]
     assert "xegpu.store_nd" not in text and "gpu.alloc" not in text
     assert "known_block_size = array<i32: 128, 1, 1>" in text
-    _check_xevm(lower_xpu(kernel, args, "xevm"), name, 1)
+    _check_xevm(lowered, name, 1)
 
 
 @pytest.mark.isolated
@@ -706,11 +689,10 @@ _RANK3 = {
 }
 
 
-def _lower_rank3(name: str, stop_at: str, **config: object) -> str:
+def _rank3_case(name: str, **config: object) -> tuple[object, list[object]]:
     fn, block_sizes, shapes, dtype, _, _ = _RANK3[name]
     kernel = _kernel(helion.Config(block_sizes=block_sizes, **config))(fn)
-    args = [xpu_tensor(*shape, dtype=dtype) for shape in shapes]
-    return lower_xpu(kernel, args, stop_at)
+    return kernel, [xpu_tensor(*shape, dtype=dtype) for shape in shapes]
 
 
 @pytest.mark.isolated
@@ -719,12 +701,11 @@ def test_unit_leading_tile_dims_fold(name: str) -> None:
     """Block size 1 on the leading dims: the kernel lowers as its 2D class, all
     XeGPU tiles 2D, the leading dims as workgroup grid dims."""
     *_, class_op, grid = _RANK3[name]
-    text = _lower_rank3(name, "xegpu-wg")
+    text, lowered = lower_xpu_stages(*_rank3_case(name))
     assert class_op in text
     ranks = {dims.count("x") for dims in _TENSOR_DESC.findall(text)}
     assert ranks == {2}, ranks
     assert f"known_grid_size = array<i32: {', '.join(map(str, grid))}>" in text
-    lowered = _lower_rank3(name, "xevm")
     assert "xegpu." not in lowered
     if class_op == "xegpu.dpas":
         assert "matrix_mad" in lowered
@@ -736,7 +717,7 @@ def test_batched_matmul_params_see_the_batch_matrix() -> None:
     with pytest.raises(
         XeGPUConfigError, match=r"GEMM \(M=1024, N=1024, K=1024, WG tile 256x256"
     ):
-        _lower_rank3("batched_matmul", "xegpu-wg", xegpu_sg_tiles=[[256, 256]])
+        lower_xpu(*_rank3_case("batched_matmul", xegpu_sg_tiles=[[256, 256]]))
 
 
 # --- Attention ------------------------------------------------------------------
@@ -785,20 +766,18 @@ def chained_matmuls(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.
     return out
 
 
-def _lower_attention(
+def _attention_case(
     shape: tuple[int, int, int, int],
     block_sizes: list[int],
-    stop_at: str = "xegpu-wg",
     fn: object = attention,
     **config: object,
-) -> str:
+) -> tuple[object, list[object]]:
     kernel = _kernel(helion.Config(block_sizes=block_sizes, **config))(fn)
     shapes = [shape, shape, shape]
     if fn is attention_kt:
         batch, heads, seq, head_dim = shape
         shapes[1] = (batch, heads, head_dim, seq)
-    args = [xpu_tensor(*dims, dtype=torch.bfloat16) for dims in shapes]
-    return lower_xpu(kernel, args, stop_at)
+    return kernel, [xpu_tensor(*dims, dtype=torch.bfloat16) for dims in shapes]
 
 
 @pytest.mark.isolated
@@ -829,7 +808,7 @@ def test_attention_is_recognized_by_structure(
         check_params(params, kernel_shapes)
 
     with mock.patch.object(xpu, "check_params", record):
-        text = _lower_attention(shape, block_sizes, **config)
+        text, lowered = lower_xpu_stages(*_attention_case(shape, block_sizes, **config))
     assert shapes == [expected]
     rows = sg_rows or 16
     subgroups = expected.rows // rows
@@ -838,7 +817,6 @@ def test_attention_is_recognized_by_structure(
     assert f"sg_layout = [{subgroups}, 1], sg_data = [{rows}, 64]" in text
     kv = f"sg_data = [{expected.kv_tile}, 64]"
     assert f"sg_layout = [1, 1], {kv}, order = [0, 1]" in text
-    lowered = _lower_attention(shape, block_sizes, "xevm", **config)
     assert "xegpu." not in lowered
     assert "intel_sub_group_bf16_bf16_matrix_mad_k16" in lowered
 
@@ -905,7 +883,7 @@ def test_unsupported_attention_variants(
     match: str,
 ) -> None:
     with pytest.raises(error, match=match):
-        _lower_attention(shape, block_sizes, fn=fn)
+        lower_xpu(*_attention_case(shape, block_sizes, fn=fn))
 
 
 @pytest.mark.isolated
@@ -920,7 +898,7 @@ def test_unsupported_attention_variants(
 )
 def test_invalid_attention_parameters(xegpu: dict[str, object], match: str) -> None:
     with pytest.raises(XeGPUConfigError, match=match):
-        _lower_attention((32, 32, 512, 64), [1, 1, 128, 64], **xegpu)
+        lower_xpu(*_attention_case((32, 32, 512, 64), [1, 1, 128, 64], **xegpu))
 
 
 # --- Unsupported kernels -----------------------------------------------------

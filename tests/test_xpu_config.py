@@ -18,6 +18,7 @@ from mlir import ir
 import pytest
 import torch
 
+from tests.harness import lower_xpu_stages
 from tests.harness import xpu_tensor
 
 from helion_mlir_backend import compile_mlir
@@ -177,6 +178,14 @@ def _lower(
     return str(lower_mlir(kernel, args, config=config, target="xpu", stop_at=stop_at))
 
 
+def _lower_stages(
+    kernel: object, args: list[object], blocks: list[int], **xegpu: object
+) -> tuple[str, str]:
+    """:func:`_lower` to ``xegpu-wg`` and to ``xevm``, from one lowering."""
+    config = helion.Config(block_sizes=blocks, **xegpu)
+    return lower_xpu_stages(kernel, args, config=config)
+
+
 @pytest.fixture(autouse=True)
 def xpu_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("HELION_MLIR_TARGET", "HELION_MLIR_XPU_STOP_AT"):
@@ -301,20 +310,16 @@ def test_forced_load_and_prefetch_tiles() -> None:
 
 
 @pytest.mark.isolated
-@pytest.mark.parametrize("stop_at", ["xegpu-wg", "xevm"])
-def test_parameters_per_kernel(stop_at: str) -> None:
+def test_parameters_per_kernel() -> None:
     """Each phase's kernel gets its own parameters; ``None`` keeps inference."""
-    text = _lower(
+    text, lowered = _lower_stages(
         two_phase_matmul,
         _two_phase_args(),
         [128, 256, 32, 256, 256, 32],
-        stop_at,
         xegpu_sg_tiles=[[32, 64], None],
         xegpu_load_tiles=[None, [16, 16, 32, 16]],
     )
-    if stop_at == "xevm":
-        _check_xevm(text, launches=2)
-        return
+    _check_xevm(lowered, launches=2)
     first, second = _kernels(text).values()
     # Kernel 0 (WG tile 128x256): forced subgroup tile, inferred load tiles; 16
     # subgroups.
@@ -364,21 +369,14 @@ def test_shorter_lists_and_none_entries_infer() -> None:
 
 
 @pytest.mark.isolated
-@pytest.mark.parametrize("stop_at", ["xegpu-wg", "xevm"])
 @pytest.mark.parametrize(("rows", "threads"), [(16, 64), (64, 16), (None, 128)])
-def test_reduction_subgroup_rows(stop_at: str, rows: int | None, threads: int) -> None:
+def test_reduction_subgroup_rows(rows: int | None, threads: int) -> None:
     """A reduction's subgroup tile is ``[rows, 0]`` (default: 8 rows)."""
     sg_tiles = [[rows, 0]] if rows is not None else [None]
-    text = _lower(
-        softmax,
-        [xpu_tensor(4096, 4096)],
-        SOFTMAX_BLOCKS,
-        stop_at,
-        xegpu_sg_tiles=sg_tiles,
+    text, lowered = _lower_stages(
+        softmax, [xpu_tensor(4096, 4096)], SOFTMAX_BLOCKS, xegpu_sg_tiles=sg_tiles
     )
-    if stop_at == "xevm":
-        _check_xevm(text, launches=1)
-        return
+    _check_xevm(lowered, launches=1)
     (kernel,) = _kernels(text).values()
     rows = rows or 8
     assert f"sg_layout = [{64 // rows}, 1], sg_data = [{rows}, 64]" in kernel
@@ -435,7 +433,7 @@ def test_reduction_load_tiles(
     tile (inferred: the largest dividing the subgroup tile); its tile stores
     the 2D block store tile."""
     args = [xpu_tensor(4096, 4096, dtype=dtype)]
-    text = _lower(softmax_in_f32, args, SOFTMAX_BLOCKS, **xegpu)
+    text, lowered = _lower_stages(softmax_in_f32, args, SOFTMAX_BLOCKS, **xegpu)
     (kernel,) = _kernels(text).values()
     sg_layout, sg_data = [64 // rows, 1], [rows, 64]
     assert _op_layouts(kernel, "xegpu.load_nd") == {
@@ -444,7 +442,6 @@ def test_reduction_load_tiles(
     assert _op_layouts(kernel, "xegpu.store_nd") == {
         _layout(sg_layout, sg_data, [8, 16])
     }
-    lowered = _lower(softmax_in_f32, args, SOFTMAX_BLOCKS, "xevm", **xegpu)
     _check_xevm(lowered, 1)
     assert _block_reads(lowered) == reads
 
@@ -486,17 +483,14 @@ def test_reduction_tile_limits(
 
 
 @pytest.mark.isolated
-@pytest.mark.parametrize("stop_at", ["xegpu-wg", "xevm"])
 @pytest.mark.parametrize("forced", [False, True])
-def test_kernels_of_different_classes(stop_at: str, forced: bool) -> None:
+def test_kernels_of_different_classes(forced: bool) -> None:
     """A GEMM kernel and a reduction kernel in one Helion kernel, each set up by
     its own class (lighthouse's stages need every kernel in one class)."""
     xegpu = {"xegpu_sg_tiles": [[64, 32], [16, 0]]} if forced else {}
     args = [xpu_tensor(N, N, dtype=torch.float16) for _ in range(2)]
-    text = _lower(matmul_softmax, args, MATMUL_SOFTMAX_BLOCKS, stop_at, **xegpu)
-    if stop_at == "xevm":
-        _check_xevm(text, launches=2)
-        return
+    text, lowered = _lower_stages(matmul_softmax, args, MATMUL_SOFTMAX_BLOCKS, **xegpu)
+    _check_xevm(lowered, launches=2)
     gemm, reduction = _kernels(text).values()
     assert "xegpu.dpas" in gemm and "xegpu.dpas" not in reduction
     sg_tile, sg_layout, rows = (
@@ -733,13 +727,14 @@ def _elementwise_args(dtype: torch.dtype = torch.bfloat16) -> list[object]:
 def test_elementwise_parameters(
     xegpu: dict[str, object], load: str, store: str, threads: int
 ) -> None:
-    text = _lower(silu, _elementwise_args(), ELEMENTWISE_BLOCKS, **xegpu)
+    text, lowered = _lower_stages(
+        silu, _elementwise_args(), ELEMENTWISE_BLOCKS, **xegpu
+    )
     (kernel,) = _kernels(text).values()
     assert _op_layouts(kernel, "xegpu.load_nd") == {load}
     assert _op_layouts(kernel, "xegpu.store_nd") == {store}
     assert _known_threads(kernel) == threads
     assert _launch_threads(text) == [threads]
-    lowered = _lower(silu, _elementwise_args(), ELEMENTWISE_BLOCKS, "xevm", **xegpu)
     _check_xevm(lowered, 1)
 
 

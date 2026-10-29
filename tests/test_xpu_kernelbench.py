@@ -23,7 +23,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from tests.harness import lower_xpu
+from tests.harness import lower_xpu_stages
 from tests.harness import xpu_tensor
 from tests.kernelbench_xpu import ATTENTION_BLOCKS
 from tests.kernelbench_xpu import LEVEL2_PROBLEMS
@@ -169,13 +169,12 @@ _CHECKS = {
 @pytest.mark.parametrize("name", list(_ALL))
 def test_kernelbench_problem_lowers_for_xpu(name: str) -> None:
     problem = _ALL[name]
-    text = lower_xpu(problem.kernel, _args(problem), "xegpu-wg")
+    text, lowered = lower_xpu_stages(problem.kernel, _args(problem))
     _check_launch(text, problem.grid)
     _CHECKS[problem.kind](text)
     # Every tile is 2D, also of rank-3+ problems (unit leading dims folded).
     ranks = {dims.count("x") for dims in _TENSOR_DESC.findall(text)}
     assert ranks == {2}, ranks
-    lowered = lower_xpu(problem.kernel, _args(problem), "xevm")
     assert "xegpu." not in lowered
     assert "llvm.func spir_funccc" in lowered
     assert re.search(r"gpu\.launch_func <%\w+ : !llvm\.ptr>", lowered)
