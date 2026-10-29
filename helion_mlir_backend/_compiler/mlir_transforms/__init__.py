@@ -16,6 +16,7 @@ from .legalize_host_ops import legalize_host_ops
 from .loop_bounds import loop_bounds
 from .mark_operand_packs import OPERAND_PACK_ATTR_NAME
 from .mark_operand_packs import mark_operand_packs
+from .match_scalar_contractions import match_scalar_contractions
 from .materialize_copies import materialize_copies
 from .materialize_operand_pads import materialize_operand_pads
 from .move_offsets_to_subview import move_offsets_to_subview
@@ -55,6 +56,7 @@ __all__ = [
     "loop_bounds",
     "mark_operand_packs",
     "match_row_result_stores",
+    "match_scalar_contractions",
     "materialize_copies",
     "materialize_operand_pads",
     "move_offsets_to_subview",

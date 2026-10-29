@@ -16,6 +16,7 @@ import lighthouse.transform as lh_transform
 from mlir import ir
 from mlir import passmanager
 from mlir.dialects import transform
+from mlir.dialects.transform import structured
 import pytest
 import torch
 
@@ -37,11 +38,13 @@ from helion_mlir_backend._compiler.helion_transforms import split_contraction_op
 from helion_mlir_backend._compiler.helion_transforms import split_copies
 from helion_mlir_backend._compiler.helion_transforms import split_transfers
 from helion_mlir_backend._compiler.helion_transforms import unroll_transfers
+from helion_mlir_backend._compiler.helion_transforms import vectorize_linalg
 from helion_mlir_backend._compiler.helion_transforms import version_padded_operands
 from helion_mlir_backend._compiler.mlir_transforms import HelionTransformDialect
 from helion_mlir_backend._compiler.mlir_transforms import (
     forward_rows as forward_rows_op,
 )
+from helion_mlir_backend._compiler.mlir_transforms import match_scalar_contractions
 from helion_mlir_backend._compiler.mlir_transforms import (
     split_contraction_operands as split_contraction_operands_op,
 )
@@ -1548,3 +1551,47 @@ func.func @f(%a: memref<4x8xf32>, %b: memref<8x16xf32>, %c: memref<4x16xf32>) {
 def test_split_contraction_operands_leaves_others_alone(case: str) -> None:
     before, after = _apply_bare(split_contraction_operands_op, _SPLIT_UNCHANGED[case])
     assert after == before
+
+
+_SCALAR_CONTRACTIONS = """
+func.func @f(%a: tensor<16xf32>, %b: tensor<16xf32>, %c: tensor<f32>,
+             %m: tensor<4x16xf32>, %n: tensor<16x4xf32>, %o: tensor<4x4xf32>)
+    -> (tensor<f32>, tensor<f32>, tensor<4x4xf32>) {
+  %0 = linalg.contract
+      indexing_maps = [affine_map<(k) -> (k)>, affine_map<(k) -> (k)>,
+                       affine_map<(k) -> ()>]
+      ins(%a, %b : tensor<16xf32>, tensor<16xf32>) outs(%c : tensor<f32>)
+      -> tensor<f32>
+  %1 = linalg.dot ins(%b, %a : tensor<16xf32>, tensor<16xf32>)
+      outs(%c : tensor<f32>) -> tensor<f32>
+  %2 = linalg.contract
+      indexing_maps = [affine_map<(i, j, k) -> (i, k)>,
+                       affine_map<(i, j, k) -> (k, j)>,
+                       affine_map<(i, j, k) -> (i, j)>]
+      ins(%m, %n : tensor<4x16xf32>, tensor<16x4xf32>) outs(%o : tensor<4x4xf32>)
+      -> tensor<4x4xf32>
+  return %0, %1, %2 : tensor<f32>, tensor<f32>, tensor<4x4xf32>
+}
+"""
+
+
+def test_match_scalar_contractions() -> None:
+    def generalize(funcs: ir.Value) -> None:
+        structured.structured_generalize(
+            transform.AnyOpType.get(), match_scalar_contractions(funcs)
+        )
+
+    _, text = _apply_bare(generalize, _SCALAR_CONTRACTIONS)
+    # The dot products only; the 4x4 matmul stays named.
+    assert text.count("linalg.generic") == 2
+    assert "linalg.dot" not in text
+    assert text.count("linalg.contract") == 1
+
+
+def test_vectorize_linalg_dot_products() -> None:
+    # Named, the dot products vectorize to vector.contract ops of vector<f32>
+    # accumulators, which do not verify.
+    text = _apply(vectorize_linalg, _SCALAR_CONTRACTIONS)
+    assert "linalg." not in text
+    assert text.count("into f32") == 2
+    assert text.count("into vector<4x4xf32>") == 1

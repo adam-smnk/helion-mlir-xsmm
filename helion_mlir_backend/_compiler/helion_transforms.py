@@ -35,10 +35,15 @@ def vectorize_linalg() -> ir.Module:
     """Schedule: lighthouse's ``vectorization.py[gen=vectorize_linalg]``, also
     vectorizing ops of runtime shape, with masks. Runtime extents without an
     evident bound and ops of too large vectors are first tiled. Ops that cannot
-    be tiled or vectorized (e.g. argmax, gathers) are left to the loop lowering."""
+    be tiled or vectorized (e.g. argmax, gathers) are left to the loop lowering.
+    Dot products are generalized first: upstream vectorizes a named
+    contraction into a rank-0 result to an invalid ``vector.contract``."""
     ht.HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        structured.structured_generalize(
+            transform.AnyOpType.get(), ht.match_scalar_contractions(funcs)
+        )
         to_tile = ht.partition_linalg(funcs)[-1]
         with lh_transform.foreach(to_tile) as op:
             sizes = ht.tile_sizes(op)
