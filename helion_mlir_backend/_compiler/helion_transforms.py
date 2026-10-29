@@ -209,6 +209,17 @@ def align_operand_rows() -> ir.Module:
     return schedule
 
 
+def split_bf16_loads() -> ir.Module:
+    """Schedule: every LLVM load of a bf16 vector of 8k+1 elements (k > 0) as
+    loads of the first 8k and of the last."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        ht.split_bf16_loads(named_seq.bodyTarget)
+
+        transform.yield_()
+    return schedule
+
+
 def split_copies() -> ir.Module:
     """Schedule: every function's out-of-bounds n-D memref copies row by row,
     split on an in-bounds check."""

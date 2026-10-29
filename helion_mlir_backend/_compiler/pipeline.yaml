@@ -121,3 +121,5 @@ Pipeline:
   - pass: "convert-vector-to-scf"
   - schedule: "helion_transforms.py[gen=hoist_allocas]"
   - include: llvm-lowering.yaml
+  ## Loads of bf16 vectors of 8k+1 elements abort x86 code generation: split.
+  - schedule: "helion_transforms.py[gen=split_bf16_loads]"

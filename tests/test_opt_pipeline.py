@@ -27,6 +27,7 @@ from helion_mlir_backend._compiler.helion_transforms import linearize_vector_ops
 from helion_mlir_backend._compiler.helion_transforms import lower_transposes
 from helion_mlir_backend._compiler.helion_transforms import materialize_operand_pads
 from helion_mlir_backend._compiler.helion_transforms import schedule_amx_loads
+from helion_mlir_backend._compiler.helion_transforms import split_bf16_loads
 from helion_mlir_backend._compiler.helion_transforms import split_copies
 from helion_mlir_backend._compiler.helion_transforms import split_transfers
 from helion_mlir_backend._compiler.helion_transforms import unroll_transfers
@@ -366,6 +367,93 @@ def test_partial_tile_copies_lower_by_rows(name: str, shape: tuple[int, int]) ->
     assert not re.search(r"llvm\.shufflevector[^\n]*vector<\d{3,}x", text)
     assert text.count("llvm.insertelement") + text.count("llvm.extractelement") < 100
     assert len(text) < 200_000
+
+
+# Loads of bf16 vectors: 33 elements (8k+1) and, left alone, 32 and 34.
+BF16_VECTOR_LOADS = """
+llvm.func @f(%p: !llvm.ptr) -> !llvm.struct<(vector<33xbf16>, vector<32xbf16>,
+                                             vector<34xbf16>)> {
+  %a = llvm.load %p <alignment = 2> : !llvm.ptr -> vector<33xbf16>
+  %b = llvm.load %p <alignment = 2> : !llvm.ptr -> vector<32xbf16>
+  %c = llvm.load %p <alignment = 2> : !llvm.ptr -> vector<34xbf16>
+  %0 = llvm.mlir.poison : !llvm.struct<(vector<33xbf16>, vector<32xbf16>,
+                                         vector<34xbf16>)>
+  %1 = llvm.insertvalue %a, %0[0] : !llvm.struct<(vector<33xbf16>, vector<32xbf16>,
+                                                    vector<34xbf16>)>
+  %2 = llvm.insertvalue %b, %1[1] : !llvm.struct<(vector<33xbf16>, vector<32xbf16>,
+                                                    vector<34xbf16>)>
+  %3 = llvm.insertvalue %c, %2[2] : !llvm.struct<(vector<33xbf16>, vector<32xbf16>,
+                                                    vector<34xbf16>)>
+  llvm.return %3 : !llvm.struct<(vector<33xbf16>, vector<32xbf16>, vector<34xbf16>)>
+}
+"""
+
+
+def test_split_bf16_loads_splits_the_last_element() -> None:
+    # A load of a bf16 vector of 8k+1 elements aborts x86 code generation.
+    text = _apply(split_bf16_loads, BF16_VECTOR_LOADS)
+    loads = re.findall(r"llvm\.load [^\n]*-> vector<(\d+)xbf16>", text)
+    assert sorted(loads) == ["1", "32", "32", "34"]
+    assert "llvm.getelementptr %arg0[32] : (!llvm.ptr) -> !llvm.ptr, bf16" in text
+    assert text.count("llvm.shufflevector") == 2
+
+
+def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
+    """AI-bench's 39_L2Norm_ kernel: ``x / ||x||_2`` per row, in two passes over
+    column chunks."""
+    m, n = x.shape
+    hl.specialize(n)
+    block_n = hl.register_block_size(n)
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            v = x[tile_m, tile_n].to(torch.float32)
+            acc = acc + v * v
+        inv = torch.rsqrt(acc.sum(-1, keepdim=True))
+        for tile_n in hl.tile(n, block_size=block_n):
+            out[tile_m, tile_n] = (x[tile_m, tile_n].to(torch.float32) * inv).to(
+                x.dtype
+            )
+    return out
+
+
+l2_normalize_kernel = helion.kernel(
+    _l2_normalize, backend="mlir", config=helion.Config(block_sizes=[513, 8])
+)
+
+
+def test_ragged_bf16_l2_normalize_runs() -> None:
+    """Regression: copying the partial last row tile of a 129x513 bf16 output
+    by rows of 513 aborted LLVM code generation ("Do not know how to soft
+    promote this operator's operand")."""
+    torch.manual_seed(0)
+    x = torch.randn(129, 513, dtype=torch.bfloat16)
+    expected = x.float() / x.float().norm(dim=1, keepdim=True)
+    actual = l2_normalize_kernel(x)
+    torch.testing.assert_close(
+        actual.float(), expected.to(torch.bfloat16).float(), rtol=1e-2, atol=1e-2
+    )
+
+
+@helion.kernel(backend="mlir", config=helion.Config(block_sizes=[8, 1024]))
+def scalar_mul_kernel(a: torch.Tensor, s: hl.constexpr) -> torch.Tensor:
+    """AI-bench's 5_Matrix_scalar_multiplication kernel."""
+    out = torch.empty_like(a)
+    for tile in hl.tile(a.shape):
+        out[tile] = a[tile] * s
+    return out
+
+
+def test_ragged_bf16_scalar_mul_runs() -> None:
+    """Regression: the rows of the partial last row tile of a 9x33 bf16 input,
+    loaded as vectors of 33 elements, aborted LLVM code generation ("Do not
+    know how to soft promote this operator's operand")."""
+    torch.manual_seed(0)
+    a = torch.randn(9, 33, dtype=torch.bfloat16)
+    actual = scalar_mul_kernel(a, hl.constexpr(3.0))
+    expected = (a.float() * 3.0).to(torch.bfloat16)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=1e-2, atol=1e-2)
 
 
 # A cast of VNNI pairs between the reshapes of flattened transfers.
