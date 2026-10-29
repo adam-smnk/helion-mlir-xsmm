@@ -69,7 +69,18 @@ grid loops of one of these kernel classes:
 - elementwise: any number of inputs and outputs, fused unary/binary math, casts,
   broadcast rows (e.g. a bias), over 2D tiles of 16- or 32-bit elements (bf16, f16,
   f32) whose columns are a multiple of 16, or 1D tiles (gathers and scatters). bf16
-  math runs in f32.
+  math runs in f32;
+- attention, written as flash attention (lighthouse's attention class): in an inner
+  `hl.tile` loop over K/V tiles, `S = Q @ K^T`, row reductions of `S` (the online
+  softmax's maxima and sums), and `O = O * alpha + P @ V` accumulated across the
+  loop, with `P` computed from `S`; both matmuls on f16/bf16 operands with f32
+  accumulation (DPAS). Recognized by that structure, not by name. Lighthouse's
+  attention layout takes K and V stored `[seq, head dim]`, a head dim of 64, query
+  rows per workgroup in 16-row subgroups (at most 32) and K/V tiles of a multiple of
+  32 rows. Lighthouse fuses unfused SDPA into this form in its workgroup tiling,
+  which Helion's grid replaces, so unfused SDPA is not supported. KernelBench 97
+  (`tests/kernelbench_xpu.py`, `attention`) uses block sizes `[1, 1, 128, 64]`
+  (batch, head, query rows, K/V rows) on `[B, H, S, 64]` tiles.
 
 Rank 3 and higher work with block size 1 on the leading dims (batch, channel, head):
 unit tile dims are folded away before the checks and lighthouse's stages, so the grid
@@ -121,7 +132,7 @@ keeps lighthouse's inference.
 
 | Key | Entry | Applies to |
 |-----|-------|------------|
-| `xegpu_sg_tiles` | `[sg_m, sg_n]` subgroup tile (`threads` = 16 x subgroups); `[rows, 0]` for a row reduction | GEMM, reduction, 2D elementwise kernels |
+| `xegpu_sg_tiles` | `[sg_m, sg_n]` subgroup tile (`threads` = 16 x subgroups); `[rows, 0]` for a row reduction or attention (query rows, a multiple of 16) | GEMM, attention, reduction, 2D elementwise kernels |
 | `xegpu_load_tiles` | `[a_m, a_k, b_k, b_n]`: A and B tiles loaded per instruction; `[m, n]`: the tile an elementwise kernel, or a row reduction (of the tiles it reduces), loads per instruction | GEMM, reduction, 2D elementwise kernels |
 | `xegpu_prefetch_tiles` | `[a_m, a_k, b_k, b_n]`: A and B prefetch tiles, in the operand's stored orientation (`[n, k]` for a transposed B) | GEMM kernels |
 | `xegpu_prefetch_depths` | `[a_nb, b_nb]`: K iterations A and B are prefetched ahead | GEMM kernels |
@@ -139,7 +150,8 @@ Before lowering, forced parameters are checked against each kernel's shapes with
 lighthouse's XeGPU constraints (`matmul_constraints`, the cost model's register and
 DPAS limits; for elementwise and reduction kernels the limits of the inference
 above, e.g. a reduction's load tile rows divide its subgroup rows and f32 loads take
-16 columns; the prefetch keys are rejected: GEMM only); invalid ones, malformed entries and lists longer than the number of
+16 columns; the prefetch keys are rejected: GEMM only; attention kernels take only
+`xegpu_sg_tiles`); invalid ones, malformed entries and lists longer than the number of
 kernels raise `XeGPUConfigError` (an `MLIRBackendError`, so the autotuner skips the
 config). The CPU target ignores the `xegpu_*` keys, so one config can serve both
 devices.
@@ -148,15 +160,18 @@ devices.
 
 Given configs are used as they are; autotuning is an extra. The XPU search space
 (`targets/xpu_search.py`) classifies each GPU kernel from Helion's facts on the
-kernel (GEMM, row reduction, elementwise) and narrows the block sizes Helion samples
+kernel (GEMM, attention, row reduction, elementwise) and narrows the block sizes Helion samples
 to what XeGPU compiles: powers of two dividing the sizes they tile (no masking), at
 least 16 for the blocks of a tile's contiguous dim; matmul M/N tiles of 32 to 1024
 and K tiles of 16 to 64, below K; reduction rows of 8 to 256 (whole 8-row subgroups,
-at most 32) and 16 to 256 columns; 2D elementwise tiles of at most 2048 per side. The
+at most 32) and 16 to 256 columns; attention query rows of 16 to 512 and K/V tiles of
+32 or 64 rows, below the sequence; 2D elementwise tiles of at most 2048 per side. The
 default config infers every XeGPU parameter, with a matmul's block sizes from
-lighthouse's parameter selection for its sizes, and lowers. The `xegpu_*` keys are
+lighthouse's parameter selection for its sizes and an attention kernel's from
+lighthouse's attention defaults (128 query rows, 64 K/V rows), and lowers. The `xegpu_*` keys are
 searched as per-kernel fragments, `None` (inferred) the default: `xegpu_sg_tiles`
-(GEMM 32x32, 32x64, 64x32; reduction 16 or 32 rows; elementwise 16x32, 32x32, 32x64),
+(GEMM 32x32, 32x64, 64x32; reduction 16 or 32 rows; attention 32 rows; elementwise
+16x32, 32x32, 32x64),
 `xegpu_load_tiles` (reduction and elementwise: 8 or 32 rows at the widest block load)
 and `xegpu_prefetch_depths` (GEMM: 2 and 2); `xegpu_prefetch_tiles` is not searched.
 Sampled configs that cannot lower (e.g. a subgroup tile not dividing the sampled

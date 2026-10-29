@@ -29,13 +29,16 @@ from helion_mlir_backend._compiler.mlir.support import MLIRBackendError
 from helion_mlir_backend._compiler.targets import get_target
 from helion_mlir_backend._compiler.targets import xpu
 from helion_mlir_backend._compiler.targets.xpu_params import XEGPU_CONFIG_KEYS
+from helion_mlir_backend._compiler.targets.xpu_search import ATTENTION as ATTENTION_KIND
 from helion_mlir_backend._compiler.targets.xpu_search import KernelChoicesFragment
+from helion_mlir_backend._compiler.targets.xpu_search import search_kernels
 from helion_mlir_backend.api import _compile
 
 _PROBLEMS = {problem.name: problem for problem in (*PROBLEMS, *RANK3_PROBLEMS)}
 GEMM = "1_Square_matrix_multiplication_"
 ELEMENTWISE = "19_ReLU"
 REDUCTION = "23_Softmax"
+ATTENTION = "97_ScaledDotProductAttention"
 SAMPLES = 6
 
 
@@ -63,7 +66,7 @@ def xpu_environment(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.isolated
-@pytest.mark.parametrize("name", [GEMM, ELEMENTWISE, REDUCTION])
+@pytest.mark.parametrize("name", [GEMM, ELEMENTWISE, REDUCTION, ATTENTION])
 def test_sampled_configs_lower_or_are_skipped(name: str) -> None:
     problem = _PROBLEMS[name]
     spec = _xpu_spec(problem)
@@ -213,3 +216,34 @@ def test_leading_blocks_are_unit(name: str) -> None:
         )
     )
     assert "#xegpu.layout" in text
+
+
+@pytest.mark.isolated
+def test_attention_is_classified_and_its_default_lowers() -> None:
+    """The flash-attention kernel (two contractions in its K/V loop, which a
+    reduction reduces in) is its own class: query rows 16..512 (16-row
+    subgroups, at most 32), K/V tiles 32..64 (whole V load blocks, the K/V tile
+    in registers), lighthouse's 128 x 64 as the default, and its subgroup
+    rows searched."""
+    problem = _PROBLEMS[ATTENTION]
+    hf, _, env = _compile(problem.kernel, _args(problem), None)
+    spec = env.config_spec
+    (kernel,) = search_kernels(spec, hf.device_ir)
+    assert kernel.kind == ATTENTION_KIND
+    get_target("xpu").adjust_config_spec(spec, hf.device_ir)
+    bounds = [(block.min_size, block.max_size) for block in spec.block_sizes]
+    assert bounds == [(1, 1), (1, 1), (16, 512), (32, 64)]
+    default = spec.default_config()
+    assert default.config["block_sizes"] == problem.block_sizes
+    assert spec._flat_fields()["xegpu_sg_tiles"].choices == ((None, [32, 0]),)
+    text = str(
+        lower_mlir(
+            problem.kernel,
+            _args(problem),
+            config=default,
+            target="xpu",
+            stop_at="xegpu-wg",
+        )
+    )
+    assert text.count("xegpu.dpas ") == 2
+    assert "known_block_size = array<i32: 128, 1, 1>" in text

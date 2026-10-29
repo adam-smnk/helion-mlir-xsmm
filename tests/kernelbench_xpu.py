@@ -22,17 +22,21 @@ chosen per shape:
   workgroup (lighthouse's reduction class: 8 subgroups of 8 rows) and 64-column
   chunks; multi-pass over the chunks like AI-bench's CPU kernels.
 - Rank 3 and 4 (batched matmuls, NCHW activations, a softmax over the last dim
-  of ``[B, H, S, D]``): block size 1 on the leading (batch, channel, head) dims,
-  the 2D kernels' tiles on the last two. The pipeline folds unit tile dims, so
-  each is its 2D kernel class, and the leading dims become workgroup grid dims
-  (they multiply the workgroups: a small per-batch matrix still fills the GPU).
-  Larger leading blocks (real 3D tiles) are rejected.
+  of ``[B, H, S, D]``, attention): block size 1 on the leading (batch, channel,
+  head) dims, the 2D kernels' tiles on the last two. The pipeline folds unit
+  tile dims, so each is its 2D kernel class, and the leading dims become
+  workgroup grid dims (they multiply the workgroups: a small per-batch matrix
+  still fills the GPU). Larger leading blocks (real 3D tiles) are rejected.
+- Attention (97, bf16 ``[32, 32, 512, 64]``): written fused and tiled as flash
+  attention (online softmax over K/V tiles), block sizes ``[1, 1, query rows,
+  K/V rows]``; see :data:`ATTENTION_BLOCKS` for the hardware rationale.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import field
+import math
 from typing import TYPE_CHECKING
 
 import helion
@@ -362,6 +366,46 @@ def _softmax_last_dim(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """``F.scaled_dot_product_attention(q, k, v)`` of ``[B, H, S, D]`` (no mask,
+    scale ``1/sqrt(D)``, KernelBench 97) as flash attention: each workgroup
+    takes a tile of query rows of one (batch, head) and runs over the K/V
+    sequence in tiles, with an online softmax (running row maxima and sums,
+    the output rescaled when the maximum grows). The matmuls take bf16
+    operands and accumulate in f32 (DPAS); the softmax is f32; ``P`` is
+    rounded to V's dtype for ``P @ V``, the output to Q's. Also run on the CPU
+    target (numerics) and with other shapes and block sizes (``test_xpu_ir``).
+
+    The tiles are 4D with unit batch and head blocks, so the contractions are
+    einsums (``hl.dot`` takes 2D or 3D operands). An einsum of bf16 tiles
+    returns bf16; added to an f32 accumulator it accumulates in f32 (the
+    backend fuses ``acc + einsum`` into one contraction), so ``Q @ K^T``
+    accumulates into zeros."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    scale = 1.0 / math.sqrt(d)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], float("-inf"), dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * scale
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+
+
 # --- Problems ---------------------------------------------------------------------
 
 
@@ -372,7 +416,7 @@ class Problem:
     name: str
     """The KernelBench file name, without ``.py``."""
     kind: str
-    """``matmul``, ``elementwise`` or ``reduction``."""
+    """``matmul``, ``elementwise``, ``reduction`` or ``attention``."""
     fn: Callable[..., object]
     shapes: tuple[tuple[int, ...], ...]
     """The input shapes, in argument order."""
@@ -390,6 +434,28 @@ _GEMM_BLOCKS = [256, 256, 32]
 _ELEMENTWISE_BLOCKS = [128, 256]
 _ELEMENTWISE_SHAPE = (4096, 393216)
 _REDUCTION_BLOCKS = [64, 64]
+ATTENTION_BLOCKS = [1, 1, 128, 64]
+"""Flash-attention block sizes ``[batch, head, query rows, K/V rows]``, picked
+from the hardware (Xe2, large register file) for a head dim of 64:
+
+- Batch and head blocks 1: each workgroup works on one (batch, head) matrix
+  (unit tile dims are folded; the grid is B x H x S/128 = 32x32x4).
+- 128 query rows per workgroup: 8 subgroups of 16 rows (lighthouse's attention
+  layout: subgroup tiles of 16 rows, two 8-row DPAS blocks), 128 threads of
+  16 lanes. Every subgroup reads the whole K and V tiles, so more rows per
+  workgroup share each K/V tile through the L1 cache; 8 subgroups (of at
+  most 32) still leave room for several workgroups per Xe core, and
+  32x32x4 = 4096 workgroups fill the GPU.
+- K/V tiles of 64 rows: per subgroup, ``Q @ K^T`` is 16x64 (2x4 DPAS 8x16
+  blocks, 4 K steps of 16 over the head dim) and ``P @ V`` 16x64 over 64 K/V
+  rows (4 K steps): 32 DPAS each per step. The K or V tile (64x64 bf16, 128
+  registers of 64 bytes) with Q (16), the scores (32) and the accumulator (32)
+  fits the 256-register file; 128 rows (256 registers) would spill. 64 is
+  also lighthouse's attention reduction tile, and whole 32x32 V blocks.
+- 2D block loads: Q in 16x16 blocks, V in 32x32 blocks (the VNNI-transformed
+  B operand), K transposed (``Q @ K^T`` of K stored ``[seq, head dim]``) in
+  16x8 blocks of 32-bit pairs; the output is stored in 8x16 blocks.
+"""
 
 
 _MATMULS = {
@@ -513,6 +579,18 @@ RANK3_PROBLEMS: tuple[Problem, ...] = (
         F32,
         [_REDUCTION_BLOCKS[1], 1, 1, _REDUCTION_BLOCKS[0]],
         (32, 32, 8),
+    ),
+    # 97_ScaledDotProductAttention at mlir-gpu-bench shapes, written as flash
+    # attention (AI-bench lowers unfused SDPA; lighthouse fuses it in its WG
+    # tiling, which Helion's grid replaces).
+    Problem(
+        "97_ScaledDotProductAttention",
+        "attention",
+        attention,
+        ((32, 32, 512, 64),) * 3,
+        BF16,
+        ATTENTION_BLOCKS,
+        (32, 32, 4),
     ),
 )
 """Rank-3+ problems: block size 1 on the leading dims (folded away)."""

@@ -69,6 +69,9 @@ def prepare_for_xegpu() -> ir.Module:
       loop-carried accumulators (``fold_loop_unit_dims``); batched matmuls are
       generalized first (as lighthouse's cleanup does) so a unit batch dim
       folds, leaving a matmul.
+    - Loop-carried tensors updated elementwise into a fresh tensor (e.g. the
+      running sum of a flash-attention kernel) are updated in place
+      (``carry_loop_inits``), so vectorization carries them as vectors.
 
     The XPU target applies this stage before its capability checks and
     parameter validation, which therefore see the rank-reduced kernels.
@@ -93,6 +96,7 @@ def prepare_for_xegpu() -> ir.Module:
         with ir.InsertionPoint(transform.apply_patterns(module).patterns):
             tensor_transform.apply_patterns_tensor_reassociative_reshape_folding()
         lh_transform.cleanup(module)
+        ht.carry_loop_inits(module)
         transform.yield_()
     return schedule
 
@@ -242,11 +246,13 @@ def _set_threads(func: ir.Value, index: int, kernel: KernelParams) -> ir.Value:
     alternatives = lh_transform.alternatives(
         func, num_alternatives=5, result_types=[func.type]
     )
-    for region, set_threads in enumerate(
-        (set_gpu_threads_attention, set_gpu_threads_gemm, set_gpu_threads_reduction)
+    for region, set_threads, sg_tile in (
+        (0, set_gpu_threads_attention, _attention_sg_tile(kernel.sg_tile)),
+        (1, set_gpu_threads_gemm, force),
+        (2, set_gpu_threads_reduction, force),
     ):
         with alternatives.region(region) as scope:
-            set_threads(_kernel_ops(scope, "gpu.launch", index), force_sg_tile=force)
+            set_threads(_kernel_ops(scope, "gpu.launch", index), force_sg_tile=sg_tile)
             transform.yield_([scope])
     with alternatives.region(3) as scope:
         launch = _only(_kernel_ops(scope, "gpu.launch", index))
@@ -263,6 +269,17 @@ def _set_threads(func: ir.Value, index: int, kernel: KernelParams) -> ir.Value:
         )
         transform.yield_([scope])
     return alternatives.results[0]
+
+
+def _attention_sg_tile(sg_tile: Sequence[int] | None) -> list[int] | None:
+    """A forced ``[rows, 0]`` subgroup tile (the reduction form) in the form
+    lighthouse's attention class takes: the query rows last, as in its tiles
+    of the full-rank attention op (``[0, 0, rows]``). Its thread count reads
+    the last entry, and ``annotate_attention`` drops leading zeros and appends
+    the untiled head dim (``[rows, 0]``)."""
+    if sg_tile is None or len(sg_tile) != 2 or sg_tile[1] != 0:
+        return list(sg_tile) if sg_tile is not None else None
+    return [sg_tile[0]]
 
 
 def _elementwise_layout(
@@ -314,7 +331,7 @@ def _annotate_kernel(gpu_func: ir.Value, kernel: KernelParams) -> None:
         dpas_op = transform_ext.extract_handle(dpas_ops, 0, silenceable=True)
         anchor_op = lh_transform.match_op(scope, "vector.multi_reduction")
         anchor_op = transform_ext.extract_handle(anchor_op, 0, silenceable=True)
-        annotate_attention(scope, dpas_op, force_sg_tile=sg_tile)
+        annotate_attention(scope, dpas_op, force_sg_tile=_attention_sg_tile(sg_tile))
         transform.yield_([scope])
     with alternatives.region(1) as scope:
         dpas_ops = lh_transform.match_op(scope, "xegpu.dpas")

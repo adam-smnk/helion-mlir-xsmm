@@ -11,11 +11,15 @@ The gates are conservative, by IR property (not by kernel):
   here, and only tiles with more than two non-unit dims are rejected;
 - every grid loop (top-level ``scf.forall``, one GPU kernel each) is a kernel
   class the pipeline handles: one matmul-like contraction (GEMM, plus epilogue),
-  a reduction over the innermost dim (lighthouse's classes: rows of 2D
-  tiles), or elementwise (only parallel ops: tiles loaded and stored whole,
-  that an XeGPU layout fits);
+  two in flash-attention form (``xpu_params.attention_shape``: ``Q @ K^T``, row
+  reductions, ``P @ V`` accumulated in a loop over K/V tiles; a head dim of
+  64, as lighthouse's attention layout requires), a reduction over the
+  innermost dim (lighthouse's classes: rows of 2D tiles), or elementwise
+  (only parallel ops: tiles loaded and stored whole, that an XeGPU layout
+  fits);
 - a contraction runs in a K loop (an inner ``hl.tile`` with a block size below
-  K), on f16/bf16 operands accumulating in f32 (XeGPU DPAS).
+  K), on f16/bf16 operands (also f32 values the contraction truncates to them,
+  e.g. attention's ``P``) accumulating in f32 (XeGPU DPAS).
 """
 
 from __future__ import annotations
@@ -24,7 +28,9 @@ from mlir import ir
 from mlir.dialects import linalg
 
 from ..mlir.support.errors import UnsupportedOperationError
+from .xpu_params import ATTENTION_D_HEAD
 from .xpu_params import ElementwiseShape
+from .xpu_params import attention_shape
 from .xpu_params import kernel_shape
 
 _DPAS_OPERANDS = frozenset({"f16", "bf16"})
@@ -219,17 +225,53 @@ def _check_kernel_class(loop: ir.Operation) -> None:
     if not contractions and not reductions:
         _check_elementwise(loop)
         return
-    if len(contractions) > 1:
+    if len(contractions) == 2:
+        _check_attention(contractions, loop)
+    elif len(contractions) > 2:
         raise UnsupportedOperationError(
             "several matmuls in one grid loop on XPU",
             reason=(
                 f"the grid loop has {len(contractions)} contractions; the XeGPU "
-                "layout annotation handles one matmul per kernel"
+                "layout annotation handles one matmul per kernel, or two in "
+                "flash-attention form"
             ),
             alternatives=["one matmul per top-level hl.tile loop", _CPU],
         )
     for contraction in contractions:
         _check_contraction(contraction, loop)
+
+
+def _check_attention(contractions: list[ir.OpView], loop: ir.Operation) -> None:
+    """Two contractions in a grid loop are a flash-attention kernel
+    (``attention_shape``) whose head dims lighthouse's attention layout takes."""
+    try:
+        shape = attention_shape(loop, [op.operation for op in contractions])
+    except ValueError as exc:
+        raise UnsupportedOperationError(
+            "two matmuls outside the attention form on XPU",
+            reason=(
+                f"{exc}; the XeGPU layout annotation handles one matmul per "
+                "kernel, or two in flash-attention form: S = Q @ K^T, row "
+                "reductions of S (online softmax), O = O * alpha + P @ V with P "
+                "from S, in one inner hl.tile loop over K/V tiles"
+            ),
+            alternatives=[
+                "one matmul per top-level hl.tile loop",
+                "the flash-attention form",
+                _CPU,
+            ],
+        ) from None
+    if shape.d_head != ATTENTION_D_HEAD or shape.d_value != ATTENTION_D_HEAD:
+        raise UnsupportedOperationError(
+            f"attention with head dim {shape.d_head} (V: {shape.d_value}) on XPU",
+            reason=(
+                "lighthouse's attention layout (annotate_attention) is written "
+                f"for a head dim of {ATTENTION_D_HEAD}: it hard-codes the Q, K, "
+                "V and output tile widths, and infer_xegpu_attention_params "
+                "asserts them"
+            ),
+            alternatives=[f"Q, K and V with a head dim of {ATTENTION_D_HEAD}", _CPU],
+        )
 
 
 def _check_contraction(op: ir.OpView, loop: ir.Operation) -> None:
@@ -245,7 +287,7 @@ def _check_contraction(op: ir.OpView, loop: ir.Operation) -> None:
             alternatives=["a K block size below K", _CPU],
         )
     operands = list(operation.operands)
-    inputs = [_element_type(value) for value in operands[: -len(operation.results)]]
+    inputs = _operand_types(operation)
     accumulator = _element_type(operands[-1])
     if not set(inputs) <= _DPAS_OPERANDS or accumulator != _DPAS_ACCUMULATOR:
         raise UnsupportedOperationError(
@@ -256,6 +298,25 @@ def _check_contraction(op: ir.OpView, loop: ir.Operation) -> None:
                 _CPU,
             ],
         )
+
+
+def _operand_types(op: ir.Operation) -> list[str]:
+    """The element types a contraction multiplies: its inputs', or the type its
+    body truncates an input to first (e.g. attention's f32 ``P`` rounded to
+    bf16 for ``P @ V``: vectorized, the truncation feeds the DPAS)."""
+    count = len(op.operands) - len(op.results)
+    inputs = list(op.operands)[:count]
+    if not op.regions or not list(op.regions[0].blocks):
+        return [_element_type(value) for value in inputs]
+    arguments = list(op.regions[0].blocks[0].arguments)[:count]
+    types = []
+    for value, argument in zip(inputs, arguments, strict=True):
+        users = [use.owner for use in argument.uses]
+        if len(users) == 1 and users[0].name == "arith.truncf":
+            types.append(str(users[0].results[0].type))
+        else:
+            types.append(_element_type(value))
+    return types
 
 
 def _check_elementwise(loop: ir.Operation) -> None:

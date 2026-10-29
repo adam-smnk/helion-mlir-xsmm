@@ -5,6 +5,7 @@ The op modules are imported before the dialect is loaded: a Python-defined
 dialect only registers the ops defined before it is loaded."""
 
 from .align_operand_rows import align_operand_rows
+from .carry_loop_inits import carry_loop_inits
 from .dialect import HelionTransformDialect
 from .fold_loop_unit_dims import fold_loop_unit_dims
 from .hoist_allocas import hoist_allocas
@@ -38,6 +39,7 @@ __all__ = [
     "HelionTransformDialect",
     "InferXeGPUElementwiseLayoutOp",
     "align_operand_rows",
+    "carry_loop_inits",
     "fold_loop_unit_dims",
     "hoist_allocas",
     "hoist_invariant_scalars",

@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import io
 import re
+from unittest import mock
 
 import helion
 import helion.language as hl
@@ -20,6 +21,7 @@ import torch
 
 from tests.harness import lower_xpu
 from tests.harness import xpu_tensor
+from tests.kernelbench_xpu import attention
 
 from helion_mlir_backend import compile_mlir
 from helion_mlir_backend import generate_mlir
@@ -31,9 +33,11 @@ from helion_mlir_backend._compiler.mlir.support import UnsupportedTargetError
 from helion_mlir_backend._compiler.mlir.support import XeGPUConfigError
 from helion_mlir_backend._compiler.targets import XpuTarget
 from helion_mlir_backend._compiler.targets import get_target
+from helion_mlir_backend._compiler.targets import xpu
 from helion_mlir_backend._compiler.targets.xpu import XpuLowering
 from helion_mlir_backend._compiler.targets.xpu import _translated
 from helion_mlir_backend._compiler.targets.xpu import bindings_emit_spirv
+from helion_mlir_backend._compiler.targets.xpu_params import AttentionShape
 
 N = 1024
 GEMM = helion.Config(block_sizes=[256, 256, 32])
@@ -735,6 +739,190 @@ def test_batched_matmul_params_see_the_batch_matrix() -> None:
         _lower_rank3("batched_matmul", "xegpu-wg", xegpu_sg_tiles=[[256, 256]])
 
 
+# --- Attention ------------------------------------------------------------------
+
+
+def attention_kt(q: torch.Tensor, kt: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """:func:`attention` of K stored transposed (``[B, H, D, S]``)."""
+    batch, heads, m, d = q.shape
+    n = kt.size(3)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], float("-inf"), dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhdn->bhmn", q_tile, kt[tb, th, :, tn])
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+
+
+def chained_matmuls(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """``(Q @ K^T) @ V`` in one K/V loop, without a softmax between."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            acc = acc + torch.einsum(
+                "bhmn,bhnd->bhmd", scores.to(v.dtype), v[tb, th, tn, :]
+            )
+        out[tb, th, tm, :] = acc.to(out.dtype)
+    return out
+
+
+def _lower_attention(
+    shape: tuple[int, int, int, int],
+    block_sizes: list[int],
+    stop_at: str = "xegpu-wg",
+    fn: object = attention,
+    **config: object,
+) -> str:
+    kernel = _kernel(helion.Config(block_sizes=block_sizes, **config))(fn)
+    shapes = [shape, shape, shape]
+    if fn is attention_kt:
+        batch, heads, seq, head_dim = shape
+        shapes[1] = (batch, heads, head_dim, seq)
+    args = [xpu_tensor(*dims, dtype=torch.bfloat16) for dims in shapes]
+    return lower_xpu(kernel, args, stop_at)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("shape", "block_sizes", "sg_rows", "expected"),
+    [
+        # Other sizes than 97's: more workgroup rows, a 32-row K/V tile.
+        ((2, 4, 1024, 64), [1, 1, 256, 32], None, AttentionShape(256, 32, 64, 64)),
+        # A forced subgroup tile: 4 subgroups of 32 rows.
+        ((32, 32, 512, 64), [1, 1, 128, 64], 32, AttentionShape(128, 64, 64, 64)),
+    ],
+)
+def test_attention_is_recognized_by_structure(
+    shape: tuple[int, int, int, int],
+    block_sizes: list[int],
+    sg_rows: int | None,
+    expected: AttentionShape,
+) -> None:
+    """Two contractions chained through row reductions in a K/V loop are the
+    attention class (any sizes lighthouse's layout takes): lighthouse's
+    attention threads and layout, both matmuls on DPAS."""
+    config = {} if sg_rows is None else {"xegpu_sg_tiles": [[sg_rows, 0]]}
+    shapes: list[object] = []
+    check_params = xpu.check_params
+
+    def record(params: object, kernel_shapes: list[object]) -> None:
+        shapes.extend(kernel_shapes)
+        check_params(params, kernel_shapes)
+
+    with mock.patch.object(xpu, "check_params", record):
+        text = _lower_attention(shape, block_sizes, **config)
+    assert shapes == [expected]
+    rows = sg_rows or 16
+    subgroups = expected.rows // rows
+    assert f"known_block_size = array<i32: {subgroups * 16}, 1, 1>" in text
+    assert text.count("xegpu.dpas ") == 2
+    assert f"sg_layout = [{subgroups}, 1], sg_data = [{rows}, 64]" in text
+    kv = f"sg_data = [{expected.kv_tile}, 64]"
+    assert f"sg_layout = [1, 1], {kv}, order = [0, 1]" in text
+    lowered = _lower_attention(shape, block_sizes, "xevm", **config)
+    assert "xegpu." not in lowered
+    assert "intel_sub_group_bf16_bf16_matrix_mad_k16" in lowered
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("shape", "block_sizes", "fn", "error", "match"),
+    [
+        # Lighthouse's attention layout is written for a head dim of 64.
+        (
+            (32, 32, 512, 128),
+            [1, 1, 128, 64],
+            attention,
+            UnsupportedOperationError,
+            r"attention with head dim 128(.|\n)*annotate_attention",
+        ),
+        # K stored transposed: lighthouse's layout loads K [seq, head dim].
+        (
+            (32, 32, 512, 64),
+            [1, 1, 128, 64],
+            attention_kt,
+            UnsupportedOperationError,
+            r"outside the attention form(.|\n)*K stored \[seq, head dim\]",
+        ),
+        # No softmax (row reduction) between the matmuls.
+        (
+            (32, 32, 512, 64),
+            [1, 1, 128, 64],
+            chained_matmuls,
+            UnsupportedOperationError,
+            "no row reduction",
+        ),
+        # One K/V tile: no K/V loop.
+        (
+            (32, 32, 512, 64),
+            [1, 1, 128, 512],
+            attention,
+            UnsupportedOperationError,
+            "not in one loop over K/V tiles",
+        ),
+        # V is loaded in 32x32 blocks.
+        (
+            (32, 32, 512, 64),
+            [1, 1, 128, 16],
+            attention,
+            XeGPUConfigError,
+            r"K/V tile of 16 rows is not a multiple of 32",
+        ),
+        # 64 subgroups of 16 rows.
+        (
+            (32, 32, 2048, 64),
+            [1, 1, 1024, 64],
+            attention,
+            XeGPUConfigError,
+            "64 subgroups of 16 rows exceed the maximum of 32",
+        ),
+    ],
+)
+def test_unsupported_attention_variants(
+    shape: tuple[int, int, int, int],
+    block_sizes: list[int],
+    fn: object,
+    error: type[Exception],
+    match: str,
+) -> None:
+    with pytest.raises(error, match=match):
+        _lower_attention(shape, block_sizes, fn=fn)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("xegpu", "match"),
+    [
+        # Q is loaded in 16-row blocks.
+        ({"xegpu_sg_tiles": [[8, 0]]}, r"\[rows, 0\] with rows a multiple of 16"),
+        ({"xegpu_sg_tiles": [[48, 0]]}, "not a multiple of the 48-row subgroups"),
+        ({"xegpu_load_tiles": [[16, 16]]}, "do not apply to attention kernels"),
+    ],
+)
+def test_invalid_attention_parameters(xegpu: dict[str, object], match: str) -> None:
+    with pytest.raises(XeGPUConfigError, match=match):
+        _lower_attention((32, 32, 512, 64), [1, 1, 128, 64], **xegpu)
+
+
 # --- Unsupported kernels -----------------------------------------------------
 
 
@@ -776,7 +964,10 @@ def test_f32_matmul_is_unsupported() -> None:
 @pytest.mark.isolated
 def test_two_matmuls_in_one_grid_loop_are_unsupported() -> None:
     args = [xpu_tensor(N, N, dtype=torch.float16) for _ in range(3)]
-    with pytest.raises(UnsupportedOperationError, match="several matmuls"):
+    with pytest.raises(
+        UnsupportedOperationError,
+        match=r"two matmuls outside the attention form(.|\n)*one loop over K/V",
+    ):
         lower_xpu(two_matmuls, args)
 
 

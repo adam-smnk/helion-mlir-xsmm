@@ -3,7 +3,9 @@ compiles, and the ``xegpu_*`` config keys as per-kernel fragments.
 
 Each GPU kernel (a root grid loop of the Helion kernel, in program order) is
 classified from Helion's facts on the kernel, before any code generation:
-a GEMM (a ``MatmulFact`` on its grid), a 2D row reduction (a
+a GEMM (a ``MatmulFact`` on its grid), flash attention (two contractions in one
+inner loop's graph, which a ``ReductionDescriptor`` reduces in: ``Q @ K^T``,
+online softmax, ``P @ V`` over K/V tiles), a 2D row reduction (a
 ``ReductionDescriptor`` in its graphs, one grid dim of rows), else elementwise
 (1D or 2D tiles). Its memory accesses give its element sizes, its *column*
 blocks (the blocks of the contiguous, stride-1 dim of a tile) and its *leading*
@@ -47,10 +49,13 @@ from helion.language import _tracing_ops
 from lighthouse.schedule.xegpu import matmul_constraints
 from lighthouse.schedule.xegpu.xegpu_parameter_selector import XeGPUParameterSelector
 
+from ..mlir.analysis.contractions import ContractionPlan
 from ..mlir_transforms.xegpu_elementwise import BLOCK_COLS
 from ..mlir_transforms.xegpu_elementwise import MAX_SG_ELEMENTS
 from ..mlir_transforms.xegpu_elementwise import MAX_SUBGROUPS
 from ..mlir_transforms.xegpu_elementwise import load_cols
+from .xpu_params import ATTENTION_KV_ROWS
+from .xpu_params import ATTENTION_SG_ROWS
 from .xpu_params import LOAD_TILES
 from .xpu_params import PREFETCH_DEPTHS
 from .xpu_params import REDUCTION_SG_ROWS
@@ -67,6 +72,7 @@ if TYPE_CHECKING:
     from helion.autotuner.config_spec import MemoryOpFact
 
 GEMM = "gemm"
+ATTENTION = "attention"
 REDUCTION = "reduction"
 ELEMENTWISE = "elementwise"
 OTHER = "other"
@@ -87,6 +93,18 @@ MAX_K_TILE = 64
 64); larger ones exceed its register budget."""
 MAX_REDUCTION_ROWS = REDUCTION_SG_ROWS * MAX_SUBGROUPS
 """Rows of a reduction workgroup: at most 32 subgroups of lighthouse's 8 rows."""
+MAX_ATTENTION_ROWS = ATTENTION_SG_ROWS * MAX_SUBGROUPS
+"""Query rows of an attention workgroup: at most 32 subgroups of lighthouse's 16
+rows."""
+MAX_ATTENTION_KV = 64
+"""K/V rows of an attention loop step: every subgroup holds the whole K and V
+tiles (lighthouse's attention layout shares them). A 64x64 bf16 tile takes 128
+of the 256 64-byte registers a subgroup has with the large register file; 128
+rows would take all of them."""
+ATTENTION_DEFAULT_BLOCKS = (128, 64)
+"""Default query rows and K/V rows of an attention kernel: lighthouse's attention
+defaults (``infer_xegpu_attention_params``: 128-row workgroups of 16-row
+subgroups, K/V tiles of 64)."""
 MAX_REDUCTION_COLS = MAX_SG_ELEMENTS // REDUCTION_SG_ROWS
 """Columns of a reduction's tiles: an 8-row subgroup holds at most
 :data:`MAX_SG_ELEMENTS` of each carried tile."""
@@ -104,6 +122,8 @@ ELEMENTWISE_SG_TILES = ((16, 32), (32, 32), (32, 64))
 multiple of 16 columns (inferred: closest to 32x32)."""
 REDUCTION_SG_TILES = ((16, 0), (32, 0))
 """Subgroup rows searched for reduction kernels (inferred: 8)."""
+ATTENTION_SG_TILES = ((32, 0),)
+"""Subgroup rows searched for attention kernels (inferred: 16)."""
 SEARCH_LOAD_ROWS = (8, 32)
 """Rows of the block load tiles searched for elementwise and reduction kernels
 (at the widest block load columns of their element size)."""
@@ -114,7 +134,8 @@ class SearchKernel:
     """What the search space knows of one GPU kernel before code generation."""
 
     kind: str
-    """:data:`GEMM`, :data:`REDUCTION`, :data:`ELEMENTWISE` or :data:`OTHER`."""
+    """:data:`GEMM`, :data:`ATTENTION`, :data:`REDUCTION`, :data:`ELEMENTWISE` or
+    :data:`OTHER`."""
     grid_block_ids: tuple[int, ...]
     column_block_ids: frozenset[int] = frozenset()
     """Blocks tiling the contiguous dim of a tile the kernel loads or stores."""
@@ -129,7 +150,9 @@ class SearchKernel:
     transpose_a: bool = False
     transpose_b: bool = False
     reduced_block_ids: tuple[int, ...] = ()
-    """The blocks tiling a reduction's reduced dim."""
+    """The blocks tiling a reduction's reduced dim (attention: the K/V loop's)."""
+    reduced_sizes: tuple[int, ...] = ()
+    """The static sizes the reduced blocks tile (0: unknown)."""
 
 
 def search_kernels(config_spec: ConfigSpec, device_ir: DeviceIR) -> list[SearchKernel]:
@@ -179,7 +202,24 @@ def search_kernels(config_spec: ConfigSpec, device_ir: DeviceIR) -> list[SearchK
             for fact in reductions
             if fact.graph_id in graphs and fact.category in SIZED_REDUCTION_CATEGORIES
         ]
-        if matmuls:
+        if _attention_graph(device_ir, graphs, reduced) is not None:
+            loop_ids = tuple(dict.fromkeys(fact.block_id for fact in reduced))
+            kernels.append(
+                SearchKernel(
+                    ATTENTION if len(rows) == 1 else OTHER,
+                    reduced_block_ids=loop_ids,
+                    reduced_sizes=tuple(
+                        max(
+                            fact.size_hint or 0
+                            for fact in reduced
+                            if fact.block_id == i
+                        )
+                        for i in loop_ids
+                    ),
+                    **common,
+                )
+            )
+        elif matmuls:
             if len(matmuls) > 1:
                 kernels.append(SearchKernel(OTHER, **common))
                 continue
@@ -216,6 +256,22 @@ def search_kernels(config_spec: ConfigSpec, device_ir: DeviceIR) -> list[SearchK
             kind = ELEMENTWISE if rank in (1, 2) and not inner else OTHER
             kernels.append(SearchKernel(kind, rank=rank, **common))
     return kernels
+
+
+def _attention_graph(
+    device_ir: DeviceIR, graphs: set[int], reduced: Sequence[object]
+) -> int | None:
+    """The loop body graph of a flash-attention kernel: two contractions (as
+    the backend lowers them) in a graph a sized reduction reduces in (the
+    online softmax of the K/V loop); ``None`` if there is none."""
+    for fact in reduced:
+        graph_id = fact.graph_id
+        if graph_id not in graphs or not 0 <= graph_id < len(device_ir.graphs):
+            continue
+        plan = ContractionPlan.from_graphs([device_ir.graphs[graph_id].graph])
+        if len(plan.roots) == 2:
+            return graph_id
+    return None
 
 
 def _graphs_of(device_ir: DeviceIR, root_id: int) -> set[int]:
@@ -326,6 +382,18 @@ def constrain_block_sizes(
                 below_k = 1 << ((matmul.static_k - 1).bit_length() - 1)
                 if matmul.static_k > 1 and below_k >= k_block.min_size:
                     k_block.update_max(below_k)
+        elif kernel.kind == ATTENTION:
+            for block_id in kernel.grid_block_ids:
+                if block_id not in kernel.leading_block_ids:
+                    bound(block_id, ATTENTION_SG_ROWS, MAX_ATTENTION_ROWS)
+            for block_id, size in zip(
+                kernel.reduced_block_ids, kernel.reduced_sizes, strict=True
+            ):
+                high = MAX_ATTENTION_KV
+                if size > 1:
+                    # Below the sequence: the K/V loop must stay.
+                    high = min(high, 1 << ((size - 1).bit_length() - 1))
+                bound(block_id, ATTENTION_KV_ROWS, high)
         elif kernel.kind == REDUCTION:
             for block_id in kernel.grid_block_ids:
                 if block_id not in kernel.leading_block_ids:
@@ -353,6 +421,22 @@ def default_block_sizes(
         return None
     changed = False
     for kernel in kernels:
+        if kernel.kind == ATTENTION:
+            rows = [
+                i for i in kernel.grid_block_ids if i not in kernel.leading_block_ids
+            ]
+            preferred = zip(
+                (*rows, *kernel.reduced_block_ids),
+                ATTENTION_DEFAULT_BLOCKS,
+                strict=False,
+            )
+            for block_id, size in preferred:
+                index = block_sizes.block_id_to_index(block_id)
+                block = block_sizes[index]
+                if block.min_size <= size <= block.max_size and defaults[index] != size:
+                    defaults[index] = size
+                    changed = True
+            continue
         params = _gemm_params(kernel)
         if params is None:
             continue
@@ -422,6 +506,8 @@ def _candidates(kernel: SearchKernel) -> dict[str, list[tuple[int, ...]]]:
             SG_TILES: list(GEMM_SG_TILES),
             PREFETCH_DEPTHS: list(PREFETCH_DEPTH_CHOICES),
         }
+    if kernel.kind == ATTENTION:
+        return {SG_TILES: list(ATTENTION_SG_TILES)}
     if kernel.kind == REDUCTION:
         cols = max(load_cols(kernel.load_bits))
         return {

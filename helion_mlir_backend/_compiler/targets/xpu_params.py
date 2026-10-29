@@ -6,7 +6,9 @@ whole key, that is ``None`` or missing -- as are the kernels past the end of a
 shorter list -- leaves the parameter to lighthouse's inference:
 
 - ``xegpu_sg_tiles``: the subgroup tile, ``[sg_m, sg_n]`` of a GEMM or 2D
-  elementwise kernel; ``[rows, 0]`` of a (2D, row) reduction kernel.
+  elementwise kernel; ``[rows, 0]`` of a (2D, row) reduction kernel or of an
+  attention kernel (its query rows; the only parameter attention kernels take:
+  lighthouse's attention layout fixes their load and prefetch tiles).
 - ``xegpu_load_tiles``: ``[a_m, a_k, b_k, b_n]``, the A and B tiles a GEMM
   kernel's subgroups load per instruction (``inst_data`` of the loads);
   ``[m, n]``, the tile a 2D elementwise or (2D, row) reduction kernel's
@@ -25,7 +27,9 @@ the workgroup tile and element types
 (``mlir_transforms.xegpu_elementwise.elementwise_layout``); 1D ones take no
 parameters. Reduction kernels take lighthouse's subgroup tile and infer their
 load tile the same way from it
-(``mlir_transforms.xegpu_reduction.reduction_tiles``).
+(``mlir_transforms.xegpu_reduction.reduction_tiles``). Attention kernels
+(:func:`attention_shape`) take lighthouse's attention layout, whose workgroup
+rows and K/V tile are the block sizes.
 
 :func:`xegpu_params` reads the config; :func:`attach_params` records the result
 on the generated module (so modules compiled with different parameters differ,
@@ -288,13 +292,51 @@ class ElementwiseShape:
         return f"elementwise kernel (WG tile {tile})"
 
 
-KernelShape = GemmShape | ReductionShape | ElementwiseShape
+ATTENTION_SG_ROWS = 16
+"""The query rows of lighthouse's attention subgroup tile
+(``infer_xegpu_attention_params``: two 8-row DPAS blocks)."""
+ATTENTION_D_HEAD = 64
+"""The head dim lighthouse's attention annotation lays out: ``annotate_attention``
+hard-codes it, ``infer_xegpu_attention_params`` asserts it."""
+ATTENTION_KV_ROWS = 32
+"""K/V tiles are whole multiples of the 32x32 block tiles lighthouse's attention
+annotation loads V in (``inst_data``)."""
+
+
+@dataclass(frozen=True)
+class AttentionShape:
+    """A flash-attention kernel: in a loop over K/V tiles, ``S = Q @ K^T`` on the
+    workgroup's query rows, row reductions of ``S`` (an online softmax's maxima
+    and sums), and ``O = O * alpha + P @ V`` accumulated across the loop, with
+    ``P`` computed from ``S``. K and V are stored ``[seq, head dim]`` (``S``
+    contracts a transposed K)."""
+
+    rows: int
+    """The query rows a workgroup computes."""
+    kv_tile: int
+    """The K/V rows of one loop step."""
+    d_head: int
+    """The head dim of Q and K (the contracted dim of ``Q @ K^T``)."""
+    d_value: int
+    """The head dim of V (the columns of the output)."""
+
+    def __str__(self) -> str:
+        return (
+            f"flash-attention kernel ({self.rows} query rows per workgroup, K/V tile "
+            f"{self.kv_tile}, head dim {self.d_head})"
+        )
+
+
+KernelShape = GemmShape | ReductionShape | ElementwiseShape | AttentionShape
 
 
 def kernel_shape(loop: ir.Operation) -> KernelShape | None:
-    """The GEMM, reduction or elementwise tiles a grid loop computes (on tensors,
-    after ``prepare``: unit tile dims are folded, so a kernel with block size 1
-    on leading dims has its 2D shape)."""
+    """The GEMM, attention, reduction or elementwise tiles a grid loop computes
+    (on tensors, after ``prepare``: unit tile dims are folded, so a kernel with
+    block size 1 on leading dims has its 2D shape). Two contractions are an
+    attention kernel if they have its structure (:func:`attention_shape`),
+    else ``None``."""
+    contractions: list[tuple[ir.Operation, list[ir.AffineMap]]] = []
     first_reduction = None
     for op in _walk(loop):
         view = op.opview
@@ -303,12 +345,162 @@ def kernel_shape(loop: ir.Operation) -> KernelShape | None:
             continue
         affine_maps = [ir.AffineMapAttr(m).value for m in maps]
         if linalg.isa_contraction_op(view):
-            return _gemm_shape(op, affine_maps)
-        if first_reduction is None and _reduced_dims(op, affine_maps):
+            contractions.append((op, affine_maps))
+        elif first_reduction is None and _reduced_dims(op, affine_maps):
             first_reduction = (op, affine_maps)
+    if len(contractions) == 1:
+        return _gemm_shape(*contractions[0])
+    if contractions:
+        try:
+            return attention_shape(loop, [op for op, _ in contractions])
+        except ValueError:
+            return None
     if first_reduction is None:
         return _elementwise_shape(loop)
     return _reduction_shape(loop, *first_reduction)
+
+
+def attention_shape(
+    loop: ir.Operation, contractions: Sequence[ir.Operation]
+) -> AttentionShape:
+    """The :class:`AttentionShape` of the grid loop ``loop`` whose contractions
+    (linalg ops, in program order) are ``contractions``; ``ValueError`` naming
+    the part of the structure that is missing.
+
+    By IR property: two 2D contractions in one ``scf.for`` of the grid loop (the
+    K/V loop); the first (``Q @ K^T``) contracts its B operand transposed; the
+    second (``P @ V``) takes as A operand a value computed from the first's
+    result through at least one reduction over its rows, and the loop carries
+    its result (the output accumulator)."""
+    if len(contractions) != 2:
+        raise ValueError(
+            f"{len(contractions)} contractions (attention has two: Q @ K^T, P @ V)"
+        )
+    scores, update = (op.operation for op in contractions)
+    kv_loop = scores.parent
+    if (
+        kv_loop is None
+        or kv_loop.name != "scf.for"
+        or update.parent.operation != kv_loop.operation
+        or _enclosing(kv_loop, "scf.forall") != loop.operation
+    ):
+        raise ValueError(
+            "the two contractions are not in one loop over K/V tiles (an inner "
+            "hl.tile of the grid loop)"
+        )
+    scores_maps, update_maps = (
+        [ir.AffineMapAttr(m).value for m in linalg.get_indexing_maps(op.opview)]
+        for op in contractions
+    )
+    scores_form = _matmul_form(scores_maps)
+    update_form = _matmul_form(update_maps)
+    if scores_form is None or not scores_form[3]:
+        raise ValueError(
+            "the first contraction is not Q @ K^T of 2D tiles with K stored "
+            "[seq, head dim]"
+        )
+    if update_form is None or update_form[3]:
+        raise ValueError(
+            "the second contraction is not P @ V of 2D tiles with V stored "
+            "[seq, head dim]"
+        )
+    body = {op.operation for op in kv_loop.regions[0].blocks[0].operations}
+    from_scores = _forward_slice(scores.results[0], body)
+    into_p = _backward_slice(update.operands[0], body)
+    if scores not in into_p:
+        raise ValueError("P @ V's left operand is not computed from Q @ K^T")
+    if not any(
+        not linalg.isa_contraction_op(op.opview)
+        and (maps := linalg.get_indexing_maps(op.opview)) is not None
+        and _reduced_dims(op, [ir.AffineMapAttr(m).value for m in maps])
+        for op in from_scores & into_p
+    ):
+        raise ValueError(
+            "no row reduction (softmax maximum or sum) of the scores between "
+            "Q @ K^T and P @ V"
+        )
+    if not any(use.owner.name == "scf.yield" for use in update.results[0].uses):
+        raise ValueError("the loop does not carry P @ V's result (the output)")
+    scores_sizes = _loop_sizes(scores, scores_maps)
+    update_sizes = _loop_sizes(update, update_maps)
+    m, n, k, _ = scores_form
+    update_m, update_n, update_k, _ = update_form
+    shape = AttentionShape(
+        rows=scores_sizes[m],
+        kv_tile=scores_sizes[n],
+        d_head=scores_sizes[k],
+        d_value=update_sizes[update_n],
+    )
+    if (update_sizes[update_m], update_sizes[update_k]) != (shape.rows, shape.kv_tile):
+        raise ValueError("P @ V does not contract the K/V tile of Q @ K^T's rows")
+    return shape
+
+
+def _matmul_form(maps: list[ir.AffineMap]) -> tuple[int, int, int, bool] | None:
+    """``(m, n, k, transposed B)`` loop dims of a 2D contraction ``C[m, n] +=
+    A[m, k] * B[k, n]`` (``B[n, k]`` if transposed B), else ``None``."""
+    a_dims, b_dims, c_dims = (_dims(affine_map) for affine_map in maps[:3])
+    if any(len(dims) != 2 or None in dims for dims in (a_dims, b_dims, c_dims)):
+        return None
+    m, n = c_dims
+    if a_dims[0] != m or a_dims[1] in c_dims:
+        return None
+    k = a_dims[1]
+    if b_dims == [k, n]:
+        return m, n, k, False
+    if b_dims == [n, k]:
+        return m, n, k, True
+    return None
+
+
+def _enclosing(op: ir.Operation, name: str) -> ir.Operation | None:
+    """The closest ``name`` op enclosing ``op``."""
+    parent = op.parent
+    while parent is not None and parent.name != "func.func":
+        if parent.name == name:
+            return parent.operation
+        parent = parent.parent
+    return None
+
+
+def _in_body(op: ir.Operation, body: set[ir.Operation]) -> ir.Operation | None:
+    """The op of ``body`` that is or encloses ``op``."""
+    current = op.operation
+    while current not in body:
+        parent = current.parent
+        if parent is None:
+            return None
+        current = parent.operation
+    return current
+
+
+def _forward_slice(value: ir.Value, body: set[ir.Operation]) -> set[ir.Operation]:
+    """The ops of ``body`` (one block's ops) using ``value``, transitively."""
+    found: set[ir.Operation] = set()
+    pending = [value]
+    while pending:
+        for use in pending.pop().uses:
+            user = _in_body(use.owner, body)
+            if user is not None and user not in found:
+                found.add(user)
+                pending.extend(user.results)
+    return found
+
+
+def _backward_slice(value: ir.Value, body: set[ir.Operation]) -> set[ir.Operation]:
+    """The ops of ``body`` (one block's ops) ``value`` is computed from,
+    transitively."""
+    found: set[ir.Operation] = set()
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if not isinstance(current, ir.OpResult):
+            continue
+        owner = current.owner.operation
+        if owner in body and owner not in found:
+            found.add(owner)
+            pending.extend(owner.operands)
+    return found
 
 
 def _elementwise_shape(loop: ir.Operation) -> ElementwiseShape | None:
@@ -482,13 +674,15 @@ def check_params(
                 _check_gemm(kernel, shape, specs)
             elif isinstance(shape, ReductionShape):
                 _check_reduction(kernel, shape, specs)
+            elif isinstance(shape, AttentionShape):
+                _check_attention(kernel, shape, specs)
             elif isinstance(shape, ElementwiseShape):
                 if forced:
                     _check_elementwise(kernel, shape)
             elif forced:
                 raise ValueError(
-                    "parameters apply to GEMM (one 2D matmul), reduction and "
-                    "elementwise kernels"
+                    "parameters apply to GEMM (one 2D matmul), attention, "
+                    "reduction and elementwise kernels"
                 )
         except ValueError as exc:
             kind = f", a {shape}" if shape is not None else ""
@@ -635,6 +829,44 @@ def _check_reduction_tiles(shape: ReductionShape, specs: XeGPUSpecs) -> None:
         raise ValueError(
             f"{shape.cols} columns are not a multiple of {BLOCK_COLS} (a block load "
             "row)"
+        )
+
+
+def _check_attention(
+    kernel: KernelParams, shape: AttentionShape, specs: XeGPUSpecs
+) -> None:
+    """Lighthouse's attention layout (``annotate_attention``) for the block sizes
+    and a forced subgroup tile ``[rows, 0]`` (its only parameter here):
+    subgroups of whole 16-row Q load blocks, at most the maximum per workgroup,
+    and K/V tiles of whole 32-row V load blocks."""
+    other = [key for key in kernel.forced() if key != SG_TILES]
+    if other:
+        raise ValueError(
+            f"{', '.join(other)} do not apply to attention kernels (lighthouse's "
+            "attention annotation fixes their load and prefetch tiles)"
+        )
+    rows = ATTENTION_SG_ROWS
+    if kernel.sg_tile is not None:
+        rows, cols = kernel.sg_tile
+        if cols != 0 or rows == 0 or rows % ATTENTION_SG_ROWS:
+            raise ValueError(
+                "the subgroup tile of an attention kernel is [rows, 0] with rows a "
+                f"multiple of {ATTENTION_SG_ROWS} (its Q load blocks)"
+            )
+    if shape.rows % rows:
+        raise ValueError(
+            f"{shape.rows} query rows per workgroup are not a multiple of the "
+            f"{rows}-row subgroups"
+        )
+    if shape.rows // rows > specs.max_nb_threads:
+        raise ValueError(
+            f"{shape.rows // rows} subgroups of {rows} rows exceed the maximum of "
+            f"{specs.max_nb_threads}"
+        )
+    if shape.kv_tile % ATTENTION_KV_ROWS:
+        raise ValueError(
+            f"a K/V tile of {shape.kv_tile} rows is not a multiple of "
+            f"{ATTENTION_KV_ROWS} (lighthouse's V load blocks)"
         )
 
 
