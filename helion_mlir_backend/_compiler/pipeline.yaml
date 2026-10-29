@@ -90,6 +90,9 @@ Pipeline:
   # Per-tile scratch (accumulators, staging) on the stack: no malloc/free per tile.
   - schedule: "helion_transforms.py[gen=promote_buffers_to_stack]{max_alloc_size_in_bytes=1048576}"
   - include: bufferization-cleanup.yaml
+  ## Out-of-bounds n-D copies (pads, packs of partial tiles) row by row: split as
+  ## lone reads, their n-D vectors are rebuilt element by element.
+  - schedule: "helion_transforms.py[gen=split_copies]"
   - schedule: "helion_transforms.py[gen=split_transfers]"
   - schedule: "omp.py[gen=parallelize]"
   - schedule: "helion_transforms.py[gen=amx_move_offsets]"

@@ -23,6 +23,7 @@ from .partition_linalg import partition_linalg
 from .pin_transposes import pin_transposes
 from .rank_reduce_transfers import rank_reduce_transfers
 from .schedule_amx_loads import schedule_amx_loads
+from .split_copies import split_copies
 from .split_transfers import split_transfers
 from .tile_sizes import tile_sizes
 from .unmask_contractions import unmask_contractions
@@ -58,6 +59,7 @@ __all__ = [
     "pin_transposes",
     "rank_reduce_transfers",
     "schedule_amx_loads",
+    "split_copies",
     "split_transfers",
     "tile_sizes",
     "unmask_contractions",

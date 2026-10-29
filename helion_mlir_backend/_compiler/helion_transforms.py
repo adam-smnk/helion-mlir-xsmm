@@ -209,6 +209,19 @@ def align_operand_rows() -> ir.Module:
     return schedule
 
 
+def split_copies() -> ir.Module:
+    """Schedule: every function's out-of-bounds n-D memref copies row by row,
+    split on an in-bounds check."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.split_copies(funcs)
+        lh_transform.cleanup(named_seq.bodyTarget)
+
+        transform.yield_()
+    return schedule
+
+
 def split_transfers() -> ir.Module:
     """Schedule: split every function's out-of-bounds memref transfers on an
     in-bounds check."""

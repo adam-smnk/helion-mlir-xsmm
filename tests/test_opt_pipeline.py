@@ -5,6 +5,7 @@ f32 only: bf16 needs AMX hardware to execute (covered at IR level by test_amx_ir
 
 from __future__ import annotations
 
+import importlib
 import re
 from typing import TYPE_CHECKING
 
@@ -16,6 +17,7 @@ import torch
 
 from tests.harness import opt_pipeline
 
+from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler.helion_transforms import align_operand_rows
 from helion_mlir_backend._compiler.helion_transforms import amx_move_offsets
 from helion_mlir_backend._compiler.helion_transforms import fold_empty_slices
@@ -25,6 +27,7 @@ from helion_mlir_backend._compiler.helion_transforms import linearize_vector_ops
 from helion_mlir_backend._compiler.helion_transforms import lower_transposes
 from helion_mlir_backend._compiler.helion_transforms import materialize_operand_pads
 from helion_mlir_backend._compiler.helion_transforms import schedule_amx_loads
+from helion_mlir_backend._compiler.helion_transforms import split_copies
 from helion_mlir_backend._compiler.helion_transforms import split_transfers
 from helion_mlir_backend._compiler.helion_transforms import unroll_transfers
 from helion_mlir_backend._compiler.helion_transforms import version_padded_operands
@@ -300,6 +303,69 @@ def test_split_transfers_rank_reducing() -> None:
     # The read and the write, each on its in-bounds path (cleanup merges the ifs).
     assert "scf.if" in text
     assert text.count("in_bounds = [true]") == 2
+
+
+# The copy of a partial tile into a padded block (e.g. a pad or an operand pack),
+# of a block into a partial tile, and of a whole block.
+PARTIAL_TILE_COPIES = """
+func.func @f(%src: memref<?x?xf32, strided<[33, 1], offset: ?>>,
+             %dst: memref<32x32xf32, strided<[64, 1], offset: ?>>,
+             %out: memref<?x32xf32>, %buf: memref<32x32xf32>,
+             %copy: memref<32x32xf32>) {
+  %c0 = arith.constant 0 : index
+  %pad = arith.constant 0.0 : f32
+  %tile = vector.transfer_read %src[%c0, %c0], %pad
+      : memref<?x?xf32, strided<[33, 1], offset: ?>>, vector<32x32xf32>
+  vector.transfer_write %tile, %dst[%c0, %c0] {in_bounds = [true, true]}
+      : vector<32x32xf32>, memref<32x32xf32, strided<[64, 1], offset: ?>>
+  %block = vector.transfer_read %buf[%c0, %c0], %pad {in_bounds = [true, true]}
+      : memref<32x32xf32>, vector<32x32xf32>
+  vector.transfer_write %block, %out[%c0, %c0] {in_bounds = [false, true]}
+      : vector<32x32xf32>, memref<?x32xf32>
+  %whole = vector.transfer_read %buf[%c0, %c0], %pad {in_bounds = [true, true]}
+      : memref<32x32xf32>, vector<32x32xf32>
+  vector.transfer_write %whole, %copy[%c0, %c0] {in_bounds = [true, true]}
+      : vector<32x32xf32>, memref<32x32xf32>
+  return
+}
+"""
+
+
+def test_split_copies_copies_edge_tiles_by_rows() -> None:
+    text = _apply(split_copies, PARTIAL_TILE_COPIES)
+    # The partial copies row by row, in bounds if they fit, else with rows past
+    # the source's end padding, past the destination's end not written, masked
+    # past the source's last column. The whole copy is left as is.
+    assert text.count("vector<32x32xf32>") == 2
+    rows = re.findall(r"vector\.transfer_(read|write)[^\n]*vector<32xf32>", text)
+    assert rows.count("read") == rows.count("write") == 2 * (32 + 32)
+    assert text.count("vector.create_mask") == 1
+    assert text.count("-> (vector<32xf32>)") == 32
+    assert text.count("scf.if %") == 2 + 32 + 32
+
+
+def test_unroll_split_copies_keeps_rows() -> None:
+    # Unrolled, no copy is rebuilt from its rows (element by element).
+    text = _apply(unroll_transfers, _apply(split_copies, PARTIAL_TILE_COPIES))
+    assert "elements" not in text and "vector.insert " not in text
+
+
+@pytest.mark.parametrize(
+    ("name", "shape"),
+    [("_pad_kernel", (33, 33)), ("_pack_a_kernel_t", (45, 70))],
+    ids=["pad", "pack_a_t"],
+)
+def test_partial_tile_copies_lower_by_rows(name: str, shape: tuple[int, int]) -> None:
+    """Regression: the edge tiles of a 32x32 copy lowered to about 10 MB of
+    per-element LLVM code (shuffles of 1024 elements)."""
+    matmul = importlib.import_module("helion_mlir_utils.matmul")
+    padded = [hl.constexpr(-(-size // 32) * 32) for size in shape]
+    if name.endswith("_t"):
+        padded.reverse()
+    text = str(lower_mlir(getattr(matmul, name), [torch.randn(shape), *padded]))
+    assert not re.search(r"llvm\.shufflevector[^\n]*vector<\d{3,}x", text)
+    assert text.count("llvm.insertelement") + text.count("llvm.extractelement") < 100
+    assert len(text) < 200_000
 
 
 # A cast of VNNI pairs between the reshapes of flattened transfers.
