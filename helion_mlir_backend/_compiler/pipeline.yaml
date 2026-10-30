@@ -33,6 +33,10 @@ Pipeline:
 
   ## Normalize ops to category.
   - pass: "linalg-categorize-ops"
+  ## AMX contractions in the layouts upstream's AMX rewrite assumes (it checks
+  ## shapes, not maps): swapped operands (x @ w.T) read a transposed copy; layouts
+  ## it cannot normalize are kept off AMX (pin_amx_off_tile_sizes below).
+  - schedule: "helion_transforms.py[gen=normalize_amx_contractions]"
   ## Partial tiles' zero-padded operands read through packs are copied into buffers.
   - schedule: "helion_transforms.py[gen=materialize_operand_pads]{packed_only=True}"
   ## Operand packs (e.g. VNNI B tiles) run once per contraction, not per register tile.
@@ -41,6 +45,9 @@ Pipeline:
 
   ## 2) CPU register-level tiling - ensure data fits in registers.
   ## Parallel register tiles: assign/propagate from contraction anchors and fuse.
+  ## Contractions kept off AMX (normalize_amx_contractions) tiled as without AMX;
+  ## each tiling stage re-tiles the ops the previous one made.
+  - schedule: "helion_transforms.py[gen=pin_amx_off_tile_sizes]{strategy=register_parallel}"
   - include: x86_64/tile-and-fuse.yaml {
                                   strategy=register_parallel
                                   propagate=True
@@ -58,10 +65,12 @@ Pipeline:
   ## Reduction register tiles: annotate K-like dims and tile ops individually.
   # Tiling clears the pins; operand packs must not be tiled into tiny ops either.
   - schedule: "helion_transforms.py[gen=pin_transposes]"
+  - schedule: "helion_transforms.py[gen=pin_amx_off_tile_sizes]{strategy=register_reduction}"
   - include: x86_64/fuse-reductions.yaml {
                           strategy=register_reduction
                           use_forall=False
                         }
+  - schedule: "helion_transforms.py[gen=pin_amx_off_tile_sizes]{strategy=register_reduction}"
   - include: x86_64/tile.yaml {
                           strategy=register_reduction
                           propagate=False
@@ -71,6 +80,7 @@ Pipeline:
 
   ## 3) CPU register-level unrolling via tiling - ensure hardware-friendly shapes.
   - schedule: "helion_transforms.py[gen=pin_transposes]"
+  - schedule: "helion_transforms.py[gen=pin_amx_off_tile_sizes]{strategy=register_unroll}"
   - include: x86_64/unroll-register.yaml
   - include: cleanup.yaml
   ## Register-tile temporaries (fused accumulator init, epilogues) sized per register tile.
@@ -103,6 +113,8 @@ Pipeline:
   - schedule: "helion_transforms.py[gen=split_copies]"
   - schedule: "helion_transforms.py[gen=split_transfers]"
   - schedule: "omp.py[gen=parallelize]"
+  # Accumulator reads' subviews fitted to the register tile, which the AMX
+  # rewrite of a K loop takes them for.
   - schedule: "helion_transforms.py[gen=amx_move_offsets]"
   # The AMX rewrite rebuilds a K loop without the loop-invariant index ops defined in
   # it (outer tiles of several blocks): left in the erased loop, they abort the rewrite.

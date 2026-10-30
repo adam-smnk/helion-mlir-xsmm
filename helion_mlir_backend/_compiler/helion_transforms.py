@@ -237,6 +237,32 @@ def split_contraction_operands() -> ir.Module:
     return schedule
 
 
+def normalize_amx_contractions() -> ir.Module:
+    """Schedule: every function's bf16 contractions that lighthouse tiles for
+    AMX in the layouts upstream's AMX rewrite assumes but does not check:
+    inputs with swapped innermost dims (e.g. ``x @ w.T``) and ``(N, M)``
+    accumulators get transposed copies; layouts it cannot normalize are marked
+    to be tiled as without AMX (``pin_amx_off_tile_sizes``); memref ones not in
+    the expected layout get their inputs widened to f32."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.normalize_amx_contractions(funcs)
+        transform.yield_()
+    return schedule
+
+
+def pin_amx_off_tile_sizes(strategy: str = "register_parallel") -> ir.Module:
+    """Schedule: every function's contractions kept off AMX annotated with the
+    ``strategy`` tile sizes of the host without AMX."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.pin_amx_off_tile_sizes(funcs, strategy=strategy)
+        transform.yield_()
+    return schedule
+
+
 def split_copies() -> ir.Module:
     """Schedule: every function's out-of-bounds n-D memref copies row by row,
     split on an in-bounds check."""
@@ -278,12 +304,15 @@ def split_transfers() -> ir.Module:
 
 def amx_move_offsets() -> ir.Module:
     """Schedule: move the offsets of every function's in-bounds memref reads to
-    subviews, in the form the x86 AMX contraction rewrite matches."""
+    subviews, in the form the x86 AMX contraction rewrite matches, then fit
+    the subviews to the reads: the rewrite takes an accumulator read's memref
+    as the register tile."""
     ht.HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
         ht.move_offsets_to_subview(funcs)
         transform.apply_cse(funcs)
+        ht.fit_subviews_to_reads(funcs)
         transform.yield_()
     return schedule
 

@@ -9,8 +9,10 @@ extended for AMX operands: runtime shapes and strides, constant offsets kept
 in the indices and loop offsets split into subviews of their own.
 
 The subviews only re-base the indices: they keep the base's sizes, so extend
-past its end. Only in-bounds, unmasked reads are rewritten, as the bounds of
-any other read would be checked against the subview's sizes.
+past its end (``amx_move_offsets`` then fits accumulators' subviews to their
+reads: ``fit_subviews_to_reads``). Only in-bounds, unmasked reads are
+rewritten, as the bounds of any other read would be checked against the
+subview's sizes.
 """
 
 from mlir import ir

@@ -7,6 +7,7 @@ dialect only registers the ops defined before it is loaded."""
 from .align_operand_rows import align_operand_rows
 from .carry_loop_inits import carry_loop_inits
 from .dialect import HelionTransformDialect
+from .fit_subviews_to_reads import fit_subviews_to_reads
 from .fold_loop_unit_dims import fold_loop_unit_dims
 from .forward_rows import forward_rows
 from .hoist_allocas import hoist_allocas
@@ -20,8 +21,11 @@ from .match_scalar_contractions import match_scalar_contractions
 from .materialize_copies import materialize_copies
 from .materialize_operand_pads import materialize_operand_pads
 from .move_offsets_to_subview import move_offsets_to_subview
+from .normalize_amx_contractions import normalize_amx_contractions
 from .outer_transpose_tile import outer_transpose_tile
 from .partition_linalg import partition_linalg
+from .pin_amx_off_tile_sizes import AMX_OFF_ATTR_NAME
+from .pin_amx_off_tile_sizes import pin_amx_off_tile_sizes
 from .pin_transposes import pin_transposes
 from .rank_reduce_transfers import rank_reduce_transfers
 from .schedule_amx_loads import schedule_amx_loads
@@ -40,11 +44,13 @@ from .xegpu_reduction import infer_xegpu_reduction_tiles
 from .xegpu_reduction import match_row_result_stores
 
 __all__ = [
+    "AMX_OFF_ATTR_NAME",
     "OPERAND_PACK_ATTR_NAME",
     "HelionTransformDialect",
     "InferXeGPUElementwiseLayoutOp",
     "align_operand_rows",
     "carry_loop_inits",
+    "fit_subviews_to_reads",
     "fold_loop_unit_dims",
     "forward_rows",
     "hoist_allocas",
@@ -60,8 +66,10 @@ __all__ = [
     "materialize_copies",
     "materialize_operand_pads",
     "move_offsets_to_subview",
+    "normalize_amx_contractions",
     "outer_transpose_tile",
     "partition_linalg",
+    "pin_amx_off_tile_sizes",
     "pin_transposes",
     "rank_reduce_transfers",
     "schedule_amx_loads",

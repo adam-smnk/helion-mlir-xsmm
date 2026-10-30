@@ -6,38 +6,31 @@ the pipeline is applied stage by stage until ``x86.amx`` ops appear. Nothing is 
 
 from __future__ import annotations
 
-from lighthouse.execution.target import TargetInfo
-from lighthouse.pipeline.driver import BackendDriver
-from mlir import ir
 import pytest
 
 from tests.harness import blocked_matmul_cases
+from tests.harness import lower_opt_with_amx
 
 from helion_mlir_backend import generate_mlir
-from helion_mlir_backend._compiler.execution import inline_module
-from helion_mlir_backend._compiler.targets.cpu import pipeline_descriptor
-
-_AMX_FEATURES = ["amx_bf16", "amx_tile", "amx_int8"]
 
 
-def _first_amx_ops(module: ir.Module, entry: str) -> set[str]:
-    features = TargetInfo.host().features + _AMX_FEATURES
-    with TargetInfo.override(features=features), module.context, ir.Location.unknown():
-        inline_module(module)
-        driver = BackendDriver(module, entry, result_to_args=False, benchmark=False)
-        driver.add_stage(pipeline_descriptor("opt"))
-        for stage in driver.stages:
-            module = stage.apply(module)
-            if "x86" not in str(stage):
-                continue
-            ops = {
-                token.split("(")[0]
-                for token in str(module).split()
-                if token.startswith("x86.amx.")
-            }
-            if ops:
-                return ops
-    return set()
+def _amx_ops(module: object) -> set[str]:
+    return {
+        token.split("(")[0]
+        for token in str(module).split()
+        if token.startswith("x86.amx.")
+    }
+
+
+def _first_amx_ops(module: object, entry: str) -> set[str]:
+    lowered = lower_opt_with_amx(
+        module, entry, lambda stage, after: "x86" in stage and bool(_amx_ops(after))
+    )
+    return set() if lowered is None else _amx_ops(lowered[1])
+
+
+def _until_amx_contraction(stage: str, module: object) -> bool:
+    return "x86.amx.tile_mulf" in str(module)
 
 
 @pytest.mark.slow
@@ -88,20 +81,14 @@ def test_partial_tile_pads_only_edge_register_tiles(monkeypatch) -> None:
         helion.language.constexpr(False),
         helion.language.constexpr(False),
     ]
-    module = inline_module(generate_mlir(kernel, args))
-    features = TargetInfo.host().features + _AMX_FEATURES
-    with TargetInfo.override(features=features), module.context, ir.Location.unknown():
-        driver = BackendDriver(
-            module, "_matmul_fused_pack", result_to_args=False, benchmark=False
-        )
-        driver.add_stage(pipeline_descriptor("opt"))
-        for stage in driver.stages:
-            module = stage.apply(module)
-            module.operation.verify()
-            if "x86.amx.tile_mulf" in str(module):
-                break
-        text = str(module)
-    assert "x86.amx.tile_mulf" in text
+    lowered = lower_opt_with_amx(
+        generate_mlir(kernel, args),
+        "_matmul_fused_pack",
+        _until_amx_contraction,
+        verify=True,
+    )
+    assert lowered is not None, "no AMX contraction produced"
+    text = str(lowered[1])
     assert "vector.contract" not in text
     loads = [line for line in text.splitlines() if "x86.amx.tile_load" in line]
     # Full register tiles of the partial tile read A, of runtime rows, in place.
@@ -142,17 +129,9 @@ def test_prepacked_ragged_k_contracts_only_with_amx(monkeypatch) -> None:
         helion.language.constexpr(pairs_even),
         helion.language.constexpr(pairs_even),
     ]
-    module = inline_module(generate_mlir(kernel, args))
-    features = TargetInfo.host().features + _AMX_FEATURES
-    with TargetInfo.override(features=features), module.context, ir.Location.unknown():
-        driver = BackendDriver(
-            module, "_matmul_prepacked_vnni", result_to_args=False, benchmark=False
-        )
-        driver.add_stage(pipeline_descriptor("opt"))
-        for stage in driver.stages:
-            module = stage.apply(module)
-            if "x86.amx.tile_mulf" in str(module):
-                break
-        text = str(module)
-    assert "x86.amx.tile_mulf" in text
+    lowered = lower_opt_with_amx(
+        generate_mlir(kernel, args), "_matmul_prepacked_vnni", _until_amx_contraction
+    )
+    assert lowered is not None, "no AMX contraction produced"
+    text = str(lowered[1])
     assert "vector.contract" not in text
