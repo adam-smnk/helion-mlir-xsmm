@@ -28,6 +28,9 @@ _PRELOAD = [
     "tests.harness",
 ]
 _context: multiprocessing.context.ForkServerContext | None = None
+_SKIP_EXIT = 77
+"""Exit code of an isolated child whose test skipped; its last line says why."""
+_SKIPPED = "isolated test skipped: "
 
 if (_workers := os.environ.get("PYTEST_XDIST_WORKER_COUNT")) is not None:
     # xdist workers share the cores; per-process OpenMP/torch pools would oversubscribe.
@@ -56,7 +59,12 @@ def _run_isolated(
     os.dup2(fd, 2)
     os.environ.clear()
     os.environ.update(env)
-    getattr(importlib.import_module(module), name)(**kwargs)
+    try:
+        getattr(importlib.import_module(module), name)(**kwargs)
+    except pytest.skip.Exception as skipped:
+        print(f"{_SKIPPED}{skipped.msg}", flush=True)
+        sys.stderr.flush()
+        os._exit(_SKIP_EXIT)
     sys.stdout.flush()
     sys.stderr.flush()
 
@@ -83,6 +91,11 @@ def pytest_configure(config: pytest.Config) -> None:
         "only fails that test",
     )
     config.addinivalue_line("markers", "slow: long-running test")
+    config.addinivalue_line(
+        "markers",
+        "xpu_runtime: runs XPU kernels on the device; skipped unless torch finds an "
+        "XPU and the MLIR bindings can emit and run XPU binaries",
+    )
 
 
 @pytest.hookimpl(optionalhook=True)
@@ -109,6 +122,31 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     if any(item.get_closest_marker("isolated") for item in session.items):
         _isolated_context()
         multiprocessing.forkserver.ensure_running()
+
+
+_xpu_runtime_missing: list[str | None] = []
+
+
+def _missing_xpu_runtime() -> str | None:
+    """Why XPU kernels cannot run here (``None``: they can), probed once: the
+    XPU target's own check of the bindings, the runtime library and the device."""
+    if not _xpu_runtime_missing:
+        from helion_mlir_backend._compiler.mlir.support import UnsupportedTargetError
+        from helion_mlir_backend._compiler.targets import XpuTarget
+
+        try:
+            XpuTarget().validate_environment(None)
+        except UnsupportedTargetError as missing:
+            _xpu_runtime_missing.append(str(missing).splitlines()[0])
+        else:
+            _xpu_runtime_missing.append(None)
+    return _xpu_runtime_missing[0]
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    if item.get_closest_marker("xpu_runtime") is not None:
+        if (missing := _missing_xpu_runtime()) is not None:
+            pytest.skip(f"no XPU runtime: {missing}")
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -140,6 +178,14 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
         output = pathlib.Path(log).read_text()
     finally:
         os.unlink(log)
+    if process.exitcode == _SKIP_EXIT:
+        reasons = [
+            line[len(_SKIPPED) :]
+            for line in output.splitlines()
+            if line.startswith(_SKIPPED)
+        ]
+        if reasons:
+            pytest.skip(reasons[-1])
     if process.exitcode != 0:
         tail = "\n".join(output.splitlines()[-25:])
         how = (

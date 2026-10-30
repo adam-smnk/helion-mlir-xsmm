@@ -51,9 +51,9 @@ from lighthouse.schedule.xegpu.xegpu_parameter_selector import XeGPUParameterSel
 
 from ..mlir.analysis.contractions import ContractionPlan
 from ..mlir_transforms.xegpu_elementwise import BLOCK_COLS
+from ..mlir_transforms.xegpu_elementwise import LOAD_COLS
 from ..mlir_transforms.xegpu_elementwise import MAX_SG_ELEMENTS
 from ..mlir_transforms.xegpu_elementwise import MAX_SUBGROUPS
-from ..mlir_transforms.xegpu_elementwise import load_cols
 from .xpu_params import ATTENTION_KV_ROWS
 from .xpu_params import ATTENTION_SG_ROWS
 from .xpu_params import LOAD_TILES
@@ -124,9 +124,10 @@ REDUCTION_SG_TILES = ((16, 0), (32, 0))
 """Subgroup rows searched for reduction kernels (inferred: 8)."""
 ATTENTION_SG_TILES = ((32, 0),)
 """Subgroup rows searched for attention kernels (inferred: 16)."""
-SEARCH_LOAD_ROWS = (8, 32)
+SEARCH_LOAD_ROWS = (8, 16)
 """Rows of the block load tiles searched for elementwise and reduction kernels
-(at the widest block load columns of their element size)."""
+(of ``LOAD_COLS`` columns), all within 16 elements per work item
+(``xegpu_elementwise.MAX_LANE_ELEMENTS``)."""
 
 
 @dataclass(frozen=True)
@@ -509,16 +510,14 @@ def _candidates(kernel: SearchKernel) -> dict[str, list[tuple[int, ...]]]:
     if kernel.kind == ATTENTION:
         return {SG_TILES: list(ATTENTION_SG_TILES)}
     if kernel.kind == REDUCTION:
-        cols = max(load_cols(kernel.load_bits))
         return {
             SG_TILES: list(REDUCTION_SG_TILES),
-            LOAD_TILES: [(rows, cols) for rows in SEARCH_LOAD_ROWS],
+            LOAD_TILES: [(rows, LOAD_COLS) for rows in SEARCH_LOAD_ROWS],
         }
     if kernel.kind == ELEMENTWISE and kernel.rank == 2:
-        cols = max(load_cols(kernel.load_bits))
         return {
             SG_TILES: list(ELEMENTWISE_SG_TILES),
-            LOAD_TILES: [(rows, cols) for rows in SEARCH_LOAD_ROWS],
+            LOAD_TILES: [(rows, LOAD_COLS) for rows in SEARCH_LOAD_ROWS],
         }
     return {}
 

@@ -123,18 +123,42 @@ def legalize_host_ops() -> ir.Module:
     return schedule
 
 
-def lower_to_xevm(binary_format: str = "fatbin") -> ir.Module:
+IGC_OPTIONS = "-ze-opt-large-register-file"
+"""IGC options of the device binaries (lighthouse's ``xegpu_to_binary``): the
+large register file (256 GRFs; without it GEMMs get 128 and spill). Only
+``gpu-module-to-binary``'s ``opts`` pass them to IGC (the XPU target's binary
+stage); this LLVM never reads a target's ``cmd-options`` flag."""
+XEVM_TARGET = '#xevm.target<O = 3, chip = "bmg">'
+"""The one XeVM target of every GPU module: lighthouse's (``O = 3``, ``bmg``)."""
+_NO_MODULE = "^$"
+"""A ``gpu.module`` name regex that matches no module (names are not empty)."""
+
+
+def lower_to_xevm() -> ir.Module:
     """Schedule: annotated workgroup-level XeGPU lowered by upstream's
-    ``gpu-lower-to-xevm-pipeline`` with the options of lighthouse's
-    ``xegpu_to_binary`` (large register file); ``binary_format=skip`` stops
-    before emitting device binaries (no SPIR-V target needed). bf16 math is
-    extended to f32 first (see below)."""
+    ``gpu-lower-to-xevm-pipeline`` (lighthouse's ``xegpu_to_binary``), stopping
+    before device binaries
+    (``binary-format=skip``: no SPIR-V target needed; the XPU target emits
+    them in a stage of its own). bf16 math is extended to f32 first (see
+    below).
+
+    Each GPU module gets exactly one target, :data:`XEVM_TARGET`: lighthouse's
+    vector-to-XeGPU stage attached it, and the pipeline would attach a second
+    one (whose ``cmd-options`` flag nothing reads), so every kernel would be
+    compiled twice. The targets are set to the one, and the pipeline attaches
+    none (a module matcher matching no name). The IGC options reach the
+    binaries through ``gpu-module-to-binary``'s ``opts``."""
     with schedule_boilerplate() as (schedule, named_seq):
         # The pipeline converts fast (`afn`) math to native OpenCL calls before
         # it extends bf16 math to f32 (math-to-xevm takes any float type), which
         # leaves calls of bf16 natives that do not exist: extend first, with the
         # pipeline's own options (f16 and f32 math stay).
         gpu_modules = match(named_seq.bodyTarget, ops={"gpu.module"})
+        targets = transform.ParamConstantOp(
+            transform.AnyParamType.get(),
+            ir.ArrayAttr.get([ir.Attribute.parse(XEVM_TARGET)]),
+        )
+        transform.AnnotateOp(gpu_modules, "targets", param=targets)
         apply_registered_pass(
             gpu_modules,
             "math-extend-to-supported-types",
@@ -145,8 +169,8 @@ def lower_to_xevm(binary_format: str = "fatbin") -> ir.Module:
             "gpu-lower-to-xevm-pipeline",
             options={
                 "xegpu-op-level": "workgroup",
-                "igc-cmd-options": "-ze-opt-large-register-file",
-                "binary-format": binary_format,
+                "binary-format": "skip",
+                "xevm-module-matcher": _NO_MODULE,
             },
         )
         transform.yield_()

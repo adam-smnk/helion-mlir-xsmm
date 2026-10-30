@@ -341,8 +341,14 @@ def _host_function(text: str, name: str) -> str:
 
 def _check_xevm(text: str, entry: str, launches: int) -> None:
     """Device code fully lowered; the host launches ``launches`` kernels in order on
-    one stream, then waits for them."""
+    one stream, then waits for them. Each GPU module has one XeVM target, with
+    lighthouse's opt level (a second target would compile every kernel twice)."""
     assert "xegpu." not in text
+    targets = re.findall(r"gpu\.module @\w+ \[(.*)\] \{", text)
+    assert len(targets) == launches, targets
+    for target in targets:
+        assert target.count("#xevm.target<") == 1, target
+        assert "O = 3" in target and "cmd-options" not in target
     assert "llvm.func spir_funccc" in text
     host = _host_function(text, entry)
     streams = re.findall(r"(%\w+) = llvm\.call @mgpuStreamCreate\(\)", host)
@@ -488,12 +494,11 @@ def _layouts(text: str, op: str) -> list[str]:
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_elementwise_kernel_lowers_to_xegpu(dtype: torch.dtype) -> None:
     text, lowered = lower_xpu_stages(relu, [xpu_tensor(4096, 4096, dtype=dtype)])
-    # 32x256 workgroup tiles: 8 subgroups of 32x32 (inferred), the widest block
-    # loads (32 bf16 or 16 f32 columns), 8x16 block stores.
-    load_cols = 32 if dtype == torch.bfloat16 else 16
+    # 32x256 workgroup tiles: 8 subgroups of 32x32 (inferred), 16x16 block
+    # loads (16 columns, at most 16 elements per work item), 8x16 block stores.
     tile = "sg_layout = [1, 8], sg_data = [32, 32]"
     assert _layouts(text, "xegpu.load_nd") == [
-        f"#xegpu.layout<{tile}, inst_data = [32, {load_cols}]>"
+        f"#xegpu.layout<{tile}, inst_data = [16, 16]>"
     ]
     assert _layouts(text, "xegpu.store_nd") == [
         f"#xegpu.layout<{tile}, inst_data = [8, 16]>"
@@ -513,14 +518,15 @@ def test_elementwise_bf16_math_and_casts() -> None:
     args = [xpu_tensor(1024, 1024, dtype=torch.bfloat16)]
     text, lowered = lower_xpu_stages(gelu_tanh_cast, args)
     # bf16 loads, f32 stores: each with its own block tile.
-    assert re.search(r"xegpu\.load_nd [^\n]*inst_data = \[32, 32\][^\n]*xbf16>", text)
+    assert re.search(r"xegpu\.load_nd [^\n]*inst_data = \[16, 16\][^\n]*xbf16>", text)
     assert re.search(r"xegpu\.store_nd [^\n]*inst_data = \[8, 16\][^\n]*xf32>", text)
     _check_xevm(lowered, "gelu_tanh_cast", 1)
     # bf16 math runs in f32 (the fast exp too: upstream's math-to-xevm would
     # call a bf16 native exp otherwise).
     assert _bf16_natives(lowered) == []
     assert "@_Z16__spirv_ocl_tanhf" in lowered
-    assert "@_Z22__spirv_ocl_native_expf" in lowered
+    # The f32 native exp, per element or of a 16-element vector.
+    assert re.search(r"@_Z22__spirv_ocl_native_exp(f|Dv16_f)\b", lowered)
 
 
 @pytest.mark.isolated
@@ -562,22 +568,18 @@ def test_elementwise_1d_tiles_gather_and_scatter() -> None:
 @pytest.mark.parametrize(
     ("name", "layout"),
     [
-        (
-            "row_sums",
-            (
-                "#xegpu.slice<#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 64]>, "
-                "dims = [1]>"
-            ),
-        ),
+        # Stored as a [rows, 1] column too (keep_row_dims).
+        ("row_sums", "#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 1]>"),
         ("row_maxima", "#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 1]>"),
     ],
     ids=["vector", "keepdim-column"],
 )
 def test_row_reduction_results(name: str, layout: str) -> None:
-    """Row results are stored with scatter stores, anchored with the reduction's
-    layout (no ``inst_data``: a ``keepdim`` column's fails in XeVM); a
-    ``keepdim`` column needs no temporary buffer. The reduced tiles' loads are
-    anchored too."""
+    """Row results are stored with scatter stores of ``[rows, 1]`` columns
+    (``[rows]`` vectors are stored as columns: their sliced layout gave wrong
+    results on hardware), anchored with the reduction's layout (no
+    ``inst_data``: a ``keepdim`` column's fails in XeVM); a column needs no
+    temporary buffer. The reduced tiles' loads are anchored too."""
     kernel = {"row_sums": row_sums, "row_maxima": row_maxima}[name]
     args = [xpu_tensor(4096, 8192)]
     text, lowered = lower_xpu_stages(kernel, args)
@@ -627,6 +629,7 @@ def test_stage_dumps(monkeypatch: pytest.MonkeyPatch) -> None:
         "bufferized",
         "host-legalized",
         "gpu-outlining",
+        "row-results",
         "xegpu-initial",
         "xegpu-wg",
     ]

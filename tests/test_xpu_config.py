@@ -389,7 +389,7 @@ def test_reduction_subgroup_rows(rows: int | None, threads: int) -> None:
     ("dtype", "xegpu", "rows", "load_tile", "reads"),
     [
         (torch.float32, {}, 8, [8, 16], {"32b_8r16"}),
-        (torch.float32, {"xegpu_sg_tiles": [[32, 0]]}, 32, [32, 16], {"32b_32r16"}),
+        (torch.float32, {"xegpu_sg_tiles": [[32, 0]]}, 32, [16, 16], {"32b_16r16"}),
         (
             torch.float32,
             {"xegpu_sg_tiles": [[32, 0]], "xegpu_load_tiles": [[16, 16]]},
@@ -399,27 +399,27 @@ def test_reduction_subgroup_rows(rows: int | None, threads: int) -> None:
         ),
         (
             torch.float32,
-            {"xegpu_sg_tiles": [[32, 0]], "xegpu_load_tiles": [[32, 16]]},
+            {"xegpu_sg_tiles": [[32, 0]], "xegpu_load_tiles": [[8, 16]]},
             32,
-            [32, 16],
-            {"32b_32r16"},
+            [8, 16],
+            {"32b_8r16"},
         ),
-        (torch.bfloat16, {}, 8, [8, 32], {"16b_8r32"}),
+        (torch.bfloat16, {}, 8, [8, 16], {"16b_8r16"}),
         (
             torch.bfloat16,
-            {"xegpu_sg_tiles": [[32, 0]], "xegpu_load_tiles": [[32, 16]]},
+            {"xegpu_sg_tiles": [[32, 0]], "xegpu_load_tiles": [[16, 16]]},
             32,
-            [32, 16],
-            {"16b_32r16"},
+            [16, 16],
+            {"16b_16r16"},
         ),
     ],
     ids=[
         "f32-inferred",
         "f32-sg32",
         "f32-sg32-load-16x16",
-        "f32-sg32-load-32x16",
+        "f32-sg32-load-8x16",
         "bf16-inferred",
-        "bf16-sg32-load-32x16",
+        "bf16-sg32-load-16x16",
     ],
 )
 def test_reduction_load_tiles(
@@ -430,8 +430,9 @@ def test_reduction_load_tiles(
     reads: set[str],
 ) -> None:
     """A reduction's tile loads take its subgroup layout and a 2D block load
-    tile (inferred: the largest dividing the subgroup tile); its tile stores
-    the 2D block store tile."""
+    tile (inferred: the largest of 16 columns and at most 16 elements per work
+    item dividing the subgroup tile); its tile stores the 2D block store
+    tile."""
     args = [xpu_tensor(4096, 4096, dtype=dtype)]
     text, lowered = _lower_stages(softmax_in_f32, args, SOFTMAX_BLOCKS, **xegpu)
     (kernel,) = _kernels(text).values()
@@ -450,9 +451,12 @@ def test_reduction_load_tiles(
     ("sg_data", "bits", "load_tile", "expected"),
     [
         ((8, 64), (32,), None, ((8, 16), (8, 16))),
-        ((32, 64), (32,), None, ((32, 16), (8, 16))),
-        ((64, 64), (32,), None, ((32, 16), (8, 16))),
-        ((8, 64), (16,), None, ((8, 32), (8, 16))),
+        # At most 16 elements per work item: 16 rows of 16 columns.
+        ((32, 64), (32,), None, ((16, 16), (8, 16))),
+        ((64, 64), (32,), None, ((16, 16), (8, 16))),
+        # 16 columns of 16-bit elements too (32-column loads came out wrong).
+        ((8, 64), (16,), None, ((8, 16), (8, 16))),
+        ((32, 64), (16,), None, ((16, 16), (8, 16))),
         ((8, 16), (16,), None, ((8, 16), (8, 16))),
         ((2, 64), (32,), None, ((2, 16), (2, 16))),
         ((32, 64), (16,), (16, 16), ((16, 16), (8, 16))),
@@ -480,6 +484,26 @@ def test_reduction_tile_limits(
 ) -> None:
     with pytest.raises(ValueError, match=match):
         reduction_tiles(sg_data, bits)
+
+
+@pytest.mark.parametrize(
+    ("sg_data", "bits", "load_tile", "match"),
+    [
+        # 32-column loads of 16-bit elements came out wrong on hardware.
+        ((8, 64), (16,), (8, 32), r"cols in \[16\]"),
+        # Float conversions of more than 16 elements per work item do not
+        # compile to SPIR-V.
+        ((32, 64), (32,), (32, 16), r"more than 16 elements per work item"),
+    ],
+)
+def test_reduction_forced_load_tile_limits(
+    sg_data: tuple[int, int],
+    bits: tuple[int, ...],
+    load_tile: tuple[int, int],
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        reduction_tiles(sg_data, bits, load_tile)
 
 
 @pytest.mark.isolated
@@ -699,13 +723,13 @@ def _elementwise_args(dtype: torch.dtype = torch.bfloat16) -> list[object]:
     [
         (
             {},
-            _layout([4, 8], [32, 32], [32, 32]),
+            _layout([4, 8], [32, 32], [16, 16]),
             _layout([4, 8], [32, 32], [8, 16]),
             512,
         ),
         (
             {"xegpu_sg_tiles": [[32, 64]]},
-            _layout([4, 4], [32, 64], [32, 32]),
+            _layout([4, 4], [32, 64], [16, 16]),
             _layout([4, 4], [32, 64], [8, 16]),
             256,
         ),
@@ -716,13 +740,13 @@ def _elementwise_args(dtype: torch.dtype = torch.bfloat16) -> list[object]:
             512,
         ),
         (
-            {"xegpu_load_tiles": [[16, 32]]},
-            _layout([4, 8], [32, 32], [16, 32]),
+            {"xegpu_load_tiles": [[8, 16]]},
+            _layout([4, 8], [32, 32], [8, 16]),
             _layout([4, 8], [32, 32], [8, 16]),
             512,
         ),
     ],
-    ids=["inferred", "sg-32x64", "sg-16x64-load-8x16", "load-16x32"],
+    ids=["inferred", "sg-32x64", "sg-16x64-load-8x16", "load-8x16"],
 )
 def test_elementwise_parameters(
     xegpu: dict[str, object], load: str, store: str, threads: int
@@ -768,9 +792,19 @@ def test_elementwise_parameters(
             r"load tile \[8, 32\]: 2D block loads of 32-bit elements .* cols in \[16\]",
         ),
         (
-            {"xegpu_load_tiles": [[32, 32]], "xegpu_sg_tiles": [[16, 64]]},
+            {"xegpu_load_tiles": [[16, 32]]},
             torch.bfloat16,
-            r"load tile \[32, 32\] does not divide the subgroup tile \[16, 64\]",
+            r"load tile \[16, 32\]: 2D block loads of 16-bit elements .* cols in \[16\]",
+        ),
+        (
+            {"xegpu_load_tiles": [[32, 16]]},
+            torch.bfloat16,
+            r"load tile \[32, 16\]: more than 16 elements per work item",
+        ),
+        (
+            {"xegpu_load_tiles": [[16, 16]], "xegpu_sg_tiles": [[8, 128]]},
+            torch.bfloat16,
+            r"load tile \[16, 16\] does not divide the subgroup tile \[8, 128\]",
         ),
         (
             {"xegpu_sg_tiles": [[48, 32]]},
@@ -799,6 +833,8 @@ def test_elementwise_parameters(
         "gemm-load-tiles",
         "load-rows",
         "f32-load-cols",
+        "bf16-load-cols",
+        "load-per-work-item",
         "load-not-dividing",
         "sg-not-dividing",
         "too-many-subgroups",
@@ -830,12 +866,13 @@ def test_1d_elementwise_parameters_are_inferred_only() -> None:
 @pytest.mark.parametrize(
     ("wg_tile", "load_bits", "store_bits", "sg_tile", "load_tile", "store_tile"),
     [
-        ((128, 256), (16,), (16,), (32, 32), (32, 32), (8, 16)),
-        ((128, 256), (32,), (32,), (32, 32), (32, 16), (8, 16)),
-        ((128, 256), (16,), (32,), (32, 32), (32, 32), (8, 16)),
-        ((32, 256), (16,), (16,), (32, 32), (32, 32), (8, 16)),
-        ((256, 256), (16,), (16,), (32, 64), (32, 32), (8, 16)),
-        ((1, 4096), (16,), (16,), (1, 1024), (1, 32), (1, 16)),
+        # Loads of 16 columns, at most 16 elements per work item.
+        ((128, 256), (16,), (16,), (32, 32), (16, 16), (8, 16)),
+        ((128, 256), (32,), (32,), (32, 32), (16, 16), (8, 16)),
+        ((128, 256), (16,), (32,), (32, 32), (16, 16), (8, 16)),
+        ((32, 256), (16,), (16,), (32, 32), (16, 16), (8, 16)),
+        ((256, 256), (16,), (16,), (32, 64), (16, 16), (8, 16)),
+        ((1, 4096), (16,), (16,), (1, 1024), (1, 16), (1, 16)),
         ((1, 16), (16,), (16,), (1, 16), (1, 16), (1, 16)),
         ((4, 16), (32,), (32,), (4, 16), (4, 16), (4, 16)),
         ((96, 48), (16,), (16,), (24, 48), (8, 16), (8, 16)),

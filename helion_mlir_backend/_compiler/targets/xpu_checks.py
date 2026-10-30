@@ -19,7 +19,9 @@ The gates are conservative, by IR property (not by kernel):
   fits);
 - a contraction runs in a K loop (an inner ``hl.tile`` with a block size below
   K), on f16/bf16 operands (also f32 values the contraction truncates to them,
-  e.g. attention's ``P``) accumulating in f32 (XeGPU DPAS).
+  e.g. attention's ``P``) accumulating in f32 (XeGPU DPAS);
+- no math function in a form that computes wrong values on the device
+  (:func:`check_math`).
 """
 
 from __future__ import annotations
@@ -53,7 +55,142 @@ def check_xegpu_capabilities(module: ir.Module, entry: str) -> list[ir.Operation
         _check_full_tiles(loop)
         _check_tile_ranks(loop)
         _check_kernel_class(loop)
+        check_math(loop)
     return loops
+
+
+_HALF = frozenset({"f16", "bf16"})
+TRUNCATION_VERIFIED: dict[str, frozenset[str]] = {
+    "math.exp": _HALF,
+    "math.sqrt": _HALF,
+    "math.rsqrt": _HALF,
+    "math.erf": _HALF,
+    "math.atan": _HALF,
+    "math.asin": _HALF,
+    "math.floor": _HALF,
+    "math.ceil": _HALF,
+    "math.roundeven": _HALF,
+    "math.fpowi": _HALF,
+    "math.absf": frozenset({"f16"}),
+}
+"""Math functions whose result, rounded straight to a 16-bit float, computes
+right on the device (Arc B50, IGC of /swtools/intel-gpu/latest, llvm-project
+79ab4054; ``tests/test_xpu_runtime.py::test_math_functions``), by the 16-bit
+type. Any other math function rounded straight to ``f16``/``bf16`` (or computed
+on 16-bit values, which the pipeline extends to f32 and rounds back) is
+rejected: tanh gives zeros; log, log2, log1p, expm1, sin, cos, tan, sinh, cosh,
+acos, atanh, exp2 and pow garbage, although their f32 results are right and
+the SPIR-V looks right (suspected IGC; erf and sqrt are lowered the same way
+and are right, so the trigger depends on the builtin). A function followed by
+more math (``tanh(x) * 2``, mish, GELU's tanh) is right. Knowingly
+conservative: e.g. ``tanh`` of a row maximum stored as a bf16 ``keepdim``
+column is right on the device but rejected."""
+BF16_OPERAND_VERIFIED = frozenset(
+    {
+        "math.exp",
+        "math.powf",
+        "math.log",
+        "math.log2",
+        "math.log1p",
+        "math.expm1",
+        "math.sqrt",
+        "math.rsqrt",
+        "math.sin",
+        "math.cos",
+        "math.tan",
+        "math.tanh",
+        "math.sinh",
+        "math.asin",
+        "math.acos",
+        "math.atanh",
+        "math.erf",
+        "math.floor",
+        "math.ceil",
+        "math.roundeven",
+        "math.fpowi",
+    }
+)
+"""Math functions that compute right on the device on a bf16 value extended to
+f32, also after elementwise arithmetic on it (same tests). Any other function
+on such a value is rejected: ``abs`` returns its operand (also of ``-x`` or
+``x * 1.0``), ``atan`` is wrong below -1, ``cosh`` is wrong, at every output
+dtype; f16 operands are right. Correctness over coverage: ``abs`` of a bf16
+value that other ops also use (softsign's ``x / (1 + |x|)``) was right in the
+cases measured, but has no rule that separates it from the wrong forms, so it is
+rejected too."""
+
+
+def check_math(loop: ir.Operation) -> None:
+    """Raise :class:`UnsupportedOperationError` for a math function in ``loop``
+    in a form the device computes wrong: one not in
+    :data:`TRUNCATION_VERIFIED` whose result is rounded straight to a 16-bit
+    float, or one not in :data:`BF16_OPERAND_VERIFIED` on a bf16 value."""
+    for op in _walk(loop):
+        if not op.name.startswith("math.") or len(op.results) != 1:
+            continue
+        rounded = _rounded_to(op)
+        if rounded is not None and rounded not in TRUNCATION_VERIFIED.get(
+            op.name, frozenset()
+        ):
+            raise UnsupportedOperationError(
+                f"{op.name} rounded to {rounded} on XPU",
+                reason=(
+                    f"the device computes {op.name}'s result rounded straight to "
+                    f"{rounded} wrong (verified right: f32 results, or more math "
+                    "on the result before the rounding)"
+                ),
+                alternatives=["an f32 output", _CPU],
+            )
+        if op.name not in BF16_OPERAND_VERIFIED and any(
+            _from_bf16(operand, {}) for operand in op.operands
+        ):
+            raise UnsupportedOperationError(
+                f"{op.name} of a bf16 value on XPU",
+                reason=(
+                    f"the device computes {op.name} of a bf16 value (extended to "
+                    "f32, also after arithmetic on it) wrong"
+                ),
+                alternatives=["f16 or f32 inputs", _CPU],
+            )
+
+
+def _from_bf16(value: ir.Value, seen: dict[ir.Value, bool]) -> bool:
+    """``value`` is a bf16 value, or computed from one by ``arith.extf`` and
+    elementwise ``arith`` ops (``negf``, ``mulf``, ``select``, ...)."""
+    if value in seen:
+        return seen[value]
+    seen[value] = False
+    if _element_type(value) == "bf16":
+        seen[value] = True
+        return True
+    owner = value.owner
+    if isinstance(owner, ir.Block) or not owner.name.startswith("arith."):
+        return False
+    result = any(_from_bf16(operand, seen) for operand in owner.operands)
+    seen[value] = result
+    return result
+
+
+def _rounded_to(op: ir.Operation) -> str | None:
+    """The 16-bit float type ``op``'s result is rounded to directly: a user's
+    ``arith.truncf``; for 16-bit math (extended to f32 and rounded back), its
+    own type unless only more math uses it (``tanh(x) * exp(x)`` in bf16 is
+    right; ``abs(x)`` stored or converted is not)."""
+    users = [use.owner for use in op.results[0].uses]
+    result = _element_type(op.results[0])
+    if result in _HALF:
+        computed = all(
+            user.name.startswith(("arith.", "math."))
+            and user.name not in ("arith.extf", "arith.truncf")
+            for user in users
+        )
+        return None if users and computed else result
+    for user in users:
+        if user.name == "arith.truncf":
+            rounded = _element_type(user.results[0])
+            if rounded in _HALF:
+                return rounded
+    return None
 
 
 def _function(module: ir.Module, name: str) -> ir.Operation:

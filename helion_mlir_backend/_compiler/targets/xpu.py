@@ -18,7 +18,10 @@ set to all kernels).
 
 Only the IR stages run without an XPU-capable LLVM build: ``xegpu-wg`` (annotated
 XeGPU) and ``xevm`` (LLVM/XeVM without device binaries). Binaries need the SPIR-V
-target, execution the Level Zero runtime (``libmlir_levelzero_runtime.so``).
+target, execution the Level Zero runtime (``libmlir_levelzero_runtime.so``). The
+``binary`` stop point lowers to ``xevm``, then rewrites the XeVM modules'
+counted allocas (``xevm_alloca_arrays``, a SPIR-V backend workaround) and emits
+the binaries: the ``xevm`` stop point's IR precedes that rewrite.
 """
 
 from __future__ import annotations
@@ -45,8 +48,10 @@ from ..mlir.support.debug import DebugOptions
 from ..mlir.support.debug import xpu_stop_at
 from ..mlir.support.errors import UnsupportedOperationError
 from ..mlir.support.errors import UnsupportedTargetError
+from ..mlir_transforms.keep_row_dims import keep_row_dims
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
+from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from .base import MLIRTarget
 from .xpu_checks import check_xegpu_capabilities
 from .xpu_params import XEGPU_CONFIG_KEYS
@@ -145,13 +150,52 @@ def _stages(
         ("host-legalized", xpu_transforms.legalize_host_ops()),
         # Lighthouse's outline_gpu_func and annotate_layouts schedules, per kernel.
         ("gpu-outlining", xpu_transforms.outline_kernels(entry, kernels)),
+        # Row results stored as [rows, 1] columns: see keep_row_dims.
+        ("row-results", _KeepRowDims()),
         ("xegpu-initial", xegpu.vector_to_xegpu_schedule()),
         ("xegpu-wg", xpu_transforms.annotate_kernels(entry, kernels)),
     ]
     if stop_at != "xegpu-wg":
-        binary_format = "skip" if stop_at == "xevm" else "fatbin"
-        schedules.append((stop_at, xpu_transforms.lower_to_xevm(binary_format)))
-    return [(name, TransformStage(schedule, context)) for name, schedule in schedules]
+        schedules.append(("xevm", xpu_transforms.lower_to_xevm()))
+    stages: list[tuple[str, Stage]] = [
+        (name, s if isinstance(s, Stage) else TransformStage(s, context))
+        for name, s in schedules
+    ]
+    if stop_at == "binary":
+        # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays.
+        stages.extend([("xevm-allocas", _AllocaArrays()), ("binary", _ToBinary())])
+    return stages
+
+
+class _ToBinary(Stage):
+    """The last pass of ``gpu-lower-to-xevm-pipeline`` (run with ``binary-format=
+    skip`` before), with its options: device binaries (fatbin)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        PassManager.parse(
+            "builtin.module(gpu-module-to-binary{format=fatbin "
+            f'opts="{xpu_transforms.IGC_OPTIONS}"}})',
+            module.context,
+        ).run(module.operation)
+        return module
+
+
+class _KeepRowDims(Stage):
+    """``[rows]`` row-result stores as ``[rows, 1]`` (works around wrong
+    scatter stores of row vectors on hardware, :mod:`keep_row_dims`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        keep_row_dims(module)
+        return module
+
+
+class _AllocaArrays(Stage):
+    """Constant-count allocas of the XeVM modules as array allocas (works around
+    a SPIR-V backend miscompile, :mod:`xevm_alloca_arrays`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        alloca_arrays(module)
+        return module
 
 
 @functools.cache

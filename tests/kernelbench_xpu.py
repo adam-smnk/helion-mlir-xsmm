@@ -19,8 +19,9 @@ chosen per shape:
   as transposed 16x16 tiles.
 - Elementwise (bf16, 4096x393216): ``[rows, cols]`` workgroup tiles of 128x256
   (lighthouse kernel_bench's elementwise default), computed in f32 like
-  PyTorch's bf16 kernels; inferred subgroup tiles of 32x32 (32 subgroups), 32x32
-  bf16 block loads, 8x16 block stores.
+  PyTorch's bf16 kernels; inferred subgroup tiles of 32x32 (32 subgroups), 16x16
+  bf16 block loads (16 columns, at most 16 elements per work item: wider loads
+  ran wrong or did not compile on hardware), 8x16 block stores.
 - Row reductions (f32): ``[rows, column chunk]`` block sizes, 64 rows per
   workgroup (lighthouse's reduction class: 8 subgroups of 8 rows) and 64-column
   chunks; multi-pass over the chunks like AI-bench's CPU kernels.

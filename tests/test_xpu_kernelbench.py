@@ -32,6 +32,8 @@ from tests.kernelbench_xpu import RANK3_PROBLEMS
 from tests.kernelbench_xpu import Problem
 from tests.kernelbench_xpu import attention
 
+from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -75,10 +77,10 @@ def _check_elementwise(text: str) -> None:
     loads = _anchor_layouts(text, "xegpu.load_nd")
     stores = _anchor_layouts(text, "xegpu.store_nd")
     assert len(loads) == len(stores) == 1
-    # Inferred for a 128x256 bf16 tile: 32 subgroups of 32x32, 32x32 block
-    # loads, 8x16 block stores.
+    # Inferred for a 128x256 bf16 tile: 32 subgroups of 32x32, 16x16 block
+    # loads (16 columns, at most 16 elements per work item), 8x16 block stores.
     tile = "sg_layout = [4, 8], sg_data = [32, 32]"
-    assert loads == [f"{tile}, inst_data = [32, 32]"]
+    assert loads == [f"{tile}, inst_data = [16, 16]"]
     assert stores == [f"{tile}, inst_data = [8, 16]"]
     assert "known_block_size = array<i32: 512, 1, 1>" in text
 
@@ -165,10 +167,23 @@ _CHECKS = {
 }
 
 
+_REJECTED = {
+    "22_Tanh": r"math\.tanh rounded to bf16",
+    # abs of bf16 x: right on the device for softsign's shared operand, but not
+    # separable from the wrong forms (xpu_checks.BF16_OPERAND_VERIFIED).
+    "30_Softsign": r"math\.absf of a bf16 value",
+}
+
+
 @pytest.mark.isolated
 @pytest.mark.parametrize("name", list(_ALL))
 def test_kernelbench_problem_lowers_for_xpu(name: str) -> None:
     problem = _ALL[name]
+    if name in _REJECTED:
+        # Computed wrong on the device (xpu_checks.check_math).
+        with pytest.raises(UnsupportedOperationError, match=_REJECTED[name]):
+            lower_xpu_stages(problem.kernel, _args(problem))
+        return
     text, lowered = lower_xpu_stages(problem.kernel, _args(problem))
     _check_launch(text, problem.grid)
     _CHECKS[problem.kind](text)

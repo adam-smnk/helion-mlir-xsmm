@@ -47,11 +47,32 @@ STORE_ROWS = (8, 4, 2, 1)
 """Rows of a 2D block store (at most 8, any element size)."""
 LOAD_ROWS = (32, 16, 8, 4, 2, 1)
 """Rows of a 2D block load (at most 32)."""
-LOAD_ROW_BYTES = 64
-"""Bytes of a 2D block load row: 32 16-bit or 16 32-bit elements."""
+LOAD_COLS = 16
+"""Columns of the 2D block loads of elementwise and reduction tiles, of any
+element size: one per work item.
+
+A block load row may hold 64 bytes, but a 16-bit ``8x32`` (``16b_8r32x1c``)
+read gives work item ``k`` columns ``2k`` and ``2k + 1``, while upstream's
+``xegpu-sg-to-lane-distribute`` (llvm-project 79ab4054) distributes the
+``inst_data = [8, 32]`` tile with ``lane_data = [1, 1]`` (columns ``k`` and
+``16 + k``): the elementwise ops and 16-column stores then take the elements
+in the wrong order (a ReLU gives ``out[0, j] == relu(x[0, 2j])``, a row sum is
+wrong). The array-length rewrite (``XeGPUArrayLengthOptimization``) that
+splits such reads into 16-column blocks fires only when every user is a
+block-aligned ``vector.extract_strided_slice``, as for a GEMM's A tile (DPAS
+operands; B uses VNNI transform reads), so GEMMs are right and elementwise and
+reduction tiles are not."""
 ELEMENT_BITS = frozenset({16, 32})
 """Element sizes of the tiles (f16, bf16, f32, i16, i32): 2D block loads and
 stores of both share the store's 16 columns."""
+MAX_LANE_ELEMENTS = 16
+"""Elements per work item of a load tile (``inst_data``): at most 16, 256 per
+tile. The ops on a loaded tile are unrolled to its load tile, one vector per
+work item, and LLVM's SPIR-V backend (verified at llvm-project 79ab4054 on an
+Arc B50) cannot legalize float extensions and truncations of vectors of more
+than 16 elements (``G_FPEXT``/``G_FPTRUNC`` of ``<64 x s16>``: "unable to
+legalize instruction"), which every bf16 tile computed in f32 has; vectors of
+more than 16 components need ``SPV_EXT_long_vector``."""
 TARGET_SG_ELEMENTS = 32 * 32
 """Default subgroup tile size (lighthouse kernel_bench's elementwise 32x32)."""
 MAX_SG_ELEMENTS = 2048
@@ -93,13 +114,6 @@ class ElementwiseLayout:
 
 def _largest_dividing(candidates: Sequence[int], size: int) -> int | None:
     return next((c for c in candidates if size % c == 0), None)
-
-
-def load_cols(element_bits: Sequence[int]) -> tuple[int, ...]:
-    """The columns a 2D block load of ``element_bits``-bit elements takes, widest
-    first: one row is at most :data:`LOAD_ROW_BYTES` and at least 16 elements."""
-    widest = LOAD_ROW_BYTES * 8 // max(element_bits, default=16)
-    return tuple(c for c in (32, 16) if c <= widest)
 
 
 def default_sg_tile(wg_tile: Sequence[int]) -> tuple[int, ...] | None:
@@ -156,9 +170,9 @@ def elementwise_layout(
       at most :data:`MAX_SG_ELEMENTS` elements (inferred: :func:`default_sg_tile`).
     - 2D: the store tile is the largest 2D block store dividing the subgroup
       tile, ``[rows <= 8, 16]``; the load tile a 2D block load dividing it,
-      ``[rows <= 32, cols]`` with rows a power of two and 16 or 32 columns (16
-      when 32-bit elements are loaded: rows of at most 64 bytes); inferred: the
-      largest.
+      ``[rows <= 32, 16]`` with rows a power of two (:data:`LOAD_COLS`), at most
+      :data:`MAX_LANE_ELEMENTS` elements per work item; inferred: the most
+      rows.
     - 1D: loads and stores are gathers and scatters of 16 elements.
 
     Raises ``ValueError`` naming the violated constraint.
@@ -239,26 +253,37 @@ def block_load_tile(
     inferred.
 
     ``[rows, cols]``, dividing ``sg_tile``: rows a power of two of at most 32,
-    16 or 32 columns (16 when 32-bit elements are loaded: rows of at most
-    :data:`LOAD_ROW_BYTES`); inferred: the largest. Raises ``ValueError`` naming
+    :data:`LOAD_COLS` columns, at most :data:`MAX_LANE_ELEMENTS`
+    elements per work item; inferred: the most rows. Raises ``ValueError`` naming
     the violated constraint (also when no such tile divides ``sg_tile``).
     """
-    cols = load_cols(load_bits)
+    max_elements = SUBGROUP_SIZE * MAX_LANE_ELEMENTS
     if load_tile is None:
-        load_rows = _largest_dividing(LOAD_ROWS, sg_tile[0])
-        load_cols_ = _largest_dividing(cols, sg_tile[1])
-        if load_rows is None or load_cols_ is None:
+        load_rows = _largest_dividing(
+            [r for r in LOAD_ROWS if r * LOAD_COLS <= max_elements], sg_tile[0]
+        )
+        if load_rows is None or sg_tile[1] % LOAD_COLS:
             raise ValueError(
                 f"no 2D block load of {max(load_bits, default=16)}-bit elements "
                 f"divides the subgroup tile {list(sg_tile)}"
             )
-        load_tile = (load_rows, load_cols_)
+        load_tile = (load_rows, LOAD_COLS)
     load_tile = tuple(load_tile)
-    if len(load_tile) != 2 or load_tile[0] not in LOAD_ROWS or load_tile[1] not in cols:
+    if (
+        len(load_tile) != 2
+        or load_tile[0] not in LOAD_ROWS
+        or load_tile[1] != LOAD_COLS
+    ):
         raise ValueError(
             f"load tile {list(load_tile)}: 2D block loads of "
             f"{max(load_bits, default=16)}-bit elements take [rows, cols] tiles with "
-            f"rows in {sorted(LOAD_ROWS)} and cols in {sorted(cols)}"
+            f"rows in {sorted(LOAD_ROWS)} and cols in [{LOAD_COLS}]"
+        )
+    if math.prod(load_tile) > max_elements:
+        raise ValueError(
+            f"load tile {list(load_tile)}: more than {MAX_LANE_ELEMENTS} elements "
+            f"per work item ({max_elements} per tile) do not compile to SPIR-V "
+            "(float conversions of wider vectors)"
         )
     if any(s % i for s, i in zip(sg_tile, load_tile, strict=True)):
         raise ValueError(

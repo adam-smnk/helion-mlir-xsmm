@@ -4,6 +4,7 @@ lighthouse's and this backend's transform ops (``mlir_transforms``)."""
 from __future__ import annotations
 
 from contextlib import contextmanager
+import inspect
 from typing import TYPE_CHECKING
 
 from lighthouse.schedule.builders import schedule_boilerplate
@@ -15,6 +16,7 @@ from mlir.dialects.transform import math as transform_math
 from mlir.dialects.transform import structured
 from mlir.dialects.transform import tensor as transform_tensor
 from mlir.dialects.transform import vector as transform_vector
+from mlir.dialects.transform import x86 as transform_x86
 
 from helion_mlir_backend._compiler import mlir_transforms as ht
 
@@ -408,6 +410,20 @@ def promote_buffers_to_stack(max_alloc_size_in_bytes: int = 262144) -> ir.Module
     return schedule
 
 
+def _polynomial_approximation_patterns() -> None:
+    """Math's polynomial approximation patterns with the AVX2 ``rsqrt`` one, at
+    the insertion point. MLIR moved the AVX2 ``rsqrt`` approximation out of
+    ``polynomial_approximation{enable_avx2}`` into the x86 transform op
+    ``math_rsqrt_approximation`` (llvm-project #236807): use whichever form the
+    bindings have."""
+    op = transform_math.ApplyPolynomialApproximationPatternsOp
+    if "enable_avx2" in inspect.signature(op.__init__).parameters:
+        op(enable_avx2=True)
+        return
+    op()
+    transform_x86.ApplyMathRsqrtApproximationPatternsOp()
+
+
 def approximate_math() -> ir.Module:
     """Schedule: math functions (``exp``, ``tanh``, ``erf``, ...) as polynomial
     approximations: LLVM lowers a vector one to a libm call per element."""
@@ -416,7 +432,7 @@ def approximate_math() -> ir.Module:
             transform.ApplyPatternsOp(named_seq.bodyTarget).patterns
         ):
             transform_math.ApplyF32ExpansionPatternsOp()
-            transform_math.ApplyPolynomialApproximationPatternsOp(enable_avx2=True)
+            _polynomial_approximation_patterns()
         transform.yield_()
     return schedule
 
