@@ -164,6 +164,39 @@ def test_kernelbench_matmul(name: str) -> None:
     _check(problem.kernel(a, b), ref)
 
 
+_GEMM_AT_SCALE = {
+    "1_Square_matrix_multiplication_": (1024, 1024, 1024),
+    "13_Matmul_for_symmetric_matrices": (1024, 1024, 1024),
+    "2_Standard_matrix_multiplication_": (512, 1024, 8192),
+}
+"""The hand-picked GEMMs on a longer K loop and more workgroups than the small
+shapes: 1 and 13 are 8x2 = 16 workgroups of 128x512 (exactly one wave on the
+B50's 16 Xe cores), 2 is 2x4 = 8 workgroups of 256x256 with its spec K."""
+_BIT_EXACT_VS_TORCH = {
+    "1_Square_matrix_multiplication_",
+    "13_Matmul_for_symmetric_matrices",
+}
+"""Verified bit for bit against ``torch.matmul`` at the shapes above (two seeds).
+2 is not: at 512x1024x8192 torch picks another kernel (and K order) than the
+spec shape's, so it is compared with the same kernel under the inferred config."""
+
+
+@pytest.mark.parametrize("name", list(_GEMM_AT_SCALE))
+def test_kernelbench_hand_picked_gemm_at_scale(name: str) -> None:
+    problem = {p.name: p for p in kb.PROBLEMS}[name]
+    m, n, k = _GEMM_AT_SCALE[name]
+    a, b = _randn(m, k), _randn(k, n)
+    out = problem.kernel(a, b)
+    if name in _BIT_EXACT_VS_TORCH:
+        _check(out, a @ b, bound=0.0)
+        return
+    _check(out, a @ b)
+    # The same K step, so the same accumulation order: the config changes
+    # the tiling and the loads, not a bit of the result.
+    inferred = _kernel(problem.fn, problem.block_sizes)(a, b)
+    _check(out, inferred, bound=0.0)
+
+
 _EXACT = {"19_ReLU", "32_HardTanh", "19_ReLU_NCHW"}
 """Problems computing an exact op (no rounding): bit for bit."""
 _GUARDED_ELEMENTWISE = {

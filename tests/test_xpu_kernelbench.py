@@ -216,6 +216,72 @@ def test_kernelbench_problem_lowers_for_xpu(name: str) -> None:
         assert "intel_sub_group_2d_block_read_transpose_32b_16r8x1c" in lowered
 
 
+_LAYOUT_32X64 = "sg_data = [32, 64], inst_data = [8, 16]"
+_GEMM_PINS = {
+    # GEMM_SQUARE: 128x512 workgroups of 4x8 subgroups of 32x64, A loaded 32x32
+    # and B 16x32 per read (B's 32x32 tile is a [16, 32] block read), inferred
+    # prefetches, one K step ahead.
+    "1_Square_matrix_multiplication_": {
+        "grid": (32, 8),
+        "sg_layout": "[4, 8]",
+        "a_load": "sg_data = [32, 32], inst_data = [32, 32]",
+        "b_load": "sg_data = [32, 64], inst_data = [16, 32]",
+        "prefetches": [
+            "sg_layout = [16, 2], sg_data = [8, 16], inst_data = [8, 16]",
+            "sg_layout = [2, 16], sg_data = [16, 32], inst_data = [8, 16]",
+        ],
+        "prefetch_count": 4,
+        "block_reads": {"read_16b_32r16x2c", "read_transform_16b_16r16x2c"},
+    },
+    # GEMM_STANDARD: 256x256 workgroups of 8x4 subgroups of 32x64, A loaded
+    # 8x32 and B 32x32, prefetches of 16x16, one K step ahead.
+    "2_Standard_matrix_multiplication_": {
+        "grid": (8, 16),
+        "sg_layout": "[8, 4]",
+        "a_load": "sg_data = [32, 32], inst_data = [8, 32]",
+        "b_load": "sg_data = [32, 64], inst_data = [32, 32]",
+        "prefetches": [
+            "sg_layout = [16, 2], sg_data = [16, 16], inst_data = [8, 16]",
+            "sg_layout = [2, 16], sg_data = [16, 16], inst_data = [8, 16]",
+        ],
+        "prefetch_count": 4,
+        "block_reads": {"read_16b_8r16x2c", "read_transform_16b_32r16x2c"},
+    },
+}
+
+
+_GEMM_PINS["13_Matmul_for_symmetric_matrices"] = _GEMM_PINS[
+    "1_Square_matrix_multiplication_"
+]
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("name", list(_GEMM_PINS))
+def test_gemm_hand_picked_config(name: str) -> None:
+    """1_Square, 13_Matmul_for_symmetric_matrices and 2_Standard run the
+    hand-picked configs of ``GEMM_SQUARE`` and ``GEMM_STANDARD``: the subgroup
+    layout (32x64, also where it is what lighthouse infers: 1 and 13 on 128x512
+    workgroups), the block loads and prefetches, and the 2D block reads they
+    lower to. For 2 the inferred 64x32 differs."""
+    pin = _GEMM_PINS[name]
+    problem = _ALL[name]
+    text, lowered = lower_xpu_stages(problem.kernel, _args(problem))
+    _check_launch(text, pin["grid"])
+    layout = f"sg_layout = {pin['sg_layout']}"
+    assert _anchor_layouts(text, "xegpu.store_nd") == [f"{layout}, {_LAYOUT_32X64}"]
+    a_load, b_load = _anchor_layouts(text, "xegpu.load_nd")
+    assert a_load == f"{layout}, {pin['a_load']}"
+    assert b_load == f"{layout}, {pin['b_load']}"
+    prefetches = _anchor_layouts(text, "xegpu.prefetch_nd")
+    assert len(prefetches) == pin["prefetch_count"]
+    assert set(prefetches) == set(pin["prefetches"])
+    reads = set(
+        re.findall(r"intel_sub_group_2d_block_(read\w*?_16b_\d+r16x2c)", lowered)
+    )
+    assert reads == pin["block_reads"]
+    assert "known_block_size = array<i32: 512, 1, 1>" in text
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "block_sizes", [ATTENTION_BLOCKS, [1, 1, 32, 32]], ids=["xpu_blocks", "small"]
