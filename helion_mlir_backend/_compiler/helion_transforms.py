@@ -308,10 +308,13 @@ def amx_move_offsets() -> ir.Module:
     """Schedule: move the offsets of every function's in-bounds memref reads to
     subviews, in the form the x86 AMX contraction rewrite matches, then fit
     the subviews to the reads: the rewrite takes an accumulator read's memref
-    as the register tile."""
+    as the register tile. Accumulator reads that skip unit dims of their
+    buffer are first made minor-identity reads of a view without them (the
+    rewrite loads only those in place)."""
     ht.HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.drop_accumulator_read_unit_dims(funcs)
         ht.move_offsets_to_subview(funcs)
         transform.apply_cse(funcs)
         ht.fit_subviews_to_reads(funcs)

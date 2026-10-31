@@ -34,7 +34,8 @@ def _matrix_view(source: ir.Value, leading: list[ir.Value]) -> ir.Value | None:
     source_type = ir.MemRefType(source.type)
     try:
         source_type.get_strides_and_offset()
-    except ValueError:
+    except (RuntimeError, ValueError):
+        # No strided layout (e.g. an affine map).
         return None
     rank, count = source_type.rank, len(leading)
     shape = source_type.shape

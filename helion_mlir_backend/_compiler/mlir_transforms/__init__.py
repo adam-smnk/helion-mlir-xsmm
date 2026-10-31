@@ -7,6 +7,7 @@ dialect only registers the ops defined before it is loaded."""
 from .align_operand_rows import align_operand_rows
 from .carry_loop_inits import carry_loop_inits
 from .dialect import HelionTransformDialect
+from .drop_accumulator_read_unit_dims import drop_accumulator_read_unit_dims
 from .fit_subviews_to_reads import fit_subviews_to_reads
 from .fold_loop_unit_dims import fold_loop_unit_dims
 from .forward_rows import forward_rows
@@ -50,6 +51,7 @@ __all__ = [
     "InferXeGPUElementwiseLayoutOp",
     "align_operand_rows",
     "carry_loop_inits",
+    "drop_accumulator_read_unit_dims",
     "fit_subviews_to_reads",
     "fold_loop_unit_dims",
     "forward_rows",

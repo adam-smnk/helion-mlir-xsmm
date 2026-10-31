@@ -49,42 +49,16 @@ from mlir import ir
 from mlir.dialects import arith
 from mlir.dialects import ext
 from mlir.dialects import memref
-from mlir.dialects import scf
 from mlir.dialects import transform
 from mlir.dialects import vector
 from mlir.dialects.transform import DiagnosedSilenceableFailure
 
 from .dialect import HelionTransformDialect
 from .dialect import transform_op
+from .utils import int_constant
+from .utils import is_accumulator
 from .utils import opview
 from .utils import payload_ops
-
-
-def _constant_index(value: ir.Value) -> int | None:
-    if isinstance(value.owner, ir.Block):
-        return None
-    op = opview(value.owner)
-    if not isinstance(op, arith.ConstantOp) or not isinstance(op.value, ir.IntegerAttr):
-        return None
-    return ir.IntegerAttr(op.value).value
-
-
-def _is_accumulator(value: ir.Value) -> bool:
-    """Whether every use of ``value`` is a ``vector.contract`` accumulator, or
-    an ``scf.for`` init of an iter arg whose uses all are."""
-    uses = list(value.uses)
-    if not uses:
-        return False
-    for use in uses:
-        owner = opview(use.owner)
-        if isinstance(owner, vector.ContractionOp) and use.operand_number == 2:
-            continue
-        if not isinstance(owner, scf.ForOp) or use.operand_number < 3:
-            return False
-        iter_arg = owner.inner_iter_args[use.operand_number - 3]
-        if not _is_accumulator(iter_arg):
-            return False
-    return True
 
 
 def _accumulated_by(value: ir.Value) -> frozenset:
@@ -114,9 +88,9 @@ def _read_region(use: ir.OpOperand, rank: int) -> tuple[list[int], list[int]] | 
     permutation = read.permutation_map.value
     if permutation != ir.AffineMap.get_minor_identity(rank, len(shape)):
         return None
-    if not _is_accumulator(read.result):
+    if not is_accumulator(read.result):
         return None
-    indices = [_constant_index(index) for index in read.indices]
+    indices = [int_constant(index) for index in read.indices]
     if len(indices) != rank or any(index is None for index in indices):
         return None
     extents = [1] * (rank - len(shape)) + list(shape)
@@ -251,7 +225,7 @@ def _fit(subview: memref.SubViewOp, groups: list[_Group]) -> None:
             with ir.InsertionPoint(read), read.location:
                 for dim, shift in enumerate(low):
                     if shift:
-                        old = _constant_index(read.operands[1 + dim])
+                        old = int_constant(read.operands[1 + dim])
                         read.operands[1 + dim] = arith.constant(index, old - shift)
     subview.operation.erase()
 
