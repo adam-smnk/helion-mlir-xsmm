@@ -174,6 +174,64 @@ def test_second_k_loop_matches_reference(name: str) -> None:
     assert error.item() < 1e-2
 
 
+# The six AI-bench linear() shapes (bias + relu, 64 threads, small-M panel
+# rule) that aborted in lowering (review temp/review-cpu-mlp sw64, cases
+# 134/148/155/159/162/166). One entry per kernel call: the bulk rows, and the
+# zero-padded rest rows where M is not a whole number of row tiles.
+# (M, K, N, panel, block_sizes, pairs_chunked, pairs_even)
+UTILS_CASES = {
+    "linear_128x3200x4096": (128, 3200, 4096, 128, [64, 1, 416, 352], 1248, 1600),
+    "linear_192x3200x4096": (192, 3200, 4096, 128, [96, 1, 416, 352], 1248, 1600),
+    "linear_200x3200x4096_bulk": (128, 3200, 4096, 128, [128, 1, 416, 352], 1248, 1600),
+    "linear_200x3200x4096_rest": (96, 3200, 4096, 128, [96, 1, 416, 352], 1248, 1600),
+    "linear_200x2080x2048_bulk": (192, 2080, 2048, 128, [64, 1, 512, 32], 1024, 1024),
+    "linear_200x2080x2048_rest": (32, 2080, 2048, 128, [32, 1, 512, 32], 1024, 1024),
+    "linear_255x3200x4096_rest": (128, 3200, 4096, 128, [128, 1, 416, 352], 1248, 1600),
+    "linear_255x2080x2048_rest": (64, 2080, 2048, 128, [64, 1, 512, 32], 1024, 1024),
+}
+
+
+def _utils_case(name: str) -> tuple[helion.Kernel, list[object], Tensor]:
+    m, k, n, panel, block_sizes, pairs_chunked, pairs_even = UTILS_CASES[name]
+    kernel = helion.kernel(
+        _matmul_prepacked_vnni,
+        backend="mlir",
+        config=helion.Config(block_sizes=block_sizes),
+        ignore_warnings=[helion.exc.TensorOperationInWrapper],
+    )
+    torch.manual_seed(0)
+    a = torch.randn(m, k, dtype=torch.bfloat16)
+    w = torch.randn(n, k, dtype=torch.bfloat16)
+    bias = torch.randn(n, dtype=torch.bfloat16)
+    # As pack_b_vnni_t: K padded to whole 32-pair chunks; the kernel's tail
+    # chunk reads A past its last pair (masked) and B's zero padding.
+    k_pad = -(-k // 64) * 64
+    w_pad = torch.nn.functional.pad(w, (0, k_pad - k))
+    args = [
+        a.view(m, k // 2, 2),
+        _pack_b_vnni_t(w_pad, panel),
+        bias.view(n // panel, panel),
+        None,
+        None,
+        torch.relu,
+        hl.constexpr(pairs_chunked),
+        hl.constexpr(pairs_even),
+    ]
+    return kernel, args, torch.relu(a.float() @ w.float().T + bias.float())
+
+
+@amx_host_only
+@pytest.mark.isolated
+@pytest.mark.parametrize("name", list(UTILS_CASES))
+def test_utils_small_m_shapes_match_reference(name: str) -> None:
+    """AI-bench linear() configs with 128-column panels and a second K loop
+    (rest chunk or pairs tail) that aborted in lowering."""
+    kernel, args, expected = _utils_case(name)
+    out = kernel(*args).view(expected.shape)
+    error = (out.float() - expected).abs().max() / expected.abs().max()
+    assert error.item() < 1e-2
+
+
 @pytest.mark.isolated
 @pytest.mark.parametrize("name", ["chunks_2x384_rest_256", "linear_4160_8_threads"])
 def test_second_k_loop_accumulates_in_place(name: str) -> None:

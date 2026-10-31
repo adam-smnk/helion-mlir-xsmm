@@ -128,6 +128,13 @@ class MLIRTarget(abc.ABC):
         """Reject a tensor argument (named by its host expression) that the
         compiled kernel cannot access, e.g. one on another device."""
 
+    def passes_in_place(self, tensor: torch.Tensor) -> bool:
+        """Whether the kernel can take ``tensor`` as is, with no
+        :meth:`check_tensor` error: a call whose tensors all pass, on a target
+        that keeps the default no-op :meth:`prepare_call` and
+        :meth:`finish_call`, skips those checks and hooks (default: never)."""
+        return False
+
     def prepare_call(self, buffers: Sequence[torch.Tensor]) -> None:
         """Before an entry call: make ``buffers`` ready for the kernel (default:
         nothing to do)."""

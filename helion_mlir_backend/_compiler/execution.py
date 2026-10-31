@@ -21,10 +21,12 @@ import gc
 import hashlib
 import io
 import logging
+import math
 import multiprocessing
 import os
 import pickle
 import tempfile
+import threading
 from typing import TYPE_CHECKING
 import warnings
 
@@ -39,6 +41,7 @@ from helion_mlir_backend._compiler.mlir.support.errors import CompileTimeoutErro
 from helion_mlir_backend._compiler.mlir.support.errors import LoweringStoppedError
 from helion_mlir_backend._compiler.mlir.support.type_utils import mlir_dtype_to_torch
 from helion_mlir_backend._compiler.targets import resolve_target
+from helion_mlir_backend._compiler.targets.base import MLIRTarget
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -48,7 +51,6 @@ if TYPE_CHECKING:
 
     from lighthouse.execution.runner import Runner
 
-    from helion_mlir_backend._compiler.targets import MLIRTarget
     from helion_mlir_backend._compiler.targets.base import Lowering
 
 log = logging.getLogger(__name__)
@@ -98,6 +100,66 @@ class CompiledEntry:
     def __post_init__(self) -> None:
         # The ctypes callable of the packed C interface, looked up once.
         object.__setattr__(self, "_func", self.runner.engine.lookup(self.name))
+        object.__setattr__(self, "_static", _StaticCall.build(self.args))
+
+    def call_in_place(self, values: Sequence[object]) -> list[torch.Tensor] | None:
+        """Call the entry and return its inout tensors if every argument is a
+        tensor that it can take as is -- the static shape and dtype, contiguous
+        strides, no negative or conjugate bit,
+        :meth:`MLIRTarget.passes_in_place` and a target without call
+        hooks (:meth:`MLIRTarget.prepare_call`), no inout sharing memory
+        with another argument -- else return ``None`` without calling it: the
+        caller then takes the general path (``driver.call_entry``), which
+        stages, checks and reports. Only the data pointers change between
+        calls, so the arguments are packed once per entry."""
+        static = self._static
+        if static is None:
+            return None
+        # Checked per call, not once: entries are shared through the JIT
+        # cache, and a target's hooks may be replaced after one was built.
+        hooks = type(self.target)
+        if (
+            hooks.prepare_call is not MLIRTarget.prepare_call
+            or hooks.finish_call is not MLIRTarget.finish_call
+        ):
+            return None
+        passes = self.target.passes_in_place
+        for value, shape, strides, dtype in zip(
+            values, static.shapes, static.strides, static.dtypes, strict=True
+        ):
+            if not (
+                isinstance(value, torch.Tensor)
+                and value.dtype is dtype
+                and value.shape == shape
+                and value.stride() == strides
+                and not value.is_neg()
+                and not value.is_conj()
+                and passes(value)
+            ):
+                return None
+        pointers = [value.data_ptr() for value in values]  # type: ignore[union-attr]
+        nbytes = static.nbytes
+        for i in static.inouts:
+            start, end = pointers[i], pointers[i] + nbytes[i]
+            for j, other in enumerate(pointers):
+                if j != i and other < end and start < other + nbytes[j]:
+                    return None
+        # One packed buffer per entry: a call from another thread meanwhile
+        # takes the general path.
+        if not static.lock.acquire(blocking=False):
+            return None
+        try:
+            buffer = static.buffer
+            for slot, pointer in zip(static.slots, pointers, strict=True):
+                buffer[slot] = pointer
+                buffer[slot + 1] = pointer
+            self._func(static.packed)
+        except Exception as exc:
+            exc.add_note(f"Helion MLIR backend: failed while running '{self.name}'")
+            raise
+        finally:
+            static.lock.release()
+        return [values[i] for i in static.inouts]  # type: ignore[misc]
 
     def __call__(self, values: Sequence[torch.Tensor | float | int | bool]) -> None:
         """Call the entry with one value per argument: a tensor for a memref, a
@@ -111,6 +173,53 @@ class CompiledEntry:
 
 
 _WORD = ctypes.sizeof(ctypes.c_int64)
+
+
+class _StaticCall:
+    """The packed arguments of an entry that takes only memrefs of static,
+    non-empty shapes, built once: the descriptors as :func:`_packed_args`
+    builds them for contiguous tensors, with the data pointers (``allocated``
+    and ``aligned``) filled in per call."""
+
+    def __init__(self, args: Sequence[EntryArg]) -> None:
+        self.shapes = tuple(torch.Size(arg.shape) for arg in args)
+        self.strides = tuple(_contiguous_strides(arg.shape) for arg in args)
+        self.dtypes = tuple(arg.dtype for arg in args)
+        self.nbytes = tuple(math.prod(arg.shape) * arg.dtype.itemsize for arg in args)
+        self.inouts = tuple(i for i, arg in enumerate(args) if arg.role == "inout")
+        words: list[int] = []
+        slots: list[int] = []
+        for shape, strides in zip(self.shapes, self.strides, strict=True):
+            slots.append(len(words))
+            words += (0, 0, 0, *shape, *strides)
+        self.slots = tuple(slots)
+        descriptors = len(words)
+        self.buffer = (ctypes.c_int64 * (descriptors + 2 * len(args)))()
+        base = ctypes.addressof(self.buffer)
+        words += [base + _WORD * slot for slot in slots]
+        words += [base + _WORD * (descriptors + i) for i in range(len(args))]
+        self.buffer[:] = words
+        self.packed = base + _WORD * (descriptors + len(args))
+        self.lock = threading.Lock()
+
+    @classmethod
+    def build(cls, args: Sequence[EntryArg]) -> _StaticCall | None:
+        if not args or any(
+            arg.role == "scalar" or -1 in arg.shape or 0 in arg.shape for arg in args
+        ):
+            return None
+        return cls(args)
+
+
+def _contiguous_strides(shape: Sequence[int]) -> tuple[int, ...]:
+    """The strides torch gives a contiguous tensor of ``shape``."""
+    strides = []
+    step = 1
+    for size in reversed(shape):
+        strides.append(step)
+        step *= max(size, 1)
+    return tuple(reversed(strides))
+
 
 # The C type of each runtime scalar type the entry takes by value, and the
 # Python type its values are converted to (as ``torch.tensor(value, dtype)`` did).

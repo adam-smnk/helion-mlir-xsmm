@@ -96,6 +96,9 @@ class CpuTarget(MLIRTarget):
                 f"'{name}' is on {tensor.device}; only CPU is supported"
             )
 
+    def passes_in_place(self, tensor: torch.Tensor) -> bool:
+        return tensor.is_cpu
+
     def hardware_name(self) -> str:
         return cpu_name()
 

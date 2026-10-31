@@ -567,6 +567,143 @@ def _matmul_prepacked_vnni(
     return result
 
 
+def _matmul_prepacked_rows(
+    a: Tensor,
+    b3: Tensor,
+    bias2: Tensor | None,
+    epilogue: Callable[[Tensor], Tensor],
+    out: Tensor | None = None,
+) -> Tensor:
+    """``epilogue(a @ b + bias)`` of row-major ``a`` ``[M, K]``, read in place,
+    and ``b3``, B in contiguous column panels ``[N/BN, K, BN]`` (the layout of
+    :func:`pack_b_blocked_t`, viewed); ``bias2`` is ``[N/BN, BN]`` or ``None``.
+    Written into ``out`` (``[M, N/BN, BN]``) if given.
+
+    K runs in chunks (the last block size) small enough that a register tile's
+    panel chunk stays in L1 across the rows of the tile.
+    """
+    m, k = a.shape
+    panels, _, panel = b3.shape
+    k = hl.specialize(k)
+    panel = hl.specialize(panel)
+    hl.specialize(b3.size(1))
+    if out is None:
+        result = torch.empty((m, panels, panel), dtype=a.dtype, device=a.device)
+    else:
+        result = out
+    for tile_m, tile_p in hl.tile([m, panels]):
+        acc = hl.zeros([tile_m, tile_p, panel], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = acc + torch.einsum(
+                "mk,bkn->mbn", a[tile_m, tile_k], b3[tile_p, tile_k, :]
+            )
+        if bias2 is not None:
+            acc = acc + bias2[tile_p, :]
+        result[tile_m, tile_p, :] = epilogue(acc).to(a.dtype)
+    return result
+
+
+# K elements per chunk of :func:`_matmul_prepacked_rows`: a 256 x 32 f32 panel
+# chunk is 32 KiB, within the 48 KiB L1D, so it serves every 8-row register tile
+# of a 32-row tile from L1 (128x4096x4096 on EMR: 605 us; 512: 1140 us, the
+# chunk no longer fits; 128: 595 us).
+_ROWS_K_CHUNK = 256
+_ROWS_KERNELS: dict[int, helion.Kernel] = {}
+
+
+def _rows_bound(
+    a: Tensor,
+    b3: Tensor,
+    bias2: Tensor | None,
+    epilogue: Callable[[Tensor], Tensor],
+    out: Tensor | None = None,
+) -> BoundKernel:
+    """:func:`_matmul_prepacked_rows` of 32-row, one-panel tiles bound to the
+    operands (and ``out`` if given); cached like the fused kernel."""
+    m, k = map(int, a.shape)
+    panels, _, panel = map(int, b3.shape)
+    key = (
+        "rows",
+        m,
+        k,
+        panels * panel,
+        a.dtype,
+        a.device,
+        out is None,
+        bias2 is None,
+        epilogue,
+    )
+    if (cached := _FUSED_PACK_BOUND.get(key)) is None:
+        # The largest multiple of BK up to _ROWS_K_CHUNK dividing K: a ragged
+        # chunk would be masked.
+        chunk = next(c for c in range(_ROWS_K_CHUNK, 0, -BLOCK_K) if k % c == 0)
+        if chunk not in _ROWS_KERNELS:
+            _ROWS_KERNELS[chunk] = helion.kernel(
+                _matmul_prepacked_rows,
+                backend="mlir",
+                config=helion.Config(block_sizes=[BLOCK_M, 1, chunk]),
+                ignore_warnings=_OUT_CHECK_WARNINGS,
+            )
+        cached = _FUSED_PACK_BOUND[key] = (
+            _ROWS_KERNELS[chunk].bind((a, b3, bias2, epilogue, out)),
+            (),
+        )
+        if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
+            _FUSED_PACK_BOUND.popitem(last=False)
+    else:
+        _FUSED_PACK_BOUND.move_to_end(key)
+    return cached[0]
+
+
+def _rows_operands(
+    b4: Tensor, n: int, bias: Tensor | None
+) -> tuple[Tensor, Tensor | None]:
+    """``b4`` (:func:`pack_b_blocked_t`) as panels and ``bias`` as ``[N/BN, BN]``."""
+    blocks_n, blocks_k, _, _ = map(int, b4.shape)
+    n_pad = blocks_n * BLOCK_N
+    b3 = b4.view(blocks_n, blocks_k * BLOCK_K, BLOCK_N)
+    if bias is None:
+        return b3, None
+    row = bias.reshape(1, n)
+    return b3, (row if n == n_pad else pad_2d(row, 1, n_pad)).view(blocks_n, BLOCK_N)
+
+
+def _matmul_prepacked_rows_call(
+    a: Tensor,
+    b4: Tensor,
+    n: int,
+    bias: Tensor | None,
+    epilogue: Callable[[Tensor], Tensor],
+) -> Tensor:
+    """:func:`matmul_prepacked_b` of an f32 RHS packed by :func:`pack_b_blocked_t`
+    and an activation whose K is a whole number of blocks.
+
+    Rows past the last whole 32-row tile run as a second call, zero-padded to
+    a whole tile: a partial row tile would be masked.
+    """
+    m, k = map(int, a.shape)
+    b3, bias2 = _rows_operands(b4, n, bias)
+    n_pad = int(b3.shape[0]) * BLOCK_N
+    a = a.contiguous()
+    bulk = m // BLOCK_M * BLOCK_M
+    if bulk == m:
+        out = _rows_bound(a, b3, bias2, epilogue)(a, b3, bias2, epilogue)
+        out = out.view(m, n_pad)
+        return out if n == n_pad else out[:, :n]
+    out3 = torch.empty(
+        (bulk + BLOCK_M, int(b3.shape[0]), BLOCK_N), dtype=a.dtype, device=a.device
+    )
+    for rows, out_rows in (
+        (a[:bulk], out3[:bulk]),
+        (pad_2d(a[bulk:].contiguous(), BLOCK_M, k), out3[bulk:]),
+    ):
+        if rows.shape[0]:
+            bound = _rows_bound(rows, b3, bias2, epilogue, out_rows)
+            bound(rows, b3, bias2, epilogue, out_rows)
+    out = out3[:m].view(m, n_pad)
+    return out if n == n_pad else out[:, :n]
+
+
 _PREPACKED_KERNELS: dict[tuple[int, ...], helion.Kernel] = {}
 
 
@@ -836,6 +973,18 @@ def vnni_panel(m: int, n: int) -> int:
     rows, or one of all rows. Wider panels reuse each A row over more columns
     (1024x8192x8192: 64 columns 3118 us, 256: 2458)."""
     threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+    if m < _MIN_SHARED_ROWS:
+        # One row tile does not give every thread a tile, so the threads split
+        # the rows too. Each tile reads all K of its rows of A and of its panel,
+        # so its operand bytes grow with rows + columns; rows count twice, as A
+        # is read by every tile of its rows and is usually the previous layer's
+        # output, still in other cores' caches. 128x4096x4096 (MLP layers):
+        # 64-row x 128-column tiles 133 us per layer end to end, 128 x 64 (the
+        # rule below) 145 us, 32 x 256 156 us.
+        def cost(panel: int) -> int:
+            return 2 * _prepacked_tile_m(m, -(-n // panel), panel) + panel
+
+        return min((_VNNI_PANEL, 128, 256), key=cost)
     row_tiles = max(1, m // _MIN_SHARED_ROWS)
     for panel in (256, 128):
         if -(-n // panel) * row_tiles >= threads:
@@ -1107,6 +1256,12 @@ def matmul_prepacked_b(
             f"a.shape={tuple(a.shape)} and n={n}"
         )
 
+    if a.dtype == torch.float32 and k == k_pad:
+        if bias is not None and (bias.dim() != 1 or int(bias.shape[0]) != n):
+            raise ValueError(f"bias must have shape ({n},), got {tuple(bias.shape)}")
+        # A read in place: packing it per call costs a kernel (128x4096 f32:
+        # 8 us alone, 125 us right after the GEMM that wrote its buffer).
+        return _matmul_prepacked_rows_call(a, b4, n, bias, epilogue)
     a4 = pack_a_blocked(a, m_pad=m_pad, k_pad=k_pad)
     if bias is None:
         out4 = _matmul_blocked_kernel(a4, b4, epilogue)
@@ -1117,6 +1272,88 @@ def matmul_prepacked_b(
         bias3 = bias_padded.reshape(blocks_n, 1, BLOCK_N)
         out4 = _matmul_blocked_kernel_bias(a4, b4, bias3, epilogue)
     return out4.reshape(m_pad, n_pad)[:m, :n]
+
+
+def prepacked_b_call(
+    a: Tensor,
+    b4: Tensor,
+    n: int,
+    bias: Tensor | None = None,
+    epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
+) -> Callable[[Tensor], Tensor]:
+    """``lambda x: matmul_prepacked_b(x, b4, n, bias, epilogue)`` with the host
+    work of a call (operand views, tile choice, kernel lookup) done once, for
+    activations like ``a``: the same shape and dtype, contiguous; others, and
+    cases with partial row tiles, take :func:`matmul_prepacked_b`. Valid while
+    ``OMP_NUM_THREADS`` stays the same."""
+
+    def general(x: Tensor) -> Tensor:
+        return matmul_prepacked_b(x, b4, n, bias, epilogue)
+
+    # Operands matmul_prepacked_b rejects (or handles specially) take it.
+    if (
+        a.dim() != 2
+        or b4.dim() != 4
+        or a.dtype != b4.dtype
+        or a.device != b4.device
+        or (
+            bias is not None
+            and (bias.dim() != 1 or int(bias.shape[0]) != n or bias.device != a.device)
+        )
+    ):
+        return general
+    m, k = map(int, a.shape)
+    shape, dtype = a.shape, a.dtype
+    a = a.contiguous()
+    if b4.shape[-1] == 2:
+        panels, pairs_b, panel, _ = map(int, b4.shape)
+        n_pad = panels * panel
+        tile_m = _prepacked_tile_m(m, panels, panel)
+        if (
+            dtype != torch.bfloat16
+            or k % 2
+            or panel % BLOCK_N
+            or m % tile_m
+            or 2 * pairs_b != _round_up(k, 2 * _PANEL_PAIRS)
+            or _round_up(n, panel) != n_pad
+        ):
+            return general
+        bias2 = None
+        if bias is not None:
+            row = bias.reshape(1, n)
+            bias2 = (row if n == n_pad else pad_2d(row, 1, n_pad)).view(panels, panel)
+        pairs = (m, k // 2, 2)
+        bound, consts = _prepacked_bound(
+            a.view(pairs), b4, bias2, None, None, epilogue, tile_m
+        )
+
+        def run(x: Tensor) -> Tensor:
+            return bound(x.view(pairs), b4, bias2, None, None, epilogue, *consts)
+
+    else:
+        blocks_n, blocks_k, block_k, block_n = map(int, b4.shape)
+        n_pad = blocks_n * BLOCK_N
+        if (
+            dtype != torch.float32
+            or (block_k, block_n) != (BLOCK_K, BLOCK_N)
+            or blocks_k * BLOCK_K != k
+            or m % BLOCK_M
+            or _round_up(n, BLOCK_N) != n_pad
+        ):
+            return general
+        b3, bias2 = _rows_operands(b4, n, bias)
+        bound = _rows_bound(a, b3, bias2, epilogue)
+
+        def run(x: Tensor) -> Tensor:
+            return bound(x, b3, bias2, epilogue)
+
+    def call(x: Tensor) -> Tensor:
+        if x.shape != shape or x.dtype is not dtype or not x.is_contiguous():
+            return general(x)
+        out = run(x).view(m, n_pad)
+        return out if n == n_pad else out[:, :n]
+
+    return call
 
 
 def matmul_prepacked_b_affine(

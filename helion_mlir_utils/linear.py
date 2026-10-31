@@ -14,6 +14,7 @@ from .matmul import matmul
 from .matmul import matmul_prepacked_b
 from .matmul import pack_b_blocked_t
 from .matmul import pack_b_vnni_t
+from .matmul import prepacked_b_call
 from .matmul import vnni_panel
 
 if TYPE_CHECKING:
@@ -35,6 +36,8 @@ class LinearCache(NamedTuple):
     packed_weight: Tensor
     bias: Tensor | None
     out_features: int
+    call: tuple | None = None
+    """``(epilogue, OMP_NUM_THREADS, prepacked_b_call(...))`` of the last call."""
 
 
 class AffineLinearCache(NamedTuple):
@@ -118,17 +121,18 @@ def linear(
             bias,
             int(layer.out_features),
         )
-
-    return (
-        matmul_prepacked_b(
-            x,
-            cache.packed_weight,
-            n=cache.out_features,
-            bias=cache.bias,
-            epilogue=epilogue,
-        ),
-        cache,
-    )
+    # The call's host work (views, tile choice, kernel lookup) is done once:
+    # per call it costs about as much as a small layer's kernel.
+    threads = os.environ.get("OMP_NUM_THREADS")
+    prepared = cache.call
+    if prepared is None or prepared[0] is not epilogue or prepared[1] != threads:
+        call = prepacked_b_call(
+            x, cache.packed_weight, cache.out_features, cache.bias, epilogue
+        )
+        cache = cache._replace(call=(epilogue, threads, call))
+    else:
+        call = prepared[2]
+    return call(x), cache
 
 
 def linear_affine(

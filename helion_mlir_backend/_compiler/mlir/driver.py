@@ -7,6 +7,7 @@ memref-ABI entry (runtime scalars by value), then finishes the host code and ret
 
 from __future__ import annotations
 
+import keyword
 from typing import TYPE_CHECKING
 
 import sympy
@@ -91,13 +92,27 @@ def compile_kernel(
         else None
     )
 
+    # An argument named by a host local is looked up; others are evaluated.
+    local_names = [
+        arg.name
+        if arg.name.isidentifier() and not keyword.iskeyword(arg.name)
+        else None
+        for arg in entry.args
+    ]
+    arg_sources = list(zip(local_names, arg_exprs, strict=True))
+
     def run(*args: object) -> object:
         host = host_function(*args)
         try:
             local_vars = next(host)
             call_entry(
                 entry,
-                [eval(expr, host_globals, local_vars) for expr in arg_exprs],
+                [
+                    local_vars[name]
+                    if name is not None and name in local_vars
+                    else eval(expr, host_globals, local_vars)
+                    for name, expr in arg_sources
+                ],
                 symbolic_sizes,
             )
             next(host)
@@ -120,8 +135,12 @@ def call_entry(
     copied back for inouts). An input that overlaps an inout is cloned so the
     ``restrict`` arguments hold; overlapping inouts are rejected. Runtime scalars
     are passed by value. ``sizes`` (each argument's size expressions) lets runtime
-    sizes the kernel assumes equal be checked.
+    sizes the kernel assumes equal be checked. Calls that need none of this
+    (:meth:`CompiledEntry.call_in_place`) skip it: per-call host time is a large
+    part of a small kernel's time.
     """
+    if sizes is None and (inouts := entry.call_in_place(values)) is not None:
+        return inouts
     target = entry.target
     tensors = [
         _checked_tensor(target, arg, value)
@@ -147,7 +166,12 @@ def call_entry(
                 reason="each written tensor must be its own buffer",
             )
     staged = [
-        tensor.clone(memory_format=torch.contiguous_format)
+        # A negative or conjugate view's storage holds the values unnegated
+        # (unconjugated): the kernel gets a materialized copy (written back
+        # for inouts), which never aliases an inout.
+        tensor.resolve_conj().resolve_neg().contiguous()
+        if tensor.is_neg() or tensor.is_conj()
+        else tensor.clone(memory_format=torch.contiguous_format)
         if role == "in" and _overlaps_any(tensor, inout_spans)
         else tensor.contiguous()
         for tensor, role in zip(tensors, roles, strict=True)
