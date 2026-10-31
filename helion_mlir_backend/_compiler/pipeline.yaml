@@ -13,6 +13,8 @@ Pipeline:
   # for static sizes), else bufferization copies the region into a heap buffer
   # before every tile, full ones too.
   - schedule: "helion_transforms.py[gen=fold_full_insert_slices]"
+  ## Outputs a top-level parallel loop overwrites whole, for first_touch_outputs.
+  - schedule: "helion_transforms.py[gen=mark_overwritten_args]"
 
   # Based on Lighthouse's x86 pipeline.
   # Skips packing as the entry-level IR from Helion already contains parallel loops.
@@ -126,6 +128,9 @@ Pipeline:
   - schedule: "helion_transforms.py[gen=split_copies]"
   - schedule: "helion_transforms.py[gen=split_transfers]"
   - schedule: "omp.py[gen=parallelize]"
+  ## A fresh output's pages faulted in by each thread in a contiguous slice before
+  ## the loop writing it: else dozens of threads zero the same huge pages at once.
+  - schedule: "helion_transforms.py[gen=first_touch_outputs]"
   # Accumulator reads' subviews fitted to the register tile, which the AMX
   # rewrite of a K loop takes them for.
   - schedule: "helion_transforms.py[gen=amx_move_offsets]"

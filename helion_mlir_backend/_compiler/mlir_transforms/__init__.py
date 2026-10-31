@@ -8,6 +8,9 @@ from .align_operand_rows import align_operand_rows
 from .carry_loop_inits import carry_loop_inits
 from .dialect import HelionTransformDialect
 from .drop_accumulator_read_unit_dims import drop_accumulator_read_unit_dims
+from .first_touch import OVERWRITTEN_ATTR_NAME
+from .first_touch import first_touch_outputs
+from .first_touch import mark_overwritten_args
 from .fit_subviews_to_reads import fit_subviews_to_reads
 from .fold_full_insert_slices import fold_full_insert_slices
 from .fold_loop_unit_dims import fold_loop_unit_dims
@@ -52,11 +55,13 @@ from .xegpu_reduction import match_row_result_stores
 __all__ = [
     "AMX_OFF_ATTR_NAME",
     "OPERAND_PACK_ATTR_NAME",
+    "OVERWRITTEN_ATTR_NAME",
     "HelionTransformDialect",
     "InferXeGPUElementwiseLayoutOp",
     "align_operand_rows",
     "carry_loop_inits",
     "drop_accumulator_read_unit_dims",
+    "first_touch_outputs",
     "fit_subviews_to_reads",
     "fold_full_insert_slices",
     "fold_loop_unit_dims",
@@ -72,6 +77,7 @@ __all__ = [
     "map_elementwise_grid",
     "map_grid_columns_first",
     "mark_operand_packs",
+    "mark_overwritten_args",
     "match_row_result_stores",
     "match_scalar_contractions",
     "materialize_copies",

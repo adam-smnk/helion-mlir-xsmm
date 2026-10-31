@@ -19,6 +19,9 @@ from mlir.dialects.transform import vector as transform_vector
 from mlir.dialects.transform import x86 as transform_x86
 
 from helion_mlir_backend._compiler import mlir_transforms as ht
+from helion_mlir_backend._compiler.mlir_transforms.first_touch import (
+    MIN_BYTES as FIRST_TOUCH_MIN_BYTES,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -353,6 +356,31 @@ def isolate_operand_packs() -> ir.Module:
             size = ht.outer_transpose_tile(pack)
             structured.TileUsingForOp(pack, sizes=[size])
             transform.yield_()
+        transform.yield_()
+    return schedule
+
+
+def mark_overwritten_args() -> ir.Module:
+    """Schedule: mark the arguments each function's top-level parallel loop
+    overwrites whole, for ``first_touch_outputs``."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.mark_overwritten_args(funcs)
+        transform.yield_()
+    return schedule
+
+
+def first_touch_outputs(min_bytes: int = FIRST_TOUCH_MIN_BYTES) -> ir.Module:
+    """Schedule: the pages of outputs marked by ``mark_overwritten_args`` (of at
+    least ``min_bytes``) touched by each thread in a contiguous slice at the
+    start of the OpenMP region first writing them: faulting a fresh output in,
+    dozens of threads then neither zero the same huge page nor contend on one
+    page table lock."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.first_touch_outputs(funcs, min_bytes)
         transform.yield_()
     return schedule
 
