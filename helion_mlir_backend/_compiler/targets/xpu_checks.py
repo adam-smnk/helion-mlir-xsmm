@@ -32,6 +32,7 @@ from mlir.dialects import linalg
 from ..mlir.support.errors import UnsupportedOperationError
 from .xpu_params import ATTENTION_D_HEAD
 from .xpu_params import ElementwiseShape
+from .xpu_params import GemmShape
 from .xpu_params import attention_shape
 from .xpu_params import kernel_shape
 
@@ -342,6 +343,8 @@ def _check_kernel_class(loop: ir.Operation) -> None:
     if not contractions and not reductions:
         _check_elementwise(loop)
         return
+    if len(contractions) == 1 and reductions:
+        _check_matmul_and_reduction(loop)
     if len(contractions) == 2:
         _check_attention(contractions, loop)
     elif len(contractions) > 2:
@@ -356,6 +359,27 @@ def _check_kernel_class(loop: ir.Operation) -> None:
         )
     for contraction in contractions:
         _check_contraction(contraction, loop)
+
+
+def _check_matmul_and_reduction(loop: ir.Operation) -> None:
+    """A matmul and a row reduction in one grid loop: lighthouse's annotation tries
+    its attention layout on them, which asserts a contracted tile of 64, and with
+    such a tile falls to the GEMM annotation with a reduction it does not lay out:
+    180 of 256 rows wrong on the B50, silently."""
+    shape = kernel_shape(loop)
+    if isinstance(shape, GemmShape):
+        raise UnsupportedOperationError(
+            "a matmul and a row reduction in one grid loop on XPU",
+            reason=(
+                "lighthouse's layout annotation has no form for them: its attention "
+                f"layout asserts a contracted tile of {ATTENTION_D_HEAD}, and its "
+                "GEMM layout leaves most rows of the reduction wrong"
+            ),
+            alternatives=[
+                "the reduction in its own top-level hl.tile loop, after hl.barrier()",
+                _CPU,
+            ],
+        )
 
 
 def _check_attention(contractions: list[ir.OpView], loop: ir.Operation) -> None:

@@ -28,7 +28,7 @@ from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
 from helion_mlir_backend._compiler.mlir.support import MLIRBackendError
 from helion_mlir_backend._compiler.targets import get_target
 from helion_mlir_backend._compiler.targets import xpu
-from helion_mlir_backend._compiler.targets.xpu_params import XEGPU_CONFIG_KEYS
+from helion_mlir_backend._compiler.targets.xpu_params import XPU_CONFIG_KEYS
 from helion_mlir_backend._compiler.targets.xpu_search import ATTENTION as ATTENTION_KIND
 from helion_mlir_backend._compiler.targets.xpu_search import KernelChoicesFragment
 from helion_mlir_backend._compiler.targets.xpu_search import search_kernels
@@ -81,7 +81,7 @@ def test_sampled_configs_lower_or_are_skipped(name: str) -> None:
     default = spec.default_config()
     assert all(
         all(entry is None for entry in default.config[key])
-        for key in XEGPU_CONFIG_KEYS & default.config.keys()
+        for key in XPU_CONFIG_KEYS & default.config.keys()
     )
     outcomes = []
     configs = [default, *_samples(spec, SAMPLES)]
@@ -143,8 +143,8 @@ def test_xegpu_fragments_on_the_xpu_only() -> None:
     cpu = env.config_spec
     before = [(b.min_size, b.max_size) for b in cpu.block_sizes]
     get_target("cpu").adjust_config_spec(cpu, hf.device_ir)
-    assert not XEGPU_CONFIG_KEYS & set(cpu._flat_fields())
-    assert not XEGPU_CONFIG_KEYS & cpu.default_config().config.keys()
+    assert not XPU_CONFIG_KEYS & set(cpu._flat_fields())
+    assert not XPU_CONFIG_KEYS & cpu.default_config().config.keys()
     assert [b.max_size for b in cpu.block_sizes] == [high for _, high in before]
 
 
@@ -222,9 +222,9 @@ def test_leading_blocks_are_unit(name: str) -> None:
 def test_attention_is_classified_and_its_default_lowers() -> None:
     """The flash-attention kernel (two contractions in its K/V loop, which a
     reduction reduces in) is its own class: query rows 16..512 (16-row
-    subgroups, at most 32), K/V tiles 32..64 (whole V load blocks, the K/V tile
-    in registers), lighthouse's 128 x 64 as the default, and its subgroup
-    rows searched."""
+    subgroups, at most 32), K/V tiles 32..128 (whole V load blocks; 256 rows take
+    twice as long), lighthouse's 128 x 64 as the default, and its subgroup rows
+    searched."""
     problem = _PROBLEMS[ATTENTION]
     hf, _, env = _compile(problem.kernel, _args(problem), None)
     spec = env.config_spec
@@ -232,9 +232,9 @@ def test_attention_is_classified_and_its_default_lowers() -> None:
     assert kernel.kind == ATTENTION_KIND
     get_target("xpu").adjust_config_spec(spec, hf.device_ir)
     bounds = [(block.min_size, block.max_size) for block in spec.block_sizes]
-    assert bounds == [(1, 1), (1, 1), (16, 512), (32, 64)]
+    assert bounds == [(1, 1), (1, 1), (16, 512), (32, 128)]
     default = spec.default_config()
-    assert default.config["block_sizes"] == problem.block_sizes
+    assert default.config["block_sizes"] == [1, 1, 128, 64]
     assert spec._flat_fields()["xegpu_sg_tiles"].choices == ((None, [32, 0]),)
     text = str(
         lower_mlir(

@@ -27,8 +27,11 @@ import torch.nn.functional as F
 
 from tests import kernelbench_xpu as kb
 from tests.harness import xpu_tensor
+from tests.igc_dumps import igc_dump_problems
+from tests.igc_dumps import narrow_minmax
 
 from helion_mlir_backend import lower_mlir
+from helion_mlir_backend._compiler import xpu_transforms
 from helion_mlir_backend._compiler.targets.xpu import bindings_emit_spirv
 
 pytestmark = pytest.mark.isolated
@@ -198,7 +201,9 @@ def hardtanh_of_relu(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 def clamp_of_clamp(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
     """A guarded maximum between the selects, which IGC folds."""
     for tile in hl.tile(x.shape):
-        out[tile] = torch.clamp(torch.clamp(x[tile], min=torch.zeros_like(x[tile])), max=1.0)
+        out[tile] = torch.clamp(
+            torch.clamp(x[tile], min=torch.zeros_like(x[tile])), max=1.0
+        )
     return out
 
 
@@ -214,8 +219,14 @@ UNIT_CLAMPS = {
     "method": (method, lambda x: x.clamp(0.0, 1.0)),
     "clip": (clip, lambda x: x.clip(0.0, 1.0)),
     "hardtanh": (hardtanh, lambda x: F.hardtanh(x, 0.0, 1.0)),
-    "min_then_max": (min_then_max, lambda x: torch.clamp_max(torch.clamp_min(x, 0.0), 1.0)),
-    "max_then_min": (max_then_min, lambda x: torch.clamp_min(torch.clamp_max(x, 1.0), 0.0)),
+    "min_then_max": (
+        min_then_max,
+        lambda x: torch.clamp_max(torch.clamp_min(x, 0.0), 1.0),
+    ),
+    "max_then_min": (
+        max_then_min,
+        lambda x: torch.clamp_min(torch.clamp_max(x, 1.0), 0.0),
+    ),
     "scaled": (scaled, lambda x: torch.clamp(x * 2.0, 0.0, 1.0)),
     "hardtanh_of_relu": (hardtanh_of_relu, lambda x: F.hardtanh(F.relu(x))),
     "clamp_of_clamp": (
@@ -294,33 +305,6 @@ def _igc_dump(
     return directory
 
 
-_DECL = re.compile(r"\s*\.decl (V\d+) .*?num_elts=(\d+)(?:.*?alias=<(V\d+),)?")
-_NARROW = re.compile(r"\s*(?:max|min)(?:\.\w+)?\s*\([^,)]*,?\s*1\)\s*(V\d+)\(")
-
-
-def narrow_minmax(visaasm: pathlib.Path) -> list[str]:
-    """Size-1 min/max instructions into a variable of several elements: how IGC
-    emits a vector compare and select it takes for a min/max (``IGC_OPTIONS``)."""
-    elements: dict[str, int] = {}
-    alias: dict[str, str] = {}
-    found: list[str] = []
-    lines = visaasm.read_text(errors="replace").splitlines()
-    for line in lines:
-        if match := _DECL.match(line):
-            elements[match[1]] = int(match[2])
-            if match[3]:
-                alias[match[1]] = match[3]
-    for line in lines:
-        if not (match := _NARROW.match(line.split("///")[0])):
-            continue
-        variable = match[1]
-        while variable in alias:
-            variable = alias[variable]
-        if elements.get(variable, 1) > 1:
-            found.append(line.strip())
-    return found
-
-
 def _problem(prefix: str) -> tuple[helion.Kernel, list[object], helion.Config]:
     problems = (*kb.PROBLEMS, *kb.RANK3_PROBLEMS, *kb.LEVEL2_PROBLEMS)
     problem = next(p for p in problems if p.name.startswith(prefix))
@@ -359,13 +343,206 @@ def test_problems_have_no_narrow_minmax_and_use_all_registers(
         text = visaasm.read_text(errors="replace")
         assert "-TotalGRFNum 256" in text, visaasm.name
         assert narrow_minmax(visaasm) == [], visaasm.name
+    _assert_options_in_force(dump, cmp=bool(_entries(config, "igc_vectorizer")))
+
+
+def _entries(config: helion.Config | None, key: str) -> list[object]:
+    return (
+        [item for item in (config.config.get(key) or ()) if item == "cmp"]
+        if config
+        else []
+    )
+
+
+def _assert_options_in_force(dump: pathlib.Path, *, cmp: bool) -> None:
+    """IGC's command line has the option: one that reaches only ``_options.txt`` is
+    lost (a tool preloaded into ``ocloc``, a libocloc build of LLVM, ...), and
+    without it no vectorized code in an ``"off"`` binary."""
     options = [path.read_text() for path in dump.glob("*_options.txt")]
     assert any("-ze-opt-large-register-file" in text for text in options)
-    assert any("EnableVectorizer=0" in text for text in options)
-    optimized = list(dump.glob("*_optimized.ll"))
-    assert optimized
-    for path in optimized:
-        assert "vectorized_" not in path.read_text(errors="replace"), path.name
+    wanted = "VectorizerAllowCMP=0" if cmp else "EnableVectorizer=0"
+    other = "EnableVectorizer=0" if cmp else "VectorizerAllowCMP=0"
+    commands = [path.read_text(errors="replace") for path in dump.glob("*_cmd.txt")]
+    assert any(wanted in text for text in commands)
+    assert not any(other in text for text in commands)
+    if not cmp:
+        optimized = list(dump.glob("*_optimized.ll"))
+        assert optimized
+        for path in optimized:
+            assert "vectorized_" not in path.read_text(errors="replace"), path.name
+
+
+@BINARIES
+@pytest.mark.parametrize("vectorizer", ["off", "cmp", None])
+def test_vectorizer_choice_reaches_igc(
+    vectorizer: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """``igc_vectorizer``: the kernel's choice on IGC's command line, ``"off"`` the
+    default, on a kernel with no other reason to be checked."""
+    problem = next(p for p in kb.PROBLEMS if p.name.startswith("1_Square"))
+    config = helion.Config(
+        block_sizes=problem.block_sizes,
+        **problem.xegpu,
+        **({"igc_vectorizer": [vectorizer]} if vectorizer else {}),
+    )
+    args = [xpu_tensor(*shape, dtype=problem.dtype) for shape in problem.shapes]
+    dump = _igc_dump(monkeypatch, tmp_path, problem.kernel, args, config)
+    _assert_options_in_force(dump, cmp=vectorizer == "cmp")
+
+
+def _two_elementwise(x: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
+    for tile in hl.tile(x.shape):
+        a[tile] = torch.exp(x[tile].to(F32)) * 3.0
+    hl.barrier()
+    for tile in hl.tile(x.shape):
+        b[tile] = torch.exp(x[tile].to(F32)) * 5.0
+
+
+_THREE = re.compile(r"3\.000000e\+00|0x4008000000000000")
+_FIVE = re.compile(r"5\.000000e\+00|0x4014000000000000")
+
+
+@BINARIES
+@pytest.mark.parametrize(
+    "choices", [["cmp", None], [None, "cmp"]], ids=["first", "second"]
+)
+def test_vectorizer_choice_is_per_kernel(
+    choices: list[str | None], monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Each GPU module compiles with its own options: the module multiplying by 3 or
+    by 5, told by its constant in IGC's IR, has its entry's key on IGC's command line."""
+    config = helion.Config(block_sizes=[64, 64, 64, 64], igc_vectorizer=choices)
+    kernel = helion.kernel(_two_elementwise, backend="mlir", static_shapes=True)
+    args = [xpu_tensor(256, 256, dtype=F32) for _ in range(3)]
+    dump = _igc_dump(monkeypatch, tmp_path, kernel, args, config)
+    seen = {}
+    for command in dump.glob("*_cmd.txt"):
+        codegen = pathlib.Path(str(command)[: -len("_cmd.txt")] + "_codegen.ll")
+        if not codegen.exists():
+            continue
+        text = codegen.read_text(errors="replace")
+        module = 0 if _THREE.search(text) else 1 if _FIVE.search(text) else None
+        if module is None:
+            continue
+        keys = command.read_text(errors="replace")
+        seen[module] = (
+            "cmp" if "VectorizerAllowCMP" in keys else None,
+            "EnableVectorizer" in keys,
+        )
+    assert set(seen) == {0, 1}
+    for module, choice in enumerate(choices):
+        assert seen[module] == (choice, choice is None), module
+
+
+def _lost_options(monkeypatch: pytest.MonkeyPatch) -> None:
+    """As a tool that drops ``-igc_opts`` does."""
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")
+    for name in ("IGC_OPTIONS", "IGC_OPTIONS_CMP"):
+        monkeypatch.setattr(xpu_transforms, name, "-ze-opt-large-register-file")
+
+
+def _attention_kernel(**config: object) -> tuple[helion.Kernel, list[object]]:
+    problem = _attention_problem()
+    kernel = helion.kernel(
+        kb.attention,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=problem.block_sizes, **config),
+    )
+    return kernel, [xpu_tensor(2, 2, 512, 64, dtype=BF16) for _ in range(3)]
+
+
+def _dump_problems(dump: pathlib.Path) -> list[str]:
+    return igc_dump_problems(sorted(dump.iterdir()))
+
+
+@BINARIES
+def test_lost_igc_options_show_in_the_binary_with_nan_ignoring_maxima(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Without the options these kernels gave up to half of their rows NaN (a default
+    ``unitrace`` drops ``-igc_opts``). The scan finds it, so the tests below say
+    something."""
+    _lost_options(monkeypatch)
+    kernel, args = _attention_kernel(xegpu_nan_ignoring_maxima=[True])
+    assert _dump_problems(_igc_dump(monkeypatch, tmp_path, kernel, args)) != []
+
+
+@BINARIES
+def test_lost_igc_options_do_not_matter_without_the_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The negative: NaN-propagating maxima do not take that path."""
+    _lost_options(monkeypatch)
+    kernel, args = _attention_kernel()
+    assert _dump_problems(_igc_dump(monkeypatch, tmp_path, kernel, args)) == []
+
+
+def _rounded_sine(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """A scalar builtin's result straight into a conversion to 16 bits."""
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.sin(x[tile].to(F32)).to(out.dtype)
+    return out
+
+
+@BINARIES
+def test_vectorizer_cmp_shows_the_fptrunc_miscompile_there(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """``igc_vectorizer="cmp"`` on the form of ``VectorizerAllowFPTRUNC``'s bug: a use
+    before its def in IGC's IR, stale registers in the output. It is what a kernel
+    must not choose. The negative: the default."""
+    kernel = helion.kernel(_rounded_sine, backend="mlir", static_shapes=True)
+    args = [xpu_tensor(64, 512, dtype=BF16), xpu_tensor(64, 512, dtype=BF16)]
+    for choice, wrong in (("cmp", True), ("off", False)):
+        directory = tmp_path / choice
+        directory.mkdir()
+        config = helion.Config(block_sizes=[32, 256], igc_vectorizer=[choice])
+        dump = _igc_dump(monkeypatch, directory, kernel, args, config)
+        assert bool(_dump_problems(dump)) == wrong
+
+
+@BINARIES
+@pytest.mark.parametrize(
+    "prefix", ["97_", "29_Softplus", "29_Matmul_Mish_Mish", "81_Gemm_Swish"]
+)
+def test_kernels_that_choose_the_vectorizer_show_no_known_miscompile(
+    prefix: str, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """Their binaries as built, with this IGC."""
+    kernel, args, config = _problem(prefix)
+    assert config.config["igc_vectorizer"] == ["cmp"]
+    assert _dump_problems(_igc_dump(monkeypatch, tmp_path, kernel, args, config)) == []
+
+
+def test_igc_dump_problems(tmp_path: pathlib.Path) -> None:
+    """The check itself: a vector compare in IGC's final IR, a use before its def in
+    its optimized IR (fptrunc before the inserts), and no vISA at all."""
+    assert igc_dump_problems([]) == ["IGC wrote no vISA to check"]
+    visa = tmp_path / "k.visaasm"
+    visa.write_text(".decl V1 v_type=G type=f num_elts=1 align=dword\n")
+    assert igc_dump_problems([visa]) == []
+    codegen = tmp_path / "k_codegen.ll"
+    codegen.write_text("%c = fcmp ogt <8 x float> %a, %b\n")
+    assert igc_dump_problems([visa, codegen]) == ["k_codegen.ll: fcmp ogt <8 x float>"]
+    codegen.write_text("%c = fcmp ogt float %a, %b\n")
+    assert igc_dump_problems([visa, codegen]) == []
+    optimized = tmp_path / "k_optimized.ll"
+    optimized.write_text(
+        "define void @k() {\n"
+        "entry:\n"
+        "  %c = fptrunc <8 x float> %v to <8 x bfloat>\n"
+        "  %v = insertelement <8 x float> %u, float %f, i32 7\n"
+        "  br label %next\n"
+        "next:\n"
+        "  %p = phi float [ %q, %next ]\n"
+        "  %q = fadd float %p, %p\n"
+        "  ret void\n"
+        "}\n"
+    )
+    assert igc_dump_problems([visa, optimized]) == [
+        "k_optimized.ll: %c = fptrunc <8 x float> %v to <8 x bfloat>"
+    ]
 
 
 @BINARIES

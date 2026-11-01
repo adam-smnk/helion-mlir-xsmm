@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import importlib.util
 import io
 import re
+from typing import TYPE_CHECKING
 from unittest import mock
 
 import helion
@@ -41,6 +43,9 @@ from helion_mlir_backend._compiler.targets.xpu import XpuLowering
 from helion_mlir_backend._compiler.targets.xpu import _translated
 from helion_mlir_backend._compiler.targets.xpu import bindings_emit_spirv
 from helion_mlir_backend._compiler.targets.xpu_params import AttentionShape
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 N = 1024
 GEMM = helion.Config(block_sizes=[256, 256, 32])
@@ -783,6 +788,534 @@ def test_maximum_reductions_propagate_nan() -> None:
     assert "maxnumf" not in text
     assert "llvm.intr.maximum" in lowered
     assert "llvm.intr.maxnum" not in lowered
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("xegpu", "ignored"),
+    [({"xegpu_nan_ignoring_maxima": [True]}, True), ({}, False)],
+)
+def test_attention_row_maxima_forms(xegpu: dict[str, object], ignored: bool) -> None:
+    """``xegpu_nan_ignoring_maxima``: the reductions stay as lighthouse vectorizes
+    them; without it they propagate NaN, as ``amax`` elsewhere."""
+    text, lowered = lower_xpu_stages(
+        *_attention_case((2, 2, 512, 64), [1, 1, 128, 64], **xegpu)
+    )
+    assert ("vector.multi_reduction <maxnumf>" in text) == ignored
+    assert ("vector.multi_reduction <maximumf>" in text) != ignored
+    assert ("llvm.intr.maxnum" in lowered) == ignored
+    assert ("llvm.intr.maximum" in lowered) != ignored
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ([1], r"xegpu_nan_ignoring_maxima\[0\]=1: expected True or None"),
+        ([False], r"xegpu_nan_ignoring_maxima\[0\]=False: expected True or None"),
+        (True, r"xegpu_nan_ignoring_maxima=True: expected a list"),
+    ],
+)
+def test_nan_ignoring_maxima_malformed(value: object, match: str) -> None:
+    config = helion.Config(block_sizes=[1, 1, 128, 64], xegpu_nan_ignoring_maxima=value)
+    args = [xpu_tensor(2, 2, 512, 64, dtype=torch.bfloat16) for _ in range(3)]
+    with pytest.raises(XeGPUConfigError, match=match):
+        lower_xpu(_kernel(config)(attention), args)
+
+
+def attention_and_row_maximum(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attention, and its running maximum as a second output: a NaN there counts."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    maximum = torch.empty(batch, heads, m, 1, dtype=torch.float32, device=q.device)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+        maximum[tb, th, tm, :] = row_max[:, :, :, None]
+    return out, maximum
+
+
+def attention_and_output_maximum(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attention, and the maximum of each output row as a second output."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    maximum = torch.empty(batch, heads, m, 1, dtype=torch.float32, device=q.device)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        result = acc / row_sum[:, :, :, None]
+        out[tb, th, tm, :] = result.to(out.dtype)
+        maximum[tb, th, tm, :] = result.amax(-1)[:, :, :, None]
+    return out, maximum
+
+
+def attention_hard(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Hard attention: P is 1 where the score equals the running maximum."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = (scores >= new_max[:, :, :, None]).to(torch.float32)
+            alpha = (row_max >= new_max).to(torch.float32)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+
+
+def attention_row_gate(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """The maximum gates each output row."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        gate = (row_max > 0.0).to(torch.float32)[:, :, :, None]
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None] * gate).to(out.dtype)
+    return out
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("fn", "ignoring", "propagating"),
+    [
+        (attention, 1, 0),
+        (attention_and_row_maximum, 0, 1),
+        (attention_and_output_maximum, 1, 1),
+        (attention_hard, 0, 1),
+        (attention_row_gate, 0, 1),
+    ],
+    ids=["softmax", "stored", "output-row", "hard", "row-gate"],
+)
+def test_key_applies_to_reductions_that_only_shift(
+    fn: object, ignoring: int, propagating: int
+) -> None:
+    """``row_maxima``: of a kernel with the key, only reductions that reach nothing
+    but the running maximum and ``exp(s - m)`` ignore NaN. To ``xegpu-wg``: the last
+    two hang further down (not from this)."""
+    config = helion.Config(
+        block_sizes=[1, 1, 128, 64], xegpu_nan_ignoring_maxima=[True]
+    )
+    args = [xpu_tensor(2, 2, 512, 64, dtype=torch.bfloat16) for _ in range(3)]
+    text = lower_xpu(_kernel(config)(fn), args)
+    assert text.count("<maxnumf>") == ignoring
+    assert text.count("<maximumf>") == propagating
+
+
+_TILE_EXPRESSION_KERNEL = """
+import helion.language as hl
+import torch
+
+
+def tile_expression(q, k, v):
+    batch, heads, m, d = q.shape
+    group = heads // k.size(1)
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m], block_size=[1, 1, None]):
+        k_head = EXPRESSION
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum(
+                "bhmd,bnd->bhmn", q_tile, k[tb, k_head, tn, :]
+            )
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bnd->bhmd", p.to(v.dtype), v[tb, k_head, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+"""
+TILE_EXPRESSIONS = {
+    "fdiv": ("th.begin // group", lambda h: h // 4),
+    "plus-minus": ("(th.begin + group) // group - 1", lambda h: (h + 4) // 4 - 1),
+    "end": ("(th.end - 1) // group", lambda h: h // 4),
+    "id": ("th.id // group", lambda h: h // 4),
+    "flip": ("1 - th.begin // group", lambda h: 1 - h // 4),
+    "times": ("(th.begin * 3) // (group * 3)", lambda h: (h * 3) // 12),
+    "nested": ("(th.begin // 2) // 2", lambda h: (h // 2) // 2),
+}
+"""Tile position arithmetic above an inner loop: source, and what it gives for a query
+head of the (2, 8, 256, 64) test shape."""
+
+
+def tile_expression_kernel(directory: Path, expression: str) -> object:
+    """The kernel with K/V head ``expression``, from a file: Helion reads the source."""
+    path = directory / "tile_expression.py"
+    path.write_text(_TILE_EXPRESSION_KERNEL.replace("EXPRESSION", expression))
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.tile_expression
+
+
+def _tile_expression_args() -> list[object]:
+    return [
+        xpu_tensor(2, 8, 256, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+    ]
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("expression", list(TILE_EXPRESSIONS))
+def test_tile_expressions_above_an_inner_loop_lower(
+    expression: str, tmp_path: Path
+) -> None:
+    fn = tile_expression_kernel(tmp_path, TILE_EXPRESSIONS[expression][0])
+    config = helion.Config(block_sizes=[256, 64])
+    assert "xegpu.dpas" in lower_xpu(_kernel(config)(fn), _tile_expression_args())
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    "expression",
+    ["th.begin % 2", "(th.begin // group) * (th.begin // group)"],
+    ids=["mod", "square"],
+)
+def test_other_tile_expressions_are_a_clear_error(
+    expression: str, tmp_path: Path
+) -> None:
+    """Negative: not "Value not found for node: symnode"."""
+    fn = tile_expression_kernel(tmp_path, expression)
+    config = helion.Config(block_sizes=[256, 64])
+    with pytest.raises(UnsupportedOperationError, match="tile expression"):
+        lower_xpu(_kernel(config)(fn), _tile_expression_args())
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        (["on"], r"igc_vectorizer\[0\]='on': expected \"off\", \"cmp\" or None"),
+        ([True], r"igc_vectorizer\[0\]=True: expected"),
+        ("cmp", r"igc_vectorizer='cmp': expected a list"),
+    ],
+)
+def test_vectorizer_malformed(value: object, match: str) -> None:
+    config = helion.Config(block_sizes=[64, 64], igc_vectorizer=value)
+    args = [xpu_tensor(256, 512, dtype=torch.bfloat16)]
+    with pytest.raises(XeGPUConfigError, match=match):
+        lower_xpu_stages(row_amax, args, config=config)
+
+
+@pytest.mark.isolated
+def test_vectorizer_choice_differs_in_the_module() -> None:
+    """Part of the module, so of the JIT cache key: the two compile separately."""
+    config = helion.Config(block_sizes=[256, 256, 32])
+    texts = []
+    for xegpu in ({}, {"igc_vectorizer": ["cmp"]}):
+        module = generate_mlir(matmul, _gemm_args(), config=config)
+        get_target("xpu").configure(module, xegpu)
+        texts.append(str(module))
+    assert texts[0] != texts[1]
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("q_shape", "blocks"),
+    [((1, 1, 128, 64), [1, 1, 128, 64]), ((1, 1, 512, 64), [1, 1, 512, 64])],
+)
+def test_one_workgroup_with_per_kernel_keys_is_a_clear_error(
+    q_shape: tuple[int, ...], blocks: list[int]
+) -> None:
+    """Regression: "lists of 1 entries, but the kernel has 0 GPU kernel(s)", as the
+    tile of the whole shape leaves no grid loop."""
+    config = helion.Config(block_sizes=blocks, igc_vectorizer=["cmp"])
+    args = [xpu_tensor(*q_shape, dtype=torch.bfloat16) for _ in range(3)]
+    with pytest.raises(XeGPUConfigError, match="no grid loop is left"):
+        lower_xpu_stages(_kernel(config)(attention), args)
+
+
+@pytest.mark.isolated
+def test_nan_ignoring_maxima_is_for_attention() -> None:
+    """Elsewhere a row maximum is a result: its NaN would be lost."""
+    config = helion.Config(block_sizes=[64, 64], xegpu_nan_ignoring_maxima=[True])
+    args = [xpu_tensor(256, 512, dtype=torch.bfloat16)]
+    with pytest.raises(XeGPUConfigError, match=r"applies to attention kernels"):
+        lower_xpu_stages(row_amax, args, config=config)
+
+
+@pytest.mark.isolated
+def test_lane_reductions_check_accepts_both_forms() -> None:
+    """Both forms of the row maxima reduce over all 16 lanes
+    (``check_lane_reductions``, at the end of the ``xevm`` stage)."""
+    for xegpu in ({"xegpu_nan_ignoring_maxima": [True]}, {}):
+        _, lowered = lower_xpu_stages(
+            *_attention_case((2, 2, 512, 64), [1, 1, 128, 64], **xegpu)
+        )
+        assert "_Z21sub_group_shuffle_xorfj" in lowered
+
+
+def two_attention_kernels(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two attention kernels (grid loops), one after the other."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    first = torch.empty_like(q)
+    second = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        first[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(first.dtype)
+    hl.barrier()
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        second[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(second.dtype)
+    return first, second
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("entries", "first", "second"),
+    [([True, None], True, False), ([None, True], False, True)],
+)
+def test_nan_ignoring_maxima_is_per_kernel(
+    entries: list[object], first: bool, second: bool
+) -> None:
+    """One entry per kernel: the other kernel keeps NaN-propagating maxima."""
+    args = [xpu_tensor(2, 2, 512, 64, dtype=torch.bfloat16) for _ in range(3)]
+    config = helion.Config(
+        block_sizes=[1, 1, 128, 64] * 2, xegpu_nan_ignoring_maxima=entries
+    )
+    text, _ = lower_xpu_stages(_kernel(config)(two_attention_kernels), args)
+    modules = re.split(r"gpu\.module @", text)[1:]
+    assert len(modules) == 2
+    for module, ignored in zip(modules, (first, second), strict=True):
+        assert ("<maxnumf>" in module) == ignored, module[:200]
+        assert ("<maximumf>" in module) != ignored, module[:200]
+
+
+def attention_runtime_scale(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Attention with its scale a runtime float (the tile times its fill, a named
+    elementwise op)."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * scale
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+
+
+def attention_head_index(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """Grouped-query attention with the K/V head computed above the K/V loop:
+    ``k_head = th.begin // group``, which reaches the inner loop as a symbolic
+    expression. Block sizes: query rows, K/V rows."""
+    batch, heads, m, d = q.shape
+    group = heads // k.size(1)
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m], block_size=[1, 1, None]):
+        k_head = th.begin // group
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum(
+                "bhmd,bnd->bhmn", q_tile, k[tb, k_head, tn, :]
+            )
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bnd->bhmd", p.to(v.dtype), v[tb, k_head, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+
+
+def matmul_and_row_maximum(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """A GEMM and the maximum of its rows in one grid loop."""
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty(m, 1, dtype=torch.float32, device=a.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = acc + hl.dot(a[tile_m, tile_k], b[tile_k, :])
+        out[tile_m, :] = acc.amax(-1, keepdim=True)
+    return out
+
+
+@pytest.mark.isolated
+def test_attention_runtime_scale_lowers() -> None:
+    """Regression: "'xevm.blockload2d' op tile_width * v_blocks ...": the tile
+    times a runtime scalar's fill kept its unit dims, so the scores went through a
+    scratch buffer in the kernel."""
+    args = [
+        xpu_tensor(2, 2, 1024, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+        0.125,
+    ]
+    kernel = _kernel(helion.Config(block_sizes=[1, 1, 256, 64]))(
+        attention_runtime_scale
+    )
+    text, lowered = lower_xpu_stages(kernel, args)
+    assert "gpu.alloc" not in text
+    assert "intel_sub_group_bf16_bf16_matrix_mad_k16" in lowered
+
+
+@pytest.mark.isolated
+def test_attention_head_index_from_outer_loop_lowers() -> None:
+    """Regression: "invalid block key: '(u3//4)'" for a tile position's arithmetic
+    above the loop that uses it."""
+    args = [
+        xpu_tensor(2, 8, 256, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+    ]
+    kernel = _kernel(helion.Config(block_sizes=[256, 64]))(attention_head_index)
+    text, _ = lower_xpu_stages(kernel, args)
+    assert text.count("xegpu.dpas") == 2
+    assert "arith.floordivsi" in text or "arith.divsi" in text or "arith.divui" in text
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("k", "blocks"),
+    [(256, [64, 32]), (128, [64, 32]), (256, [64, 64]), (128, [128, 64])],
+)
+def test_matmul_and_row_reduction_is_a_clear_error(k: int, blocks: list[int]) -> None:
+    """Regression: a raw ``AssertionError: annotate_attention expects d_head to be
+    64`` from lighthouse's attention layout at K tiles other than 64; at 64 it
+    lowered, with 180 of 256 rows wrong on the device."""
+    args = [
+        xpu_tensor(256, k, dtype=torch.bfloat16),
+        xpu_tensor(k, 256, dtype=torch.bfloat16),
+    ]
+    with pytest.raises(UnsupportedOperationError, match=r"row reduction in one grid"):
+        lower_xpu(
+            _kernel(helion.Config(block_sizes=blocks))(matmul_and_row_maximum), args
+        )
 
 
 @pytest.mark.isolated

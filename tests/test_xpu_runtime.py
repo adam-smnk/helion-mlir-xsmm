@@ -39,6 +39,7 @@ from tests import test_xevm_bf16_extensions as bf16_kernels
 from tests import test_xpu_ir as ir_kernels
 from tests import xpu_math_full_kernels as full_kernels
 from tests import xpu_math_kernels as mk
+from tests.harness import load_example
 from tests.test_xpu_kernelbench import _reference as level2_reference
 
 from helion_mlir_backend import lower_mlir
@@ -48,6 +49,7 @@ from helion_mlir_backend._compiler.targets.xpu import XpuTarget
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    import pathlib
 
 # A kernel that faults loses the device for the rest of its process: each test
 # runs in a process of its own.
@@ -1456,6 +1458,444 @@ def test_attention_other_blocks() -> None:
     q, k, v = (_randn(2, 2, 512, 64) for _ in range(3))
     ref = F.scaled_dot_product_attention(q, k, v)
     _check(_kernel(kb.attention, [1, 1, 256, 32])(q, k, v), ref, 2**-6)
+
+
+def _llama_inputs() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A small GQA shape of the example: 8 query heads on 2 K/V heads."""
+    return _randn(2, 8, 256, 64), _randn(2, 2, 256, 64), _randn(2, 2, 256, 64)
+
+
+def _llama_torch(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    return F.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+
+
+def test_llama_gqa_example() -> None:
+    """The example at a small shape against torch and an f64 reference."""
+    example = load_example("xpu/llama_gqa_attention.py")
+    q, k, v = _llama_inputs()
+    ref = _llama_torch(q, k, v)
+    poison = torch.full(q.shape, float("nan"), dtype=BF16, device=DEVICE)
+    del poison
+    out = example.llama_attention(q, k, v)
+    _check(out, ref, 2**-6)
+    exact = _llama_torch(q.cpu().double(), k.cpu().double(), v.cpu().double())
+    error = (out.cpu().double() - exact).abs().max() / exact.abs().max()
+    torch_error = (ref.cpu().double() - exact).abs().max() / exact.abs().max()
+    assert error <= 2 * torch_error, (error, torch_error)
+    assert torch.equal(example.llama_attention(q, k, v), out)
+
+
+def _other_kernels(n: int) -> dict[str, Callable[[], object]]:
+    """Kernels to run right before an attention kernel: which of them runs
+    selects what stale registers hold (``xpu_transforms.IGC_OPTIONS``), their data
+    does not matter."""
+    return {
+        "none": lambda: None,
+        "sum_zero": lambda: torch.zeros(n, device=DEVICE).sum().item(),
+        "sum_one": lambda: torch.ones(n, device=DEVICE).sum().item(),
+        "sum_huge": lambda: torch.full((n,), 1e30, device=DEVICE).sum().item(),
+        "sum_nan": lambda: torch.full((n,), float("nan"), device=DEVICE).sum().item(),
+        "sum_randn": lambda: torch.randn(n, device=DEVICE).sum().item(),
+        "max_randn": lambda: torch.randn(n, device=DEVICE).max().item(),
+        "small_sum": lambda: torch.ones(16, device=DEVICE).sum().item(),
+        "abs": lambda: torch.randn(n, device=DEVICE).abs().cpu(),
+        "mul": lambda: (torch.randn(n, device=DEVICE) * 2).cpu(),
+        "bool_sum": lambda: (torch.randn(n, device=DEVICE) > 0).sum().item(),
+        "int_sum": lambda: torch.ones(n, device=DEVICE, dtype=torch.int32).sum().item(),
+        "matmul": lambda: (
+            torch.randn(256, 256, device=DEVICE) @ torch.randn(256, 256, device=DEVICE)
+        ).cpu(),
+    }
+
+
+def _large_scores(
+    q_shape: tuple[int, ...], kv_shape: tuple[int, ...]
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One large score per K/V tile."""
+    generator = torch.Generator().manual_seed(0)
+    k = torch.randn(*kv_shape, generator=generator) * 0.1
+    v = torch.randn(*kv_shape, generator=generator)
+    for tile in range(kv_shape[2] // 64):
+        k[:, :, tile * 64 + (tile * 7) % 64, :] = 60.0 / kv_shape[3]
+    q = torch.ones(*q_shape, dtype=BF16, device=DEVICE)
+    return q, k.to(BF16).to(DEVICE), v.to(BF16).to(DEVICE)
+
+
+def _wrong_after_other_kernels(
+    call: Callable[..., torch.Tensor],
+    inputs: tuple[torch.Tensor, ...],
+    **sdpa: bool,
+) -> list[str]:
+    """The kernels after which ``call`` gives other bits than on its first call,
+    nonfinite rows or an error beyond a bf16 ulp's, in repeated calls."""
+    q, k, v = inputs
+    double = [x.cpu().double() for x in inputs]
+    ref = F.scaled_dot_product_attention(*double, **sdpa)
+    first = call(q, k, v)
+    wrong = []
+    for name, kernel in _other_kernels(q.numel()).items():
+        for _ in range(3):
+            kernel()
+            out = call(q, k, v)
+            error = (out.cpu().double() - ref).abs().max() / ref.abs().max()
+            if not (torch.equal(out, first) and error <= 2**-6):
+                wrong.append(name)
+                break
+    return wrong
+
+
+_ATTENTION_CASES = {
+    "llama": ((2, 8, 256, 64), (2, 2, 256, 64)),
+    "llama-spec": ((4, 32, 512, 64), (4, 8, 512, 64)),
+    "97": ((2, 2, 512, 64), (2, 2, 512, 64)),
+    "97-b4h8": ((4, 8, 512, 64), (4, 8, 512, 64)),
+}
+_FORMS = {
+    "shipped": {"xegpu_nan_ignoring_maxima": [True], "igc_vectorizer": ["cmp"]},
+    "vectorizer-off": {"xegpu_nan_ignoring_maxima": [True]},
+    "nan-propagating": {},
+}
+"""Row maxima and IGC's vectorizer: what the example and 97 use, and the others."""
+
+
+def _attention_call(
+    case: str, form: str = "shipped"
+) -> tuple[Callable[..., torch.Tensor], dict[str, bool]]:
+    """The attention kernel of ``case`` in ``form``, and its SDPA's options. The
+    kernels are new, so they are lowered under the current patches."""
+    xegpu = _FORMS[form]
+    if case.startswith("llama"):
+        example = load_example("xpu/llama_gqa_attention.py")
+        kernel = _kernel(example.gqa_attention, example.BLOCK_SIZES, **xegpu)
+
+        def call(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+            return example.llama_attention(q, k, v, kernel=kernel)
+
+        return call, {"enable_gqa": True}
+    return _kernel(kb.attention, kb.ATTENTION_BLOCKS, **xegpu), {}
+
+
+@pytest.mark.parametrize("form", list(_FORMS))
+@pytest.mark.parametrize("case", list(_ATTENTION_CASES))
+def test_attention_after_other_kernels(case: str, form: str) -> None:
+    """Regression: the outputs of attention kernels do not depend on the kernel
+    that ran before (stale registers: ``xpu_transforms.IGC_OPTIONS``), in each
+    form, on normal and on large scores."""
+    q_shape, kv_shape = _ATTENTION_CASES[case]
+    call, sdpa = _attention_call(case, form)
+    normal = _randn(*q_shape), _randn(*kv_shape), _randn(*kv_shape)
+    assert _wrong_after_other_kernels(call, normal, **sdpa) == []
+    large = _large_scores(q_shape, kv_shape)
+    assert _wrong_after_other_kernels(call, large, **sdpa) == []
+
+
+@pytest.mark.parametrize(
+    ("prefix", "shapes"),
+    [
+        ("29_Softplus", ((128, 393216),)),
+        ("29_Matmul_Mish_Mish", None),
+        ("81_Gemm_Swish", None),
+    ],
+)
+def test_chosen_kernels_after_other_kernels(
+    prefix: str, shapes: tuple[tuple[int, ...], ...] | None
+) -> None:
+    """The kernels other than attention that choose ``igc_vectorizer="cmp"``: the
+    same bits as with the vectorizer off, and stable after other kernels; a sentinel
+    if their code changes. It cannot show that they avoid the bug: they do not take
+    that path (the no-option control does not fail for them)."""
+    problems = (*kb.PROBLEMS, *kb.LEVEL2_PROBLEMS)
+    problem = next(p for p in problems if p.name.startswith(prefix))
+    assert problem.xegpu.get("igc_vectorizer") == ["cmp"]
+    off = {k: v for k, v in problem.xegpu.items() if k != "igc_vectorizer"}
+    generator = torch.Generator().manual_seed(0)
+    inputs = [
+        torch.randn(*shape, generator=generator).to(problem.dtype).to(DEVICE)
+        for shape in shapes or problem.shapes
+    ]
+    args = problem.args(*inputs)
+    first = _kernel(problem.fn, problem.block_sizes, **problem.xegpu)(*args).cpu()
+    reference = _kernel(problem.fn, problem.block_sizes, **off)(*args).cpu()
+    assert torch.equal(first, reference)
+    wrong = []
+    kernel = _kernel(problem.fn, problem.block_sizes, **problem.xegpu)
+    for name, other in _other_kernels(2**22).items():
+        for _ in range(3):
+            other()
+            if not torch.equal(kernel(*args).cpu(), first):
+                wrong.append(name)
+                break
+    assert wrong == []
+
+
+def test_attention_matrix_finds_the_miscompile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The check above tells the wrong form apart: NaN-ignoring row maxima built
+    with IGC's vectorizer on get IGC 2.41's one-element min/max. How many cases of a
+    matrix of kernels go wrong varies with what stale registers hold (108-154 of 156
+    across runs, none with the options), so this asserts only that some do. If this
+    fails after an IGC update, the miscompile is gone: then this test can go, not the
+    one above."""
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")
+    # In-process entries are cached by module text, which the option is not part of.
+    monkeypatch.setattr(execution, "_JIT_CACHE", type(execution._JIT_CACHE)())
+    for name in ("IGC_OPTIONS", "IGC_OPTIONS_CMP"):
+        monkeypatch.setattr(
+            xpu_target.xpu_transforms, name, "-ze-opt-large-register-file"
+        )
+    q_shape, kv_shape = _ATTENTION_CASES["97"]
+    call, _ = _attention_call("97")
+    inputs = (_randn(*q_shape), _randn(*kv_shape), _randn(*kv_shape))
+    assert _wrong_after_other_kernels(call, inputs) != []
+
+
+_INF = float("inf")
+_NONFINITE = {"nan": float("nan"), "inf": _INF, "-inf": -_INF}
+_NAN_CASES = {
+    "gqa": ((2, 8, 256, 64), (2, 2, 256, 64)),
+    "97": ((2, 2, 512, 64), (2, 2, 512, 64)),
+}
+_NAN_DTYPES = {"bf16": BF16, "f16": torch.float16}
+_POSITIONS = {
+    # A K/V row: first, a row inside a later tile for each K/V tile the kernels use
+    # (32, 128), last.
+    "first": 0,
+    "tile-end": 127,
+    "second-tile": 133,
+    "last": 255,
+}
+_SPANS = {
+    "row": slice(70, 71),
+    "first-tile": slice(0, 128),
+    "second-tile": slice(128, 256),
+    "whole-head": slice(0, 256),
+}
+
+
+def _nonfinite_edits() -> dict[str, Callable[..., object]]:
+    """``edit(q, k, v)`` by name: a NaN or an inf in one element of each operand, in
+    whole K rows and tiles (queries of both signs: scores of both infinities and
+    NaN), and K/V tiles of -inf scores (positive queries)."""
+    edits: dict[str, Callable[..., object]] = {}
+
+    def element(operand: int, row: int, value: float) -> Callable[..., object]:
+        def edit(*tensors: torch.Tensor) -> None:
+            tensors[operand][0, 1, row, 3] = value
+
+        return edit
+
+    def span(rows: slice, value: float) -> Callable[..., object]:
+        def edit(_: torch.Tensor, k: torch.Tensor, __: torch.Tensor) -> None:
+            k[1, 0, rows] = value
+
+        return edit
+
+    def minus_inf_tile(rows: slice) -> Callable[..., object]:
+        def edit(q: torch.Tensor, k: torch.Tensor, _: torch.Tensor) -> None:
+            q.abs_()
+            k[0, 0, rows] = -_INF
+
+        return edit
+
+    for name, value in _NONFINITE.items():
+        for operand_index, operand in enumerate("qkv"):
+            for position, row in _POSITIONS.items():
+                edits[f"{operand}-{name}-{position}"] = element(
+                    operand_index, row, value
+                )
+        for rows_name, rows in _SPANS.items():
+            edits[f"k-{name}-{rows_name}"] = span(rows, value)
+    edits["minus-inf-first-tile"] = minus_inf_tile(slice(0, 128))
+    edits["minus-inf-second-tile"] = minus_inf_tile(slice(128, 256))
+    return edits
+
+
+def _bits(out: torch.Tensor) -> bytes:
+    return out.contiguous().view(torch.uint8).numpy().tobytes()
+
+
+def _nonfinite_differences(
+    out: torch.Tensor, on_device: torch.Tensor, reference: torch.Tensor
+) -> str | None:
+    """How ``out`` differs from torch on the device and in f64: other NaN or inf
+    elements, or the others beyond a 16-bit rounding's error of f64."""
+    out = out.float()
+    for ref in (on_device.float(), reference):
+        for test in (torch.isnan, torch.isposinf, torch.isneginf):
+            if not torch.equal(test(out), test(ref)):
+                return f"{test.__name__}: {int((test(out) ^ test(ref)).sum())} elements"
+    finite = out.isfinite()
+    if finite.any():
+        error = (out[finite].double() - reference[finite]).abs().max()
+        if error > 2**-6 * reference[finite].abs().max():
+            return f"error {error}"
+    return None
+
+
+@pytest.mark.parametrize("dtype", list(_NAN_DTYPES))
+@pytest.mark.parametrize("case", list(_NAN_CASES))
+def test_attention_nonfinite(case: str, dtype: str) -> None:
+    """A NaN or an inf anywhere (:func:`_nonfinite_edits`): the forms give the same
+    bits (``xpu_params.NAN_IGNORING_MAXIMA``), with torch's
+    nonfinite elements. Regression among them: -inf scores in the whole first K/V
+    tile gave NaN rows in every form of the row maxima (``-inf - -inf`` while the
+    running maximum was an initial -inf); they add nothing, as in torch."""
+    name = "llama" if case == "gqa" else "97"
+    kernels = {form: _attention_call(name, form)[0] for form in _FORMS}
+    q_shape, kv_shape = _NAN_CASES[case]
+    sdpa = {"enable_gqa": True} if q_shape != kv_shape else {}
+    wrong = {}
+    for edit_name, edit in _nonfinite_edits().items():
+        generator = torch.Generator().manual_seed(0)
+        q, k, v = (
+            torch.randn(*shape, generator=generator).to(_NAN_DTYPES[dtype])
+            for shape in (q_shape, kv_shape, kv_shape)
+        )
+        edit(q, k, v)
+        reference = F.scaled_dot_product_attention(
+            q.double(), k.double(), v.double(), **sdpa
+        )
+        on_device = q.to(DEVICE), k.to(DEVICE), v.to(DEVICE)
+        outs = {form: kernel(*on_device).cpu() for form, kernel in kernels.items()}
+        out = outs["shipped"]
+        if len({_bits(other) for other in outs.values()}) > 1:
+            wrong[edit_name] = "the forms differ"
+        torch_out = F.scaled_dot_product_attention(*on_device, **sdpa).cpu()
+        difference = _nonfinite_differences(out, torch_out, reference)
+        if difference is not None:
+            wrong[edit_name] = difference
+    assert wrong == {}
+
+
+@pytest.mark.parametrize("dtype", list(_NAN_DTYPES))
+@pytest.mark.parametrize("case", list(_NAN_CASES))
+def test_attention_row_of_only_minus_inf_scores(case: str, dtype: str) -> None:
+    """Holds a known difference. A row with only -inf scores ends in ``0 / 0``: NaN,
+    as ``F.softmax(...) @ V`` gives, while torch's SDPA gives finite outputs here.
+    Other rows are as torch's. If this fails the kernel has changed its contract:
+    the example's README describes it."""
+    name = "llama" if case == "gqa" else "97"
+    q_shape, kv_shape = _NAN_CASES[case]
+    generator = torch.Generator().manual_seed(0)
+    q, k, v = (
+        torch.randn(*shape, generator=generator).to(_NAN_DTYPES[dtype])
+        for shape in (q_shape, kv_shape, kv_shape)
+    )
+    q.abs_()
+    k[0, 0] = -_INF
+    sdpa = {"enable_gqa": True} if q_shape != kv_shape else {}
+    on_device = q.to(DEVICE), k.to(DEVICE), v.to(DEVICE)
+    empty = slice(0, 4) if case == "gqa" else slice(0, 1)
+    for form in _FORMS:
+        out = _attention_call(name, form)[0](*on_device).cpu()
+        assert out[0, empty].isnan().all()
+        assert out.isfinite().sum() == out.numel() - out[0, empty].numel()
+    reference = F.scaled_dot_product_attention(
+        q.double(), k.double(), v.double(), **sdpa
+    )
+    assert reference[0, empty].isfinite().all()
+    torch_out = F.scaled_dot_product_attention(*on_device, **sdpa).cpu()
+    assert torch_out[0, empty].float().isfinite().all()
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [ir_kernels.attention_and_row_maximum, ir_kernels.attention_and_output_maximum],
+)
+def test_key_keeps_nan_in_other_uses_of_a_maximum(fn: Callable[..., object]) -> None:
+    """Regression (exact kernels): with ``xegpu_nan_ignoring_maxima`` a stored
+    running maximum, or a maximum of the output row, was finite for a row with a
+    NaN, where torch's is NaN (512 of 2048 rows, one NaN in K)."""
+    generator = torch.Generator().manual_seed(0)
+    shape = 2, 2, 512, 64
+    q, k, v = (torch.randn(*shape, generator=generator).to(BF16) for _ in range(3))
+    k[0, 1, 100, 3] = float("nan")
+    kernel = _kernel(fn, kb.ATTENTION_BLOCKS, **_FORMS["shipped"])
+    out, maximum = kernel(q.to(DEVICE), k.to(DEVICE), v.to(DEVICE))
+    expected_rows = out.cpu().isnan().any(-1, keepdim=True)
+    assert expected_rows.any()
+    assert torch.equal(maximum.cpu().isnan(), expected_rows)
+
+
+@pytest.mark.parametrize("seq", [128, 256, 384, 512, 640, 768, 1024])
+def test_attention_blocks_fit_the_shape(seq: int) -> None:
+    """Regression: 97's bench blocks refused sequences that the earlier ones took
+    (128, 640, 768). :func:`kernelbench_xpu.attention_blocks`, as AI-bench's model."""
+    q, k, v = (_randn(2, 2, seq, 64) for _ in range(3))
+    kernel = _kernel(kb.attention, kb.attention_blocks(2, 2, seq), **_FORMS["shipped"])
+    _check(kernel(q, k, v), F.scaled_dot_product_attention(q, k, v), 2**-6)
+
+
+@pytest.mark.parametrize(
+    ("q_shape", "kv_shape"),
+    [
+        ((2, 4, 128, 64), (2, 1, 128, 64)),
+        ((1, 2, 256, 64), (1, 1, 256, 64)),
+        ((2, 4, 256, 64), (2, 1, 256, 64)),
+        ((2, 8, 384, 64), (2, 2, 384, 64)),
+        ((2, 2, 512, 64), (2, 2, 512, 64)),
+        ((1, 1, 256, 64), (1, 1, 256, 64)),
+    ],
+)
+def test_llama_example_other_shapes(
+    q_shape: tuple[int, ...], kv_shape: tuple[int, ...]
+) -> None:
+    """Regression: block sizes that leave one workgroup were refused with "xegpu_*
+    lists of 1 entries, but the kernel has 0 GPU kernel(s)"; here other block sizes
+    take the shape."""
+    example = load_example("xpu/llama_gqa_attention.py")
+    q, k, v = _randn(*q_shape), _randn(*kv_shape), _randn(*kv_shape)
+    _check(example.llama_attention(q, k, v), _llama_torch(q, k, v), 2**-6)
+
+
+def test_attention_runtime_scale() -> None:
+    """Regression (exact kernel, as lowered in ``test_xpu_ir``): a runtime float
+    scale failed in XeVM. Right against SDPA, for two scales."""
+    example = load_example("xpu/llama_gqa_attention.py")
+    q, k, v = _llama_inputs()
+    packed = q.view(2, 2, 1024, 64)
+    kernel = _kernel(ir_kernels.attention_runtime_scale, example.BLOCK_SIZES)
+    _check(kernel(packed, k, v, 0.125).view(q.shape), _llama_torch(q, k, v), 2**-6)
+    doubled = F.scaled_dot_product_attention(
+        q.cpu().double() * 2, k.cpu().double(), v.cpu().double(), enable_gqa=True
+    )
+    out = kernel(packed, k, v, 0.25).view(q.shape)
+    error = (out.cpu().double() - doubled).abs().max() / doubled.abs().max()
+    assert error <= 2**-6
+
+
+def test_attention_head_index_from_outer_loop() -> None:
+    """Regression (exact kernel, as lowered in ``test_xpu_ir``): ``h = th.begin //
+    group`` above the K/V loop failed with "invalid block key". Unpacked query heads
+    give torch's GQA."""
+    q, k, v = _llama_inputs()
+    out = _kernel(ir_kernels.attention_head_index, [256, 64])(q, k, v)
+    _check(out, _llama_torch(q, k, v), 2**-6)
+
+
+@pytest.mark.parametrize("expression", list(ir_kernels.TILE_EXPRESSIONS))
+def test_tile_expression_in_an_inner_loop(
+    expression: str, tmp_path: pathlib.Path
+) -> None:
+    """K/V heads computed with tile position arithmetic above the inner loop, against
+    SDPA of those heads."""
+    source, head_of = ir_kernels.TILE_EXPRESSIONS[expression]
+    fn = ir_kernels.tile_expression_kernel(tmp_path, source)
+    q, k, v = _llama_inputs()
+    out = _kernel(fn, [256, 64])(q, k, v).cpu().double()
+    exact = torch.stack(
+        [
+            F.scaled_dot_product_attention(
+                q[:, head].cpu().double(),
+                k[:, head_of(head)].cpu().double(),
+                v[:, head_of(head)].cpu().double(),
+            )
+            for head in range(8)
+        ],
+        dim=1,
+    )
+    assert (out - exact).abs().max() <= 2**-6 * exact.abs().max()
 
 
 # --- Runtime: USM interop, synchronization, device index, caching ----------------

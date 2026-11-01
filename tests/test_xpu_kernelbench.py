@@ -127,10 +127,10 @@ def _check_attention(text: str) -> None:
     # Q @ K^T and P @ V, the online softmax's row maxima and sums.
     assert text.count("xegpu.dpas ") == 2
     assert text.count("vector.multi_reduction") == 2
-    # Lighthouse's attention layout (annotate_attention): 8 subgroups of 16
+    # Lighthouse's attention layout (annotate_attention): 32 subgroups of 16
     # query rows; every subgroup reads the whole 64x64 K and V tiles, K
     # transposed (order), V in 32x32 blocks, Q in 16x16 blocks.
-    rows = "sg_layout = [8, 1], sg_data = [16, 64]"
+    rows = "sg_layout = [32, 1], sg_data = [16, 64]"
     kv = "sg_layout = [1, 1], sg_data = [64, 64]"
     assert _anchor_layouts(text, "xegpu.load_nd") == [
         f"{rows}, inst_data = [16, 16]",
@@ -144,10 +144,10 @@ def _check_attention(text: str) -> None:
     assert set(prefetches) == {
         "sg_layout = [4, 2], sg_data = [16, 32], inst_data = [16, 32]"
     }
-    assert "known_block_size = array<i32: 128, 1, 1>" in text
+    assert "known_block_size = array<i32: 512, 1, 1>" in text
     # The softmax runs in f32, the output is stored as bf16.
-    assert "math.exp" in text and "vector<128x64xf32>" in text
-    assert re.search(r"xegpu\.store_nd [^\n]*vector<128x64xbf16>", text)
+    assert "math.exp" in text and "vector<512x64xf32>" in text
+    assert re.search(r"xegpu\.store_nd [^\n]*vector<512x64xbf16>", text)
 
 
 def _check_linear(text: str) -> None:

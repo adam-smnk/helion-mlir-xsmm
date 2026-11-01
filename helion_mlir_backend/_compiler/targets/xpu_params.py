@@ -19,6 +19,10 @@ shorter list -- leaves the parameter to lighthouse's inference:
   transposed B prefetches ``[n, k]`` tiles).
 - ``xegpu_prefetch_depths``: ``[a_nb, b_nb]``, how many K-loop iterations ahead a
   GEMM kernel prefetches A and B.
+- ``xegpu_nan_ignoring_maxima``: ``True`` for an attention kernel whose row
+  maxima may ignore NaN. :data:`NAN_IGNORING_MAXIMA` has the reasoning.
+- ``igc_vectorizer``, not an XeGPU parameter: IGC's vectorizer for the kernel, ``"off"``,
+  the default, or ``"cmp"``. :data:`VECTORIZER` has the reasoning.
 
 The workgroup tile and the K tile are not parameters: they are the kernel's
 block sizes (the grid tiles and the inner K tile), which lighthouse reads off
@@ -68,17 +72,45 @@ SG_TILES = "xegpu_sg_tiles"
 LOAD_TILES = "xegpu_load_tiles"
 PREFETCH_TILES = "xegpu_prefetch_tiles"
 PREFETCH_DEPTHS = "xegpu_prefetch_depths"
+NAN_IGNORING_MAXIMA = "xegpu_nan_ignoring_maxima"
+"""Per attention kernel, ``True``: its row maxima may stay as lighthouse vectorizes
+them, ``maxnumf``, instead of NaN-propagating ``maximumf``. That is faster: numbers
+in ``examples/xpu/README.md``.
+
+An online softmax's maximum ``m`` only shifts: ``exp(s - m) / sum(exp(s - m))``. A
+NaN score gives a NaN ``exp``, so a NaN running sum, and every later step and the
+division keep it, whatever ``m`` was: the row is NaN either way. Without a NaN,
+``maxnum`` and ``maximum`` differ at most in the sign of a zero, which ``exp`` does
+not see. Only reductions whose def-use graph shows this stay ``maxnumf``, the
+others of the kernel propagate NaN: ``row_maxima``.
+
+**The output is the same only with IGC's options**: ``llvm.maxnum`` maxima are the
+form IGC's vectorizer miscompiles without ``VectorizerAllowCMP=0`` or
+``EnableVectorizer=0`` (``xpu_transforms.IGC_OPTIONS``, wrong rows). A build that
+loses them, as a default ``unitrace`` does, gets wrong rows; nothing refuses it at
+compile time. ``tests/test_xpu_igc_workarounds.py`` scans these binaries.
+``tests/test_xpu_runtime.py`` compares with torch: ``test_attention_nonfinite``."""
+VECTORIZER = "igc_vectorizer"
+"""Per GPU kernel: IGC's vectorizer ``"off"`` (the default,
+``xpu_transforms.IGC_OPTIONS``) or ``"cmp"`` (on but for vector compares,
+``IGC_OPTIONS_CMP``). Not an XeGPU parameter: it picks the kernel's IGC options. A
+plain choice of the kernel's author, never made automatically and not searched:
+``"cmp"`` is faster on some kernels, and exposed to the IGC bug described at
+``IGC_OPTIONS`` elsewhere. Nothing checks that at compile time."""
 _ARITY = {SG_TILES: 2, LOAD_TILES: 4, PREFETCH_TILES: 4, PREFETCH_DEPTHS: 2}
 _ELEMENTWISE_ARITY = {LOAD_TILES: (2, 1)}
 """Other entry lengths: ``[m, n]`` load tiles of 2D elementwise and reduction
 kernels, ``[n]`` of 1D elementwise kernels."""
-XEGPU_CONFIG_KEYS = frozenset(_ARITY)
-"""The config keys of the XPU target's lowering."""
+XPU_CONFIG_KEYS = frozenset({*_ARITY, NAN_IGNORING_MAXIMA, VECTORIZER})
+"""The per-kernel config keys of the XPU target: its ``xegpu_*`` parameters, and
+``igc_vectorizer``, which is IGC's, not XeGPU's."""
 _FIELDS = {
     SG_TILES: "sg_tile",
     LOAD_TILES: "load_tiles",
     PREFETCH_TILES: "prefetch_tiles",
     PREFETCH_DEPTHS: "prefetch_depths",
+    NAN_IGNORING_MAXIMA: "nan_ignoring_maxima",
+    VECTORIZER: "vectorizer_cmp",
 }
 PARAMS_ATTR = "helion.xegpu_params"
 """Module attribute holding the parameters: one dictionary per kernel."""
@@ -93,6 +125,10 @@ class KernelParams:
     load_tiles: tuple[int, ...] | None = None
     prefetch_tiles: tuple[int, ...] | None = None
     prefetch_depths: tuple[int, ...] | None = None
+    nan_ignoring_maxima: tuple[int, ...] | None = None
+    """``(1,)`` if set, as module attributes hold arrays."""
+    vectorizer_cmp: tuple[int, ...] | None = None
+    """``(1,)`` for ``igc_vectorizer="cmp"``."""
 
     def forced(self) -> dict[str, tuple[int, ...]]:
         """The forced parameters, by config key."""
@@ -100,6 +136,14 @@ class KernelParams:
             key: value
             for key, name in _FIELDS.items()
             if (value := getattr(self, name)) is not None
+        }
+
+    def layout_forced(self) -> dict[str, tuple[int, ...]]:
+        """The forced parameters of the XeGPU layouts."""
+        return {
+            key: value
+            for key, value in self.forced().items()
+            if key not in (NAN_IGNORING_MAXIMA, VECTORIZER)
         }
 
     def annotate_options(self) -> dict[str, object]:
@@ -124,18 +168,21 @@ class KernelParams:
 
 
 def xegpu_params(config: Mapping[str, object]) -> tuple[KernelParams, ...]:
-    """The per-kernel parameters of ``config``'s ``xegpu_*`` keys, as long as the
+    """The per-kernel parameters of ``config``'s ``xegpu_*`` and ``igc_*`` keys, as long as the
     longest list (empty without keys); malformed values raise
     :class:`XeGPUConfigError`."""
     entries: dict[str, list[tuple[int, ...] | None]] = {}
-    for key, arity in _ARITY.items():
+    for key in _FIELDS:
         value = config.get(key)
         if value is None:
             continue
         if not isinstance(value, (list, tuple)):
+            entry = {NAN_IGNORING_MAXIMA: "True", VECTORIZER: '"off" or "cmp"'}.get(
+                key, f"a list of {_ARITY.get(key)} ints"
+            )
             raise XeGPUConfigError(
                 f"{key}={value!r}: expected a list with one entry per GPU kernel "
-                f"(top-level grid loop): a list of {arity} ints, or None"
+                f"(top-level grid loop): {entry}, or None"
             )
         entries[key] = [_entry(key, index, item) for index, item in enumerate(value)]
     count = max((len(values) for values in entries.values()), default=0)
@@ -153,6 +200,20 @@ def xegpu_params(config: Mapping[str, object]) -> tuple[KernelParams, ...]:
 def _entry(key: str, index: int, item: object) -> tuple[int, ...] | None:
     if item is None:
         return None
+    if key == VECTORIZER:
+        if item not in ("off", "cmp"):
+            raise XeGPUConfigError(
+                f'{key}[{index}]={item!r}: expected "off", "cmp" or None (one entry '
+                "per GPU kernel)"
+            )
+        return (1,) if item == "cmp" else None
+    if key == NAN_IGNORING_MAXIMA:
+        if item is not True:
+            raise XeGPUConfigError(
+                f"{key}[{index}]={item!r}: expected True or None (one entry per "
+                "GPU kernel)"
+            )
+        return (1,)
     arity = _ARITY[key]
     arities = {arity, *_ELEMENTWISE_ARITY.get(key, ())}
     if (
@@ -389,7 +450,8 @@ def attention_shape(
     ):
         raise ValueError(
             "the two contractions are not in one loop over K/V tiles (an inner "
-            "hl.tile of the grid loop)"
+            "hl.tile of the grid loop; a K/V block size as large as the sequence "
+            "leaves no such loop)"
         )
     scores_maps, update_maps = (
         [ir.AffineMapAttr(m).value for m in linalg.get_indexing_maps(op.opview)]
@@ -690,6 +752,12 @@ def check_params(
     its end infer all), and the inferred ones the block sizes decide (a GEMM's
     workgroup and K tiles must leave lighthouse's parameter selection a choice,
     a reduction's rows and columns must fit its subgroup and block tiles)."""
+    if params and not shapes:
+        raise XeGPUConfigError(
+            "per-kernel config keys (xegpu_*, igc_*), but the kernel has no GPU kernel: "
+            "its block sizes make the whole shape one tile, so no grid loop is left; "
+            "take block sizes that leave several workgroups"
+        )
     if len(params) > len(shapes):
         raise XeGPUConfigError(
             f"xegpu_* lists of {len(params)} entries, but the kernel has "
@@ -698,7 +766,13 @@ def check_params(
     specs = XeGPUSpecs.get("B70")
     for index, shape in enumerate(shapes):
         kernel = params[index] if index < len(params) else KernelParams()
-        forced = kernel.forced()
+        if kernel.nan_ignoring_maxima and not isinstance(shape, AttentionShape):
+            raise XeGPUConfigError(
+                f"{NAN_IGNORING_MAXIMA}[{index}]: invalid for GPU kernel {index}: "
+                "it applies to attention kernels, whose row maxima only shift an "
+                "exponential"
+            )
+        forced = kernel.layout_forced()
         try:
             if isinstance(shape, GemmShape):
                 _check_gemm(kernel, shape, specs)
@@ -813,7 +887,7 @@ def _check_reduction(
     if load_tile is not None and len(load_tile) != 2:
         raise ValueError("the load tile of a reduction kernel is [m, n]")
     if shape.rows is None:
-        if kernel.forced():
+        if kernel.layout_forced():
             raise ValueError("forced parameters need a 2D row reduction")
         return
     rows = REDUCTION_SG_ROWS
@@ -869,7 +943,7 @@ def _check_attention(
     and a forced subgroup tile ``[rows, 0]`` (its only parameter here):
     subgroups of whole 16-row Q load blocks, at most the maximum per workgroup,
     and K/V tiles of whole 32-row V load blocks."""
-    other = [key for key in kernel.forced() if key != SG_TILES]
+    other = [key for key in kernel.layout_forced() if key != SG_TILES]
     if other:
         raise ValueError(
             f"{', '.join(other)} do not apply to attention kernels (lighthouse's "

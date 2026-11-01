@@ -145,6 +145,8 @@ keeps lighthouse's inference.
 | `xegpu_load_tiles` | `[a_m, a_k, b_k, b_n]`: A and B tiles loaded per instruction; `[m, n]`: the tile an elementwise kernel, or a row reduction (of the tiles it reduces), loads per instruction | GEMM, reduction, 2D elementwise kernels |
 | `xegpu_prefetch_tiles` | `[a_m, a_k, b_k, b_n]`: A and B prefetch tiles, in the operand's stored orientation (`[n, k]` for a transposed B) | GEMM kernels |
 | `xegpu_prefetch_depths` | `[a_nb, b_nb]`: K iterations A and B are prefetched ahead | GEMM kernels |
+| `xegpu_nan_ignoring_maxima` | `True`: row maxima that only shift an `exp` ignore NaN, which is faster. The output is the same, as a NaN score gives a NaN row through `exp` and the sum, given IGC's options: this form is what IGC's vectorizer miscompiles without them ([`xpu_params.py`](helion_mlir_backend/_compiler/targets/xpu_params.py)) | attention kernels |
+| `igc_vectorizer` | Not an XeGPU parameter. `"off"`, the default, or `"cmp"`: IGC's vectorizer on but for vector compares, faster on some kernels and wrong in others (`xpu_transforms.IGC_OPTIONS`). The kernel author's choice: not searched, not checked at compile time | every kernel |
 
 ```python
 config = helion.Config(
@@ -160,7 +162,7 @@ lighthouse's XeGPU constraints (`matmul_constraints`, the cost model's register 
 DPAS limits; for elementwise and reduction kernels the limits of the inference
 above, e.g. a reduction's load tile rows divide its subgroup rows and f32 loads take
 16 columns; the prefetch keys are rejected: GEMM only; attention kernels take only
-`xegpu_sg_tiles`); invalid ones, malformed entries and lists longer than the number of
+`xegpu_sg_tiles`, `xegpu_nan_ignoring_maxima` and `igc_vectorizer`); invalid ones, malformed entries and lists longer than the number of
 kernels raise `XeGPUConfigError` (an `MLIRBackendError`, so the autotuner skips the
 config). The CPU target ignores the `xegpu_*` keys, so one config can serve both
 devices.
@@ -174,7 +176,7 @@ to what XeGPU compiles: powers of two dividing the sizes they tile (no masking),
 least 16 for the blocks of a tile's contiguous dim; matmul M/N tiles of 32 to 1024
 and K tiles of 16 to 64, below K; reduction rows of 8 to 256 (whole 8-row subgroups,
 at most 32) and 16 to 256 columns; attention query rows of 16 to 512 and K/V tiles of
-32 or 64 rows, below the sequence; 2D elementwise tiles of at most 2048 per side. The
+32 to 128 rows, below the sequence; 2D elementwise tiles of at most 2048 per side. The
 default config infers every XeGPU parameter, with a matmul's block sizes from
 lighthouse's parameter selection for its sizes and an attention kernel's from
 lighthouse's attention defaults (128 query rows, 64 K/V rows), and lowers. The `xegpu_*` keys are
@@ -194,6 +196,12 @@ Zero runtime (`-DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=SPIRV -DMLIR_ENABLE_LEVELZER
 and Python bindings, at the commit of the pinned `mlir-python-bindings`), used through
 `PYTHONPATH=$LLVM_INSTALL_DIR/python_packages/mlir_core`, and a PyTorch with XPU
 support. The stock bindings cannot emit SPIR-V.
+
+### XPU example
+
+[`examples/xpu/`](examples/xpu/README.md): Llama-3.2-1B attention (grouped-query
+SDPA) as a fused flash-attention kernel with hand-picked config, checked against
+and timed next to torch.
 
 ## Install
 

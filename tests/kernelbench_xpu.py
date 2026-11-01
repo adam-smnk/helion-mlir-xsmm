@@ -713,6 +713,10 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor
     rounded to V's dtype for ``P @ V``, the output to Q's. Also run on the CPU
     target (numerics) and with other shapes and block sizes (``test_xpu_ir``).
 
+    ``row_max`` starts at -FLT_MAX, not -inf, so ``score - row_max`` is never
+    ``-inf - -inf``: a first K/V tile of -inf scores adds ``exp(-inf) = 0``, as
+    in torch, and a row of only -inf scores ends in ``0 / 0``.
+
     The tiles are 4D with unit batch and head blocks, so the contractions are
     einsums (``hl.dot`` takes 2D or 3D operands). An einsum of bf16 tiles
     returns bf16; added to an f32 accumulator it accumulates in f32 (the
@@ -724,7 +728,7 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor
     out = torch.empty_like(q)
     for tb, th, tm in hl.tile([batch, heads, m]):
         q_tile = q[tb, th, tm, :]
-        row_max = hl.full([tb, th, tm], float("-inf"), dtype=torch.float32)
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
         acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
         for tn in hl.tile(n):
@@ -1112,27 +1116,44 @@ full rationale).
 4096x393216 softmax 196 -> 98 ms (torch 130); 8192x65536 L2 norm 48.5 ->
 33.6 ms (torch 31.7).
 """
-ATTENTION_BLOCKS = [1, 1, 128, 64]
-"""Flash-attention block sizes ``[batch, head, query rows, K/V rows]``, picked
-from the hardware (Xe2, large register file) for a head dim of 64:
+ATTENTION_OTHER_SHAPES_BLOCKS = [1, 1, 128, 64]
+"""For sequences that are a multiple of 128 and not of 512: 128 query rows over K/V
+tiles of 64 fit them, and leave a K/V loop at a sequence of 128. Keep in sync with
+AI-bench's ``attention``, which picks by shape as :func:`attention_blocks`."""
+
+
+def attention_blocks(batch: int, heads: int, seq: int) -> list[int]:
+    """The block sizes of :func:`attention` for its shape: 512 query rows must divide
+    the sequence and leave several workgroups."""
+    if seq % 512 == 0 and batch * heads * seq > 512:
+        return ATTENTION_BLOCKS
+    return ATTENTION_OTHER_SHAPES_BLOCKS
+
+
+ATTENTION_XEGPU = {
+    "xegpu_nan_ignoring_maxima": [True],
+    "igc_vectorizer": ["cmp"],
+}
+"""NaN-ignoring row maxima and IGC's vectorizer on but for compares, faster with the
+same output bits (``examples/xpu/README.md``). Why that holds:
+``xpu_params.NAN_IGNORING_MAXIMA``. Keep in sync with AI-bench's ``backends/utils/helion_mlir_xpu_utils/attention.py``."""
+ATTENTION_BLOCKS = [1, 1, 512, 64]
+"""Flash-attention block sizes ``[batch, head, query rows, K/V rows]`` of the bench
+shape, picked on the Arc B50 for a head dim of 64, with
+``igc_vectorizer="cmp"`` and NaN-ignoring row maxima:
 
 - Batch and head blocks 1: each workgroup works on one (batch, head) matrix
-  (unit tile dims are folded; the grid is B x H x S/128 = 32x32x4).
-- 128 query rows per workgroup: 8 subgroups of 16 rows (lighthouse's attention
-  layout: subgroup tiles of 16 rows, two 8-row DPAS blocks), 128 threads of
-  16 lanes. Every subgroup reads the whole K and V tiles, so more rows per
-  workgroup share each K/V tile through the L1 cache; 8 subgroups (of at
-  most 32) still leave room for several workgroups per Xe core, and
-  32x32x4 = 4096 workgroups fill the GPU.
-- K/V tiles of 64 rows: per subgroup, ``Q @ K^T`` is 16x64 (2x4 DPAS 8x16
-  blocks, 4 K steps of 16 over the head dim) and ``P @ V`` 16x64 over 64 K/V
-  rows (4 K steps): 32 DPAS each per step. In 64-byte registers Q (16x64
-  bf16) takes 32, the scores and the accumulator (16x64 f32) 64 each: 160 of
-  the 256-register file, plus the K or V tile (64x64 bf16, 128 registers)
-  would be 288 if it stayed resident whole. Whether the compiler streams it
-  (block reads per DPAS step) or spills is open until measured on hardware;
-  K/V tiles of 32 (64 registers) are the fallback. 64 is also lighthouse's
-  attention reduction tile, and whole 32x32 V blocks.
+  (unit tile dims are folded; the grid is B x H x S/512 = 32x32x1).
+- 512 query rows per workgroup: 32 subgroups of 16 rows (lighthouse's attention
+  layout: subgroup tiles of 16 rows, two 8-row DPAS blocks), a whole Xe core's
+  threads. Every subgroup reads the whole K and V tiles, so more rows per
+  workgroup share each K/V tile through the L1 cache.
+- K/V tiles of 64 rows: per subgroup, ``Q @ K^T`` is 16x64 (2x4 DPAS 8x16 blocks, 4 K
+  steps of 16 over the head dim) and ``P @ V`` 16x64 over 64 K/V rows (4 K steps): 32
+  DPAS each per step.
+- Measured device time at 32x32x512x64 (torch 2825 us), query rows and K/V rows:
+  128, 32: 3661; 128, 64: 3864; 256, 32: 2609; 256, 64: 2420; 512, 32: 2448; 512,
+  128: 2634; 512, 64: 2140.
 - 2D block loads: Q in 16x16 blocks, V in 32x32 blocks (the VNNI-transformed
   B operand), K transposed (``Q @ K^T`` of K stored ``[seq, head dim]``) in
   16x8 blocks of 32-bit pairs; the output is stored in 8x16 blocks.
@@ -1177,14 +1198,31 @@ def _gemm(
     )
 
 
-def _unary(name: str, fn: Callable[..., object]) -> Problem:
+VECTORIZER_CMP = {"igc_vectorizer": ["cmp"]}
+"""The kernels that choose it (``test_chosen_kernels_after_other_kernels``), with what
+they gain: device time with the vectorizer off is 29_Softplus +6.3 %, L2
+29_Matmul_Mish_Mish +6.9 %, L2 81 +3.3 %. Keep in sync with AI-bench's ``_VECTORIZER``."""
+
+
+def _unary(
+    name: str, fn: Callable[..., object], xegpu: dict[str, object] | None = None
+) -> Problem:
     # The grid runs the column tiles first (x), the rows second.
     grid = tuple(
         size // block
         for size, block in zip(_ELEMENTWISE_SHAPE, ELEMENTWISE_BLOCKS, strict=True)
     )[::-1]
     shapes = (_ELEMENTWISE_SHAPE,)
-    return Problem(name, "elementwise", fn, shapes, BF16, ELEMENTWISE_BLOCKS, grid)
+    return Problem(
+        name,
+        "elementwise",
+        fn,
+        shapes,
+        BF16,
+        ELEMENTWISE_BLOCKS,
+        grid,
+        xegpu=xegpu or {},
+    )
 
 
 def _rows(name: str, fn: Callable[..., object], shape: tuple[int, int]) -> Problem:
@@ -1239,7 +1277,7 @@ PROBLEMS: tuple[Problem, ...] = (
     _unary("25_Swish", _swish),
     _unary("27_SELU_", _selu),
     _unary("28_HardSigmoid", _hardsigmoid),
-    _unary("29_Softplus", _softplus),
+    _unary("29_Softplus", _softplus, VECTORIZER_CMP),
     _unary("30_Softsign", _softsign),
     _unary("31_ELU", _elu),
     _unary("32_HardTanh", _hardtanh),
@@ -1311,7 +1349,8 @@ RANK3_PROBLEMS: tuple[Problem, ...] = (
         ((32, 32, 512, 64),) * 3,
         BF16,
         ATTENTION_BLOCKS,
-        (32, 32, 4),
+        (32, 32, 1),
+        xegpu=ATTENTION_XEGPU,
     ),
 )
 """Rank-3+ problems: block size 1 on the leading dims (folded away)."""
@@ -1358,6 +1397,7 @@ def _linear(
     fn: Callable[..., object],
     mnk: tuple[int, int, int],
     scalars: tuple[float, ...] = (),
+    extra: dict[str, object] | None = None,
 ) -> Problem:
     """``fn`` of ``x: [M, K]``, ``weight: [N, K]`` and ``bias: [N]``."""
     m, n, k = mnk
@@ -1367,7 +1407,17 @@ def _linear(
     shapes = ((m, k), (n, k), (n,))
     # A dim of one tile is no grid dim (59: 1x128 launches 128 workgroups).
     grid = tuple(tiles for tiles in (m // blocks[0], n // blocks[1]) if tiles > 1)
-    return Problem(name, "linear", fn, shapes, BF16, blocks, grid, scalars, xegpu)
+    return Problem(
+        name,
+        "linear",
+        fn,
+        shapes,
+        BF16,
+        blocks,
+        grid,
+        scalars,
+        {**xegpu, **(extra or {})},
+    )
 
 
 _LINEAR_MNK = (1024, 8192, 8192)
@@ -1385,7 +1435,7 @@ LEVEL2_PROBLEMS: tuple[Problem, ...] = (
         _LINEAR_MNK,
         (2.0, 0.1),
     ),
-    _linear("29_Matmul_Mish_Mish", _linear_mish_mish, _LINEAR_MNK),
+    _linear("29_Matmul_Mish_Mish", _linear_mish_mish, _LINEAR_MNK, (), VECTORIZER_CMP),
     _linear(
         "40_Matmul_Scaling_ResidualAdd",
         _linear_scaling_residual_add,
@@ -1409,6 +1459,8 @@ LEVEL2_PROBLEMS: tuple[Problem, ...] = (
         "81_Gemm_Swish_Divide_Clamp_Tanh_Clamp",
         _linear_swish_divide_clamp_tanh_clamp,
         _LINEAR_MNK,
+        (),
+        VECTORIZER_CMP,
     ),
 )
 """KernelBench level 2 problems with an ``mlir-gpu-bench`` variant: ``nn.Linear``

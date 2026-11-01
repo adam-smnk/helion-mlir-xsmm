@@ -96,11 +96,12 @@ MAX_REDUCTION_ROWS = REDUCTION_SG_ROWS * MAX_SUBGROUPS
 MAX_ATTENTION_ROWS = ATTENTION_SG_ROWS * MAX_SUBGROUPS
 """Query rows of an attention workgroup: at most 32 subgroups of lighthouse's 16
 rows."""
-MAX_ATTENTION_KV = 64
+MAX_ATTENTION_KV = 128
 """K/V rows of an attention loop step: every subgroup holds the whole K and V
-tiles (lighthouse's attention layout shares them). A 64x64 bf16 tile takes 128
-of the 256 64-byte registers a subgroup has with the large register file; 128
-rows would take all of them."""
+tiles (lighthouse's attention layout shares them). A 128x64 bf16 tile would take
+all of a subgroup's 256 64-byte registers with the large register file if it
+stayed resident, yet it was the fastest on the B50 with IGC's vectorizer off (97
+and Llama's attention); 256 rows take over twice as long."""
 ATTENTION_DEFAULT_BLOCKS = (128, 64)
 """Default query rows and K/V rows of an attention kernel: lighthouse's attention
 defaults (``infer_xegpu_attention_params``: 128-row workgroups of 16-row

@@ -54,6 +54,7 @@ from ..mlir.support.errors import UnsupportedTargetError
 from ..mlir_transforms.keep_row_dims import keep_row_dims
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
+from ..mlir_transforms.row_maxima import restore_nan_propagating_maxima
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
@@ -69,7 +70,7 @@ from ..mlir_transforms.xpu_math_approx import approximate_math
 from ..mlir_transforms.xpu_math_approx import fold_extended_splats
 from .base import MLIRTarget
 from .xpu_checks import check_xegpu_capabilities
-from .xpu_params import XEGPU_CONFIG_KEYS
+from .xpu_params import XPU_CONFIG_KEYS
 from .xpu_params import KernelParams
 from .xpu_params import attach_params
 from .xpu_params import check_params
@@ -168,8 +169,8 @@ def _stages(
         ("cleanup", xegpu.cleanup_schedule(entry)),
         # No wg_tiling_schedule: Helion's grid loops are the workgroup tiles.
         ("vectorized", xegpu.vectorize_schedule(entry)),
-        # Undoes lighthouse's maxnumf reductions: see nan_propagating_maxima.
-        ("nan-maxima", xpu_transforms.nan_propagating_maxima()),
+        # Undoes lighthouse's maxnumf reductions: see row_maxima.
+        ("nan-maxima", _NanMaxima(kernels)),
         ("bufferized", xegpu.bufferize_schedule(entry)),
         ("host-legalized", xpu_transforms.legalize_host_ops()),
         # Lighthouse's outline_gpu_func and annotate_layouts schedules, per kernel.
@@ -211,27 +212,54 @@ def _stages(
                 ("xevm-unit-clamps", _UnitClamps()),
                 ("xevm-bf16-extensions", _Bf16Extensions()),
                 ("xevm-fabs", _FabsAsIntegerMin()),
-                ("binary", _ToBinary()),
+                ("binary", _ToBinary(_kernels_by_module(entry, kernels))),
             ]
         )
     return stages
 
 
+def _kernels_by_module(
+    entry: str, kernels: Sequence[KernelParams]
+) -> dict[str, KernelParams]:
+    return {
+        xpu_transforms.kernel_module_name(entry, index): kernel
+        for index, kernel in enumerate(kernels)
+    }
+
+
+class _NanMaxima(Stage):
+    """Row maxima that propagate NaN, but what ``xegpu_nan_ignoring_maxima`` allows
+    (:mod:`row_maxima`)."""
+
+    def __init__(self, kernels: Sequence[KernelParams]) -> None:
+        self.ignoring = frozenset(
+            index
+            for index, kernel in enumerate(kernels)
+            if kernel.nan_ignoring_maxima is not None
+        )
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        restore_nan_propagating_maxima(
+            module, self.ignoring, xpu_transforms.KERNEL_ATTR
+        )
+        return module
+
+
 class _ToBinary(Stage):
     """The last pass of ``gpu-lower-to-xevm-pipeline`` (run with ``binary-format=
-    skip`` before), with its options: device binaries (fatbin). A GPU module that
-    spills is compiled again with its tile math ordered chunk by chunk, and that
-    binary is kept if it spills less; a failure there keeps the first binary
+    skip`` before), with its options: device binaries (fatbin), each GPU module with
+    its kernel's IGC options (``igc_vectorizer``). A GPU module that spills is
+    compiled again with its tile math ordered chunk by chunk, and that binary is
+    kept if it spills less; a failure there keeps the first binary
     (:mod:`xevm_tile_order`). A module of very long tile math is expected to spill:
     it is compiled ordered first, and plain only if that still spills. Decided per
     module: one kernel's spill does not change another's code."""
 
+    def __init__(self, kernels: Mapping[str, KernelParams] | None = None) -> None:
+        self.kernels = kernels or {}
+
     def apply(self, module: ir.Module) -> ir.Module:
-        to_binary = PassManager.parse(
-            "builtin.module(gpu-module-to-binary{format=fatbin "
-            f"opts={{{xpu_transforms.IGC_OPTIONS}}}}})",
-            module.context,
-        )
+        to_binary = _BinaryPasses(module.context, self.kernels)
         gpu_modules = [
             op.operation
             for op in module.body.operations
@@ -272,35 +300,59 @@ def _symbol(op: ir.Operation) -> str:
     return ir.StringAttr(op.attributes["sym_name"]).value
 
 
+class _BinaryPasses:
+    """``gpu-module-to-binary`` for each GPU module with its kernel's IGC options."""
+
+    def __init__(
+        self, context: ir.Context, kernels: Mapping[str, KernelParams]
+    ) -> None:
+        self.context = context
+        self.kernels = kernels
+        self.passes: dict[str, PassManager] = {}
+
+    def run(self, operation: ir.Operation, name: str) -> None:
+        kernel = self.kernels.get(name, KernelParams())
+        options = (
+            xpu_transforms.IGC_OPTIONS_CMP
+            if kernel.vectorizer_cmp
+            else xpu_transforms.IGC_OPTIONS
+        )
+        if options not in self.passes:
+            self.passes[options] = PassManager.parse(
+                f"builtin.module(gpu-module-to-binary{{format=fatbin opts={{{options}}}}})",
+                self.context,
+            )
+        self.passes[options].run(operation)
+
+
 def _compile(
-    to_binary: PassManager,
+    to_binary: _BinaryPasses,
     gpu_modules: Sequence[ir.Operation],
     *,
     ordered: bool = False,
 ) -> dict[str, ir.Operation]:
     """The ``gpu.binary`` of each of ``gpu_modules`` (left as they are), by name,
-    compiled in a module of their own."""
-    holder = ir.Module.create()
-    holder.operation.attributes["gpu.container_module"] = ir.UnitAttr.get()
-    point = ir.InsertionPoint(holder.body)
+    each compiled in a module of its own."""
+    binaries: dict[str, ir.Operation] = {}
     for gpu_module in gpu_modules:
-        point.insert(gpu_module.clone())
-    if ordered:
-        order_tile_chunks(holder)
-    to_binary.run(holder.operation)
-    binaries = {
-        _symbol(op.operation): op.operation
-        for op in holder.body.operations
-        if op.operation.name == "gpu.binary"
-    }
-    # Detached: they outlive the holder.
-    for binary in binaries.values():
-        binary.detach_from_parent()
+        holder = ir.Module.create()
+        holder.operation.attributes["gpu.container_module"] = ir.UnitAttr.get()
+        ir.InsertionPoint(holder.body).insert(gpu_module.clone())
+        if ordered:
+            order_tile_chunks(holder)
+        to_binary.run(holder.operation, _symbol(gpu_module))
+        for op in holder.body.operations:
+            if op.operation.name == "gpu.binary":
+                binary = op.operation
+                # Detached: it outlives the holder.
+                binary.detach_from_parent()
+                binaries[_symbol(binary)] = binary
+                break
     return binaries
 
 
 def _compile_ordered(
-    to_binary: PassManager, gpu_modules: Sequence[ir.Operation]
+    to_binary: _BinaryPasses, gpu_modules: Sequence[ir.Operation]
 ) -> dict[str, ir.Operation]:
     """:func:`_compile` with the tile math ordered, or nothing if that fails: the
     caller then has, or compiles, the plain binary."""
@@ -443,7 +495,7 @@ class XpuTarget(MLIRTarget):
 
     name = "xpu"
     pipelines = _PIPELINES
-    config_keys = XEGPU_CONFIG_KEYS
+    config_keys = XPU_CONFIG_KEYS
     stop_points = XPU_STOP_POINTS
 
     buffer_alignment = 64

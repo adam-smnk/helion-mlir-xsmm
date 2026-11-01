@@ -70,7 +70,10 @@ def prepare_for_xegpu() -> ir.Module:
       inside a tile (``fold_slice_unit_dims``: e.g. one K chunk of a
       ``[M, S, K/S]`` view); batched matmuls are
       generalized first (as lighthouse's cleanup does) so a unit batch dim
-      folds, leaving a matmul.
+      folds, leaving a matmul; so are named elementwise ops (a tile times a
+      runtime scalar's fill), which the folding skips: their unit dims would
+      otherwise reach bufferization as a scratch tile (``tile_width * v_blocks``
+      in XeVM for a runtime attention scale).
     - Loop-carried tensors updated elementwise into a fresh tensor (e.g. the
       running sum of a flash-attention kernel) are updated in place
       (``carry_loop_inits``), so vectorization carries them as vectors.
@@ -90,7 +93,7 @@ def prepare_for_xegpu() -> ir.Module:
         )
         transform_ext.remove_asserts(linalg_ops)
         contracts = lh_transform.match_op(
-            module, ["linalg.contract", "linalg.batch_matmul"]
+            module, ["linalg.contract", "linalg.batch_matmul", "linalg.elementwise"]
         )
         structured.structured_generalize(anytype, contracts)
         module = apply_registered_pass(module, "linalg-fuse-elementwise-ops")
@@ -106,38 +109,6 @@ def prepare_for_xegpu() -> ir.Module:
         lh_transform.cleanup(module)
         ht.carry_loop_inits(module)
         ht.materialize_tile_copies(module)
-        transform.yield_()
-    return schedule
-
-
-def nan_propagating_maxima() -> ir.Module:
-    """Schedule: ``maxnumf`` vector reductions back to ``maximumf``.
-
-    Lighthouse's ``vectorize_schedule`` (``enable_fastmath_optimizations``)
-    turns every ``maximumf`` multi-reduction into a ``maxnumf`` one, which
-    ignores NaN operands (its FIXME). Torch's maxima propagate NaN (``amax``,
-    ``max``, the row maximum of a softmax), and Helion kernels produce no
-    ``maxnumf`` reduction of their own (torch has no NaN-ignoring maximum
-    reduction), so every ``maxnumf`` reduction here is lighthouse's rewrite.
-
-    It also keeps 97's flash attention away from an IGC miscompile, though
-    ``IGC_OPTIONS`` is the workaround for that: with ``maxnumf`` row maxima,
-    IGC turns the running maximum into a vector compare and select that writes
-    one element (see ``IGC_OPTIONS``). ``llvm.maximum`` expands to scalar
-    compares that do not take that path. ``xevm_nsz_minmax`` keeps the cost of
-    ``maximumf`` down.
-    """
-    with schedule_boilerplate() as (schedule, named_seq):
-        maximum = transform.param_constant(
-            transform.AnyParamType.get(),
-            ir.Attribute.parse("#vector.kind<maximumf>"),
-        )
-        maxnum_reductions = match(
-            named_seq.bodyTarget,
-            ops=["vector.multi_reduction"],
-            op_attrs={"kind": ir.Attribute.parse("#vector.kind<maxnumf>")},
-        )
-        transform.annotate(maxnum_reductions, "kind", param=maximum)
         transform.yield_()
     return schedule
 
@@ -165,8 +136,8 @@ def legalize_host_ops() -> ir.Module:
 
 
 IGC_OPTIONS = r"-ze-opt-large-register-file\" \"-igc_opts \'EnableVectorizer=0\'"
-"""IGC options of the device binaries (lighthouse's ``xegpu_to_binary``). Only
-``gpu-module-to-binary``'s ``opts`` pass them to IGC (the XPU target's binary
+"""IGC options of a device binary with ``igc_vectorizer`` ``"off"``, today's default.
+Only ``gpu-module-to-binary``'s ``opts`` pass them to IGC (the XPU target's binary
 stage); this LLVM never reads a target's ``cmd-options`` flag.
 
 The spelling is for that path: the options are tokenized, so the quotes
@@ -176,14 +147,17 @@ in one pair silently lose the large register file (128 GRFs, with no error). The
 escaped quotes close the first pair and open a second one.
 
 - The large register file: 256 GRFs; without it GEMMs get 128 and spill.
-- ``EnableVectorizer=0`` turns off ``IGCVectorizer``, which miscompiled kernels
-  in the two ways below (IGC 2.41, B50) and took a compiler crash on a Triton
-  kernel. Measured on the B50 against ``VectorizerAllowCMP=0``, 3 processes: 97
-  1.7 % less device time and no spill; level 1 problems at most 1.6 % more
-  (6, 29, 9, 7), the others within 0.4 %.
+- ``EnableVectorizer=0`` turns off ``IGCVectorizer``, which miscompiled kernels in
+  the two ways below (IGC 2.41, B50) and took a compiler crash on a Triton kernel.
 
-The pass's partial switches (``-igc_opts``, comma separated), kept to re-enable
-it piece by piece, and what each avoids:
+Device time with this against :data:`IGC_OPTIONS_CMP`, on the B50 at bench shapes:
+29_Softplus +6.3 %, L2 29_Matmul_Mish_Mish +6.9 %, L2 81 +3.3 %, attention with
+``maxnum`` row maxima +17 % on 97 at ``[1, 1, 256, 32]`` (3003 against 2561 us) and
++44 % on Llama GQA at ``[1, 1, 256, 64]`` (318 against 220), the rest about 1 % or
+less either way. So this is the default and that one a choice, per kernel, for
+kernels whose results were checked under it.
+
+The pass's partial switches (``-igc_opts``, comma separated), and what each avoids:
 
 - ``VectorizerAllowCMP=0``: no vector compares. ``IGCVectorizer`` rebuilds scalar
   compares and selects as ``select <8 x i1> (fcmp a, b), a, b``, and
@@ -194,15 +168,24 @@ it piece by piece, and what each avoids:
   with another one kept over a loop, or with a second row value: a running
   maximum, or a row sum through a clamp.
 - ``VectorizerAllowFPTRUNC=0``: no vector ``fptrunc``. ``fptrunc <8 x float> %v`` is
-  placed before the ``insertelement``s of ``%v``, a use before its def (22_Tanh and
-  other branchy builtins rounded to bf16 or f16): the output is whatever those
-  registers hold, left by an earlier kernel, zero only if nothing has written
-  them yet.
+  placed before the ``insertelement``s of ``%v``, a use before its def, only where a
+  scalar builtin's result goes straight into a conversion to 16 bits (``sin``, ``cos``,
+  ``tan``, ``log``, ``log2``, ``expm1``, ``sinh``, ``cosh`` and ``acos`` of f32 rounded
+  to bf16 here; ``upstream-repro/igc-vector-minmax/fptrunc`` in the wiki, on a scalar
+  ``tanh`` builtin; Helion's ``tanh`` is a polynomial, ``xpu_math_approx``, and does not
+  take it): the output is whatever those registers hold, left by an earlier kernel,
+  zero only if nothing has written them yet. Not set with :data:`IGC_OPTIONS_CMP`, as it
+  costs most of what that gains on attention (Llama GQA 288 against 220 us), so a
+  ``"cmp"`` kernel of that form is wrong: it is the kernel author's choice, and
+  ``tests/test_xpu_igc_workarounds.py`` scans the kernels that choose it.
 - ``VectorizerAllowSelect=0``: avoids the Triton compiler crash through ``ocloc``,
   as ``VectorizerAllowCMP=0`` also does; cause not investigated.
 - ``VectorizerAllowFADD``, ``FSUB``, ``FMUL``, ``FDIV``, ``EXP2``, ``MAXNUM``,
   ``WAVEALL``, ``WAVEALLJoint``, ``UniformCMP``, ``UniformSelect``: no bug known in
   them, none tried on our kernels."""
+IGC_OPTIONS_CMP = r"-ze-opt-large-register-file\" \"-igc_opts \'VectorizerAllowCMP=0\'"
+"""IGC options of a device binary with ``igc_vectorizer`` ``"cmp"``: the vectorizer
+on, but for vector compares. See :data:`IGC_OPTIONS`."""
 XEVM_TARGET = '#xevm.target<O = 3, chip = "bmg">'
 """The one XeVM target of every GPU module: lighthouse's (``O = 3``, ``bmg``)."""
 _NO_MODULE = "^$"

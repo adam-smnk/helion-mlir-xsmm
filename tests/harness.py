@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -22,6 +24,7 @@ from helion_mlir_backend._compiler.targets import xpu as xpu_target
 if TYPE_CHECKING:
     from collections.abc import Callable
     from collections.abc import Iterator
+    from types import ModuleType
 
     from mlir import ir
 
@@ -45,6 +48,15 @@ def opt_pipeline() -> contextlib.AbstractContextManager[None]:
 
 
 _FAKE_MODE = FakeTensorMode()
+
+
+def load_example(relative_path: str) -> ModuleType:
+    """The module of a script under ``examples/``, run as a library."""
+    path = Path(__file__).resolve().parent.parent / "examples" / relative_path
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def xpu_tensor(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:

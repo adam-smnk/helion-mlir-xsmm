@@ -36,7 +36,7 @@ from helion_mlir_backend._compiler.mlir_transforms.xegpu_reduction import (
 from helion_mlir_backend._compiler.targets import get_target
 from helion_mlir_backend._compiler.targets import target_config_keys
 from helion_mlir_backend._compiler.targets.xpu_params import PARAMS_ATTR
-from helion_mlir_backend._compiler.targets.xpu_params import XEGPU_CONFIG_KEYS
+from helion_mlir_backend._compiler.targets.xpu_params import XPU_CONFIG_KEYS
 from helion_mlir_backend._compiler.targets.xpu_params import ElementwiseShape
 from helion_mlir_backend._compiler.targets.xpu_params import GemmShape
 from helion_mlir_backend._compiler.targets.xpu_params import KernelParams
@@ -952,14 +952,14 @@ def test_elementwise_layout_limits(
 
 
 def test_config_keys_are_registered() -> None:
-    assert target_config_keys() == XEGPU_CONFIG_KEYS == get_target("xpu").config_keys
+    assert target_config_keys() == XPU_CONFIG_KEYS == get_target("xpu").config_keys
     assert get_target("cpu").config_keys == frozenset()
-    assert XEGPU_CONFIG_KEYS <= helion_config_spec.VALID_KEYS
+    assert XPU_CONFIG_KEYS <= helion_config_spec.VALID_KEYS
     backend = MLIRBackend()
-    assert all(backend.supports_config_key(key) for key in XEGPU_CONFIG_KEYS)
+    assert all(backend.supports_config_key(key) for key in XPU_CONFIG_KEYS)
     # Searched per kernel: the XPU target adds them to a kernel's config spec
     # (``xpu_search``), not to Helion's global backend tunables.
-    assert not XEGPU_CONFIG_KEYS & helion_config_spec.BACKEND_TUNABLE_KEYS
+    assert not XPU_CONFIG_KEYS & helion_config_spec.BACKEND_TUNABLE_KEYS
 
 
 def test_parameters_are_recorded_on_the_module() -> None:
