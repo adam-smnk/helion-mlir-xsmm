@@ -93,6 +93,11 @@ def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line("markers", "slow: long-running test")
     config.addinivalue_line(
         "markers",
+        "helion_internals: pins Helion internals the native kernel run relies on "
+        "(host-code types, binding, call conventions); run first on a Helion upgrade",
+    )
+    config.addinivalue_line(
+        "markers",
         "xpu_runtime: runs XPU kernels on the device; skipped unless torch finds an "
         "XPU and the MLIR bindings can emit and run XPU binaries",
     )

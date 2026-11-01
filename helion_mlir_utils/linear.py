@@ -27,8 +27,8 @@ CACHE_PREPACKED_WEIGHTS_ENV = "HELION_MLIR_CACHE_PREPACKED_WEIGHTS"
 def cache_prepacked_weights() -> bool:
     """Whether constant weights are packed once and reused (the default);
     ``HELION_MLIR_CACHE_PREPACKED_WEIGHTS=0`` packs them on every call."""
-    value = os.environ.get(CACHE_PREPACKED_WEIGHTS_ENV, "").strip().lower()
-    return value not in ("0", "false", "no")
+    value = os.environ.get(CACHE_PREPACKED_WEIGHTS_ENV)
+    return value is None or value.strip().lower() not in ("0", "false", "no")
 
 
 class LinearCache(NamedTuple):
@@ -91,9 +91,11 @@ def linear(
     reused until the source parameters, input dtype, or device change;
     ``HELION_MLIR_CACHE_PREPACKED_WEIGHTS=0`` packs it on every call.
     """
-    source_biases = (
-        (() if layer.bias is None else (layer.bias,)) if biases is None else biases
-    )
+    if biases is None:
+        bias = layer.bias  # (a module attribute lookup: once per call)
+        source_biases = () if bias is None else (bias,)
+    else:
+        source_biases = biases
     if not cache_prepacked_weights():
         weight = layer.weight.to(dtype=x.dtype, device=x.device)
         return (
@@ -109,7 +111,7 @@ def linear(
 
     key = (
         _parameter_key(layer.weight),
-        tuple(_parameter_key(bias) for bias in source_biases),
+        tuple(map(_parameter_key, source_biases)),
         x.dtype,
         x.device,
         x.shape[0],

@@ -6,6 +6,8 @@ registers an external MLIR backend with vanilla Helion when imported.
 
 from __future__ import annotations
 
+from ._compiler.mlir.driver import prepared_call as prepared_call
+from ._compiler.native import set_native_call as set_native_call
 from .api import compile_mlir as compile_mlir
 from .api import generate_mlir as generate_mlir
 from .api import lower_mlir as lower_mlir
@@ -20,6 +22,8 @@ __all__ = [
     "inline_mlir",
     "install",
     "lower_mlir",
+    "prepared_call",
+    "set_native_call",
 ]
 
 # Import-time side effect: make backend name "mlir" available in Helion.

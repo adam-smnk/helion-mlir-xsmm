@@ -135,6 +135,13 @@ class MLIRTarget(abc.ABC):
         :meth:`finish_call`, skips those checks and hooks (default: never)."""
         return False
 
+    native_in_place: bool = False
+    """Whether the native call paths (``native/``) may be used. They take only
+    plain dense CPU tensors (strided; no conjugate or negative bit,
+    functionalization, functorch or Python wrapper), each of which must pass
+    :meth:`passes_in_place`; any other tensor takes the Python paths
+    (default: no native paths)."""
+
     buffer_alignment: int = 1
     """The byte alignment the compiled kernels assume for the data of every
     tensor argument; ``call_entry`` passes a staged copy of a tensor whose data

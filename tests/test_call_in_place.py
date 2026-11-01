@@ -180,15 +180,24 @@ def test_scalar_and_dynamic_entries_have_no_in_place_path(
 
 
 def test_busy_packed_arguments_take_general_path(general_calls: list[str]) -> None:
+    # The Python in-place path (no native EntryCall) packs into one buffer
+    # per entry; the native paths pack on the stack and take no lock.
     x, y = torch.randn(16, 16), torch.randn(16, 16)
     run_direct(scaled_add, [x, y])
-    static = _entry(scaled_add, [x, y])._static
+    entry = _entry(scaled_add, [x, y])
+    values = [{"x": x, "y": y}.get(arg.name, torch.empty(16, 16)) for arg in entry.args]
+    static = entry._static
+    native_call = entry._native
+    object.__setattr__(entry, "_native", None)
     general_calls.clear()
     assert static.lock.acquire(blocking=False)
     try:
-        torch.testing.assert_close(run_direct(scaled_add, [x, y]), x * 2.0 + y)
+        assert entry.call_in_place(values) is None
+        driver.call_entry(entry, values)
     finally:
         static.lock.release()
+        object.__setattr__(entry, "_native", native_call)
+    torch.testing.assert_close(values[0], x * 2.0 + y)
     assert general_calls
 
 
@@ -229,6 +238,7 @@ def test_packed_descriptors_match_the_general_packing() -> None:
 def _entry(kernel: helion.Kernel, args: list[object]) -> execution.CompiledEntry:
     """The compiled entry ``kernel`` runs for ``args``."""
     run = kernel.bind(tuple(args))._run
+    run = getattr(run, "general", run)  # the Python run behind a native KernelRun
     cells = dict(zip(run.__code__.co_freevars, run.__closure__, strict=True))
     return cells["entry"].cell_contents
 

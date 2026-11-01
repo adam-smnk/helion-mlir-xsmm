@@ -99,6 +99,10 @@ class CpuTarget(MLIRTarget):
     def passes_in_place(self, tensor: torch.Tensor) -> bool:
         return tensor.is_cpu
 
+    # The native paths take only plain dense CPU tensors: a subset of
+    # passes_in_place (anything else takes the Python paths).
+    native_in_place = True
+
     def hardware_name(self) -> str:
         return cpu_name()
 

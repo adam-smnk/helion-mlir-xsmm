@@ -47,6 +47,11 @@ if TYPE_CHECKING:
 
     from helion.runtime.kernel import BoundKernel
 
+try:
+    from helion_mlir_backend import prepared_call as _prepared_call
+except ImportError:  # a backend without native calls
+    _prepared_call = None
+
 # AMX bf16 register tile. All three extents must divide by this to use the
 # blocked path.
 BLOCK_M = 32
@@ -1608,6 +1613,7 @@ def prepacked_b_call(
         bound, consts = _prepacked_bound(
             a.view(pairs), b4, bias2, scale2, shift2, epilogue, tile_m
         )
+        bound_args = (a.view(pairs), b4, bias2, scale2, shift2, epilogue, *consts)
 
         def run(x: Tensor) -> Tensor:
             return bound(x.view(pairs), b4, bias2, scale2, shift2, epilogue, *consts)
@@ -1628,6 +1634,7 @@ def prepacked_b_call(
             return general
         b3, bias2 = _rows_operands(b4, n, bias)
         bound = _rows_bound(a, b3, bias2, epilogue)
+        bound_args = (a, b3, bias2, epilogue)
 
         def run(x: Tensor) -> Tensor:
             return bound(x, b3, bias2, epilogue)
@@ -1638,7 +1645,14 @@ def prepacked_b_call(
         out = run(x).view(m, n_pad)
         return out if n == n_pad else out[:, :n]
 
-    return call
+    if n != n_pad or _prepared_call is None:
+        return call
+    # The same call natively: x (contiguous, this shape and dtype) as the
+    # kernel's operand view, the result as [M, N]; anything else takes call.
+    prepared = _prepared_call(
+        bound, bound_args, [0], call, views=[tuple(shape)], result_shape=(m, n_pad)
+    )
+    return call if prepared is None else prepared
 
 
 def matmul_prepacked_b_affine(

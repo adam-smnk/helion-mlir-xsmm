@@ -281,3 +281,65 @@ def test_row_sum_cache_evicts_least_recently_used() -> None:
         out = red.row_sum(x, epilogues[i])
         assert torch.equal(out, outs[i])
         torch.testing.assert_close(out.float(), ref * (i + 1.0), atol=0.5, rtol=2e-2)
+
+
+def _native_extension() -> bool:
+    from helion_mlir_backend._compiler import native
+
+    return native.module() is not None
+
+
+@pytest.mark.skipif(not _native_extension(), reason="no native extension")
+@pytest.mark.parametrize(
+    ("dtype", "affine"),
+    [(torch.float32, False), (torch.bfloat16, False), (torch.bfloat16, True)],
+)
+def test_prepared_linear_calls_run_natively(dtype: torch.dtype, affine: bool) -> None:
+    """The prepared call of ``linear`` / ``linear_affine`` is the backend's
+    native prepared run: later calls with the same activation layout run
+    natively, bit-equal to the general path; others take the Python call."""
+    from helion_mlir_utils.linear import linear_affine
+
+    torch.manual_seed(2)
+    layer = torch.nn.Linear(128, 64).to(dtype)
+    scale = torch.randn(64, dtype=dtype)
+    shift = torch.randn(64, dtype=dtype)
+
+    def run(x: torch.Tensor, cache: object) -> tuple[torch.Tensor, object]:
+        if affine:
+            return linear_affine(x, layer, scale, shift, torch.relu, cache=cache)
+        return linear(x, layer, torch.relu, cache=cache)
+
+    def general(x: torch.Tensor, cache: object) -> torch.Tensor:
+        extra = (scale, shift) if affine else ()
+        return mm.matmul_prepacked_b(
+            x, cache.packed_weight, 64, cache.bias, torch.relu, *extra
+        )
+
+    with torch.no_grad():
+        x = torch.randn(32, 128, dtype=dtype)
+        _, cache = run(x, None)
+        prepared = cache.call[2]
+        assert type(prepared).__name__ == "PreparedRun"
+        _, cache = run(x, cache)  # (the kernel's first call records its plan)
+        before = prepared.native_calls
+        x2 = torch.randn(32, 128, dtype=dtype)
+        y2, cache = run(x2, cache)
+        assert prepared.native_calls == before + 1
+        assert y2.shape == (32, 64) and y2.is_contiguous()
+        assert torch.equal(y2, general(x2, cache))
+        # A non-contiguous activation of the same shape: the Python call.
+        xt = torch.randn(128, 32, dtype=dtype).t()
+        y3, cache = run(xt, cache)
+        assert torch.equal(y3, general(xt.contiguous(), cache))
+
+
+@pytest.mark.skipif(not _native_extension(), reason="no native extension")
+def test_prepared_call_keeps_the_closure_for_padded_columns() -> None:
+    # N = 70 is padded to whole panels: the result is a column slice, which
+    # the native prepared run does not make.
+    a = torch.randn(32, 64)
+    b4 = mm.pack_b_blocked_t(torch.randn(70, 64))
+    call = mm.prepacked_b_call(a, b4, 70, None, torch.relu)
+    assert type(call).__name__ == "function"
+    assert torch.equal(call(a), mm.matmul_prepacked_b(a, b4, 70, None, torch.relu))

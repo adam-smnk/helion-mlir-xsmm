@@ -34,6 +34,7 @@ import mlir.ir as ir
 from mlir.passmanager import PassManager
 import torch
 
+from helion_mlir_backend._compiler import native
 from helion_mlir_backend._compiler.mlir.in_place import update_carried_values_in_place
 from helion_mlir_backend._compiler.mlir.support.debug import DebugOptions
 from helion_mlir_backend._compiler.mlir.support.debug import compile_timeout
@@ -55,7 +56,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-_JIT_CACHE: OrderedDict[tuple[str, str, str], CompiledEntry] = OrderedDict()
+_JIT_CACHE: OrderedDict[tuple[str, str, str, bool], CompiledEntry] = OrderedDict()
 _JIT_CACHE_SIZE = 128
 
 
@@ -101,6 +102,24 @@ class CompiledEntry:
         # The ctypes callable of the packed C interface, looked up once.
         object.__setattr__(self, "_func", self.runner.engine.lookup(self.name))
         object.__setattr__(self, "_static", _StaticCall.build(self.args))
+        object.__setattr__(self, "_native", self._native_call())
+
+    def _native_call(self) -> object | None:
+        """The native ``EntryCall`` of a static entry on a target with native
+        paths, if the extension is available."""
+        if self._static is None or not self.target.native_in_place:
+            return None
+        if (extension := native.module()) is None:
+            return None
+        address = ctypes.cast(self._func, ctypes.c_void_p).value
+        return extension.EntryCall(
+            address,
+            [
+                (arg.shape, arg.dtype, arg.role == "inout")
+                for arg in self.args  # every arg a memref of static shape
+            ],
+            self.target.buffer_alignment,
+        )
 
     def call_in_place(self, values: Sequence[object]) -> list[torch.Tensor] | None:
         """Call the entry and return its inout tensors if every argument is a
@@ -112,7 +131,10 @@ class CompiledEntry:
         with another argument -- else return ``None`` without calling it: the
         caller then takes the general path (``driver.call_entry``), which
         stages, checks and reports. Only the data pointers change between
-        calls, so the arguments are packed once per entry."""
+        calls, so the arguments are packed once per entry. On a target with
+        :attr:`MLIRTarget.native_in_place`, the native ``EntryCall``
+        (``native/``) does these checks and the call first (descriptors on
+        the stack, no lock); a call it refuses gets the Python checks."""
         static = self._static
         if static is None:
             return None
@@ -124,6 +146,12 @@ class CompiledEntry:
             or hooks.finish_call is not MLIRTarget.finish_call
         ):
             return None
+        if (native_call := self._native) is not None:
+            # The checks below and the call, natively; a value it doesn't
+            # take (e.g. a non-plain tensor that passes_in_place admits)
+            # gets the Python checks.
+            if native_call.call(values):
+                return [values[i] for i in static.inouts]  # type: ignore[misc]
         passes = self.target.passes_in_place
         alignment = self.target.buffer_alignment
         for value, shape, strides, dtype in zip(
@@ -348,7 +376,14 @@ def compile_entry(
         or not target.is_full(stop_at)
     ):
         return _compile_entry(module, entry, target, pipeline, stop_at, debug)
-    key = (hashlib.sha256(str(module).encode()).hexdigest(), target.name, pipeline)
+    # The native switch is part of the key: entries compiled with it on carry
+    # native call paths.
+    key = (
+        hashlib.sha256(str(module).encode()).hexdigest(),
+        target.name,
+        pipeline,
+        native.enabled(),
+    )
     if (compiled := _JIT_CACHE.get(key)) is not None:
         _JIT_CACHE.move_to_end(key)
         return compiled

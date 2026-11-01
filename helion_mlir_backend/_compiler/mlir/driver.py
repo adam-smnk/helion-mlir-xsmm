@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from .. import native
 from ..execution import compile_entry
 from ..targets import resolve_target
 from .codegen import MLIRModuleBuilder
@@ -22,6 +23,7 @@ from .support.debug import PIPELINE_CONFIG_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Sequence
 
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
@@ -120,7 +122,202 @@ def compile_kernel(
             return done.value
         raise AssertionError("the host function yields once")
 
-    return run
+    return _native_run(run, entry, host_function, arg_sources, symbolic_sizes)
+
+
+def _native_run(
+    run: Callable[..., object],
+    entry: CompiledEntry,
+    host_function: Callable[..., object],
+    arg_sources: list[tuple[str | None, object]],
+    symbolic_sizes: object,
+) -> Callable[..., object]:
+    """``run``, or a native ``KernelRun`` in front of it if the kernel
+    qualifies: its first call records a plan (:func:`_plan`); later calls
+    whose arguments match it run natively, all others take ``run``. The first
+    call decides: one that can't be planned leaves every call on ``run``."""
+    native_call = getattr(entry, "_native", None)
+    if (
+        native_call is None
+        or symbolic_sizes is not None
+        or not getattr(host_function, "_helion_mlir_metadata_only", False)
+        or any(name is None for name, _ in arg_sources)
+        or (extension := native.module()) is None
+    ):
+        return run
+    names = [name for name, _ in arg_sources]
+    defaults = (
+        *(host_function.__defaults__ or ()),
+        *(host_function.__kwdefaults__ or {}).values(),
+    )
+
+    def planner(native_run: object, *args: object) -> object:
+        return _plan(
+            native_run, run, entry, native_call, host_function, names, defaults, args
+        )
+
+    return extension.KernelRun(run, planner)
+
+
+_ScalarTypes = (int, float, bool, str, type(None))
+
+
+def _plan(
+    native_run: object,
+    run: Callable[..., object],
+    entry: CompiledEntry,
+    native_call: object,
+    host_function: Callable[..., object],
+    names: list[str],
+    defaults: tuple[object, ...],
+    args: tuple[object, ...],
+) -> object:
+    """The first call: as ``run``, recording which argument or fresh host
+    tensor each entry argument is and what is returned. Installs that plan in
+    ``native_run`` if each entry argument and the result is exactly one
+    argument (no two arguments the same object) or a fresh contiguous CPU
+    tensor (not a default argument), tensor arguments are plain CPU tensors
+    and other arguments immutable scalars, scalar ``hl.constexpr`` values or
+    functions. Without a plan, every call takes ``run``."""
+    try:
+        params = _plan_params(args)
+    except Exception:
+        params = None
+    if params is None:
+        return run(*args)
+    host = host_function(*args)
+    try:
+        local_vars = next(host)
+        if not all(name in local_vars for name in names):
+            # Not a host local after all (run evaluates it): no plan.
+            host.close()
+            return run(*args)
+        values = [local_vars[name] for name in names]
+        call_entry(entry, values)
+        next(host)
+    except StopIteration as done:
+        result = done.value
+    else:
+        raise AssertionError("the host function yields once")
+    plan = _plan_sources(args, values, result, defaults)
+    if plan is not None:
+        from ..targets.base import MLIRTarget
+
+        hooks = (type(entry.target), MLIRTarget.prepare_call, MLIRTarget.finish_call)
+        native_run.install(native_call, hooks, params, *plan)  # type: ignore[attr-defined]
+    return result
+
+
+def _plan_params(args: tuple[object, ...]) -> list[tuple[object, ...]] | None:
+    """Per argument ``(kind, dtype or value, sizes, strides)``: 0 a plain CPU
+    tensor, 1 an object compared by identity (a builtin function), 2 a scalar
+    (type and ``==``), 3 an ``hl.constexpr`` of a scalar (its type, its
+    value's type and ``==``: a helper may make a new one per call), 4 a
+    function ``(4, function, cell kinds, cell contents)``: its code and its
+    closure's contents when planned, each as 1-3 (as Helion keys functions:
+    another instance of a model has its own epilogue closures); ``None``: no
+    plan."""
+    import types
+
+    from helion.language.constexpr import ConstExpr
+
+    params: list[tuple[object, ...]] = []
+    for arg in args:
+        if type(arg) in (torch.Tensor, torch.nn.Parameter):
+            tensor: torch.Tensor = arg  # type: ignore[assignment]
+            if tensor.device.type != "cpu" or tensor.layout != torch.strided:
+                return None
+            params.append((0, tensor.dtype, tuple(tensor.shape), tensor.stride()))
+        elif type(arg) in _ScalarTypes:
+            if arg != arg:  # NaN never matches: no plan
+                return None
+            params.append((2, arg, (), ()))
+        elif type(arg) is ConstExpr and type(arg.value) in _ScalarTypes:  # type: ignore[attr-defined]
+            if arg.value != arg.value:  # type: ignore[attr-defined]
+                return None
+            params.append((3, arg, (), ()))
+        elif isinstance(arg, types.FunctionType):
+            try:
+                contents = tuple(cell.cell_contents for cell in arg.__closure__ or ())
+            except ValueError:  # an empty cell
+                return None
+            params.append((4, arg, tuple(map(_value_kind, contents)), contents))
+        elif isinstance(arg, types.BuiltinFunctionType):
+            params.append((1, arg, (), ()))
+        else:
+            return None
+    return params
+
+
+def _value_kind(value: object) -> int:
+    """How a closure cell's content is compared (as :func:`_plan_params`)."""
+    from helion.language.constexpr import ConstExpr
+
+    if type(value) in _ScalarTypes and value == value:
+        return 2
+    if type(value) is ConstExpr and type(value.value) in _ScalarTypes:  # type: ignore[attr-defined]
+        return 3 if value.value == value.value else 1  # type: ignore[attr-defined]
+    return 1
+
+
+def _plan_sources(
+    args: tuple[object, ...],
+    values: list[object],
+    result: object,
+    defaults: tuple[object, ...],
+) -> (
+    tuple[
+        list[tuple[int, int]],
+        list[tuple[torch.dtype, tuple[int, ...]]],
+        tuple[int, int],
+    ]
+    | None
+):
+    """``(sources, fresh, result)`` for ``KernelRun.install``: per entry
+    argument and for the result, ``(0, argument index)`` or ``(1, fresh
+    index)`` (``(0, -1)``: returns None); ``None``: no plan."""
+    from ..execution import _contiguous_strides
+
+    fresh: list[torch.Tensor] = []
+    arg_storages = {
+        arg.untyped_storage().data_ptr()
+        for arg in args
+        if isinstance(arg, torch.Tensor)
+    }
+
+    def source(value: object) -> tuple[int, int] | None:
+        matches = [index for index, arg in enumerate(args) if value is arg]
+        if matches:
+            # The same object for two arguments: a later call may pass two.
+            return (0, matches[0]) if len(matches) == 1 else None
+        for index, tensor in enumerate(fresh):
+            if value is tensor:
+                return (1, index)
+        if (
+            type(value) is torch.Tensor
+            and not any(value is default for default in defaults)
+            and value.device.type == "cpu"
+            and value.layout == torch.strided
+            # The strides at::empty gives (torch's contiguity ignores the
+            # strides of size-1 dims).
+            and value.stride() == _contiguous_strides(value.shape)
+            and value.storage_offset() == 0
+            and value.untyped_storage().data_ptr() not in arg_storages
+            and not value.requires_grad
+        ):
+            fresh.append(value)
+            return (1, len(fresh) - 1)
+        return None
+
+    sources = [source(value) for value in values]
+    result_source = (0, -1) if result is None else source(result)
+    if result_source is None or any(s is None for s in sources):
+        return None
+    return (
+        sources,  # type: ignore[return-value]
+        [(t.dtype, tuple(t.shape)) for t in fresh],
+        result_source,
+    )
 
 
 def call_entry(
@@ -281,3 +478,46 @@ def _byte_span(t: torch.Tensor) -> tuple[int, int]:
         (size - 1) * stride for size, stride in zip(t.shape, t.stride(), strict=True)
     )
     return start, start + (last + 1) * t.element_size()
+
+
+def prepared_call(
+    bound_kernel: BoundKernel,
+    args: Sequence[object],
+    varying: Sequence[int],
+    fallback: Callable[..., object],
+    *,
+    views: Sequence[Sequence[int] | None] | None = None,
+    result_shape: Sequence[int] | None = None,
+) -> Callable[..., object] | None:
+    """``lambda *v: bound_kernel(*args with v at the varying positions)``,
+    natively: a call checks the varying tensors (and everything else the
+    native run checks: the bound tensors' metadata, their current data, that
+    ``bound_kernel`` still runs the same compiled kernel) and calls the
+    kernel; any other call returns ``fallback(*v)``. ``None`` if the kernel
+    has no native run (not static, host code not metadata-only, no
+    extension).
+
+    ``views[k]`` (optional, per varying argument): the caller passes a
+    contiguous tensor of that shape, standing for its contiguous view of the
+    argument's shape (e.g. ``x`` for ``x.view(m, k // 2, 2)``).
+    ``result_shape``: the result, a fresh tensor of the host code, is
+    allocated with that shape (as ``result.view(result_shape)``). Neither may
+    change the element count. The first native call happens after the kernel
+    ran once (its plan is recorded on its first call)."""
+    if bound_kernel._run is None:
+        bound_kernel.ensure_config_exists(tuple(args))
+    run = bound_kernel._run
+    if native.module() is None or type(run).__name__ != "KernelRun":
+        return None
+    varying = list(varying)
+    bound = tuple(None if i in varying else arg for i, arg in enumerate(args))
+    return run.prepare(  # type: ignore[union-attr]
+        bound_kernel,
+        bound,
+        varying,
+        [None if v is None else tuple(v) for v in views]
+        if views is not None
+        else [None] * len(varying),
+        None if result_shape is None else tuple(result_shape),
+        fallback,
+    )

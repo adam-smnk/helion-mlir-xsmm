@@ -168,7 +168,7 @@ def test_jit_cache_keys_differ_by_target_and_pipeline(
     assert {key[0] for key in keys} == {
         hashlib.sha256(module_text.encode()).hexdigest()
     }
-    assert [key[1:] for key in keys] == [
+    assert [key[1:3] for key in keys] == [
         ("cpu", "scalar"),
         ("other-cpu", "opt"),
         ("cpu", "opt"),
