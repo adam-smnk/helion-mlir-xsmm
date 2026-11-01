@@ -7,6 +7,7 @@ element of A once, so its speed is A's bandwidth.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 import os
 from typing import Callable
 
@@ -79,6 +80,9 @@ def _row_sum_kernel(x: Tensor, epilogue: Callable[[Tensor], Tensor]) -> Tensor:
 
 
 _ROW_SUM_KERNELS: dict[tuple[int, int], helion.Kernel] = {}
+# Least recently used bound kernels, evicted past _ROW_SUM_BOUND_SIZE.
+_ROW_SUM_BOUND: OrderedDict[tuple, object] = OrderedDict()
+_ROW_SUM_BOUND_SIZE = 64
 
 
 def row_sum(
@@ -92,10 +96,22 @@ def row_sum(
     threads = int(os.environ.get("OMP_NUM_THREADS", torch.get_num_threads()))
     # The column block is registered first.
     block_sizes = (min(n, 512), max(1, min(32, -(-m // threads))))
-    if block_sizes not in _ROW_SUM_KERNELS:
-        _ROW_SUM_KERNELS[block_sizes] = helion.kernel(
-            _row_sum_kernel,
-            backend="mlir",
-            config=helion.Config(block_sizes=list(block_sizes)),
-        )
-    return _ROW_SUM_KERNELS[block_sizes](x.contiguous(), epilogue)
+    x = x.contiguous()
+    # The kernel bound once per shape, dtype and epilogue: binding per call
+    # costs about as much host time as the kernel itself (128x4096 bf16:
+    # 27 us per call, 8 us of it the kernel).
+    key = (block_sizes, m, n, x.dtype, x.device, epilogue)
+    if (bound := _ROW_SUM_BOUND.get(key)) is None:
+        if block_sizes not in _ROW_SUM_KERNELS:
+            _ROW_SUM_KERNELS[block_sizes] = helion.kernel(
+                _row_sum_kernel,
+                backend="mlir",
+                config=helion.Config(block_sizes=list(block_sizes)),
+            )
+        bound = _ROW_SUM_KERNELS[block_sizes].bind((x, epilogue))
+        _ROW_SUM_BOUND[key] = bound
+        if len(_ROW_SUM_BOUND) > _ROW_SUM_BOUND_SIZE:
+            _ROW_SUM_BOUND.popitem(last=False)
+    else:
+        _ROW_SUM_BOUND.move_to_end(key)
+    return bound(x, epilogue)

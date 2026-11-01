@@ -1391,15 +1391,23 @@ def prepacked_b_call(
     n: int,
     bias: Tensor | None = None,
     epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
+    scale: Tensor | None = None,
+    shift: Tensor | None = None,
 ) -> Callable[[Tensor], Tensor]:
-    """``lambda x: matmul_prepacked_b(x, b4, n, bias, epilogue)`` with the host
-    work of a call (operand views, tile choice, kernel lookup) done once, for
-    activations like ``a``: the same shape and dtype, contiguous; others, and
-    cases with partial row tiles, take :func:`matmul_prepacked_b`. Valid while
-    ``OMP_NUM_THREADS`` stays the same."""
+    """``lambda x: matmul_prepacked_b(x, b4, n, bias, epilogue, scale, shift)``
+    with the host work of a call (operand views, tile choice, kernel lookup)
+    done once, for activations like ``a``: the same shape and dtype,
+    contiguous; others, and cases with partial row tiles, take
+    :func:`matmul_prepacked_b`. ``bias``, ``scale`` and ``shift`` are
+    constants of the prepared call: the caller rebuilds it when they change
+    (:func:`~.linear.linear_affine` keys them by data pointer and
+    ``_version``, so ``load_state_dict`` and in-place ops are seen; an
+    in-place change through ``.data``, which leaves ``_version`` unchanged,
+    is not seen in every layout). Valid while ``OMP_NUM_THREADS`` stays the
+    same."""
 
     def general(x: Tensor) -> Tensor:
-        return matmul_prepacked_b(x, b4, n, bias, epilogue)
+        return matmul_prepacked_b(x, b4, n, bias, epilogue, scale, shift)
 
     # Operands matmul_prepacked_b rejects (or handles specially) take it.
     if (
@@ -1429,18 +1437,28 @@ def prepacked_b_call(
             or _round_up(n, panel) != n_pad
         ):
             return general
-        bias2 = None
-        if bias is not None:
-            row = bias.reshape(1, n)
-            bias2 = (row if n == n_pad else pad_2d(row, 1, n_pad)).view(panels, panel)
+
+        def panels2(vector: Tensor | None) -> Tensor | None:
+            # As _matmul_prepacked_vnni_call lays them out.
+            if vector is None:
+                return None
+            row = vector.reshape(1, n)
+            return (row if n == n_pad else pad_2d(row, 1, n_pad)).view(panels, panel)
+
+        bias2 = panels2(bias)
+        scale2 = panels2(_affine_vector(scale, n, n, a))
+        shift2 = panels2(_affine_vector(shift, n, n, a))
         pairs = (m, k // 2, 2)
         bound, consts = _prepacked_bound(
-            a.view(pairs), b4, bias2, None, None, epilogue, tile_m
+            a.view(pairs), b4, bias2, scale2, shift2, epilogue, tile_m
         )
 
         def run(x: Tensor) -> Tensor:
-            return bound(x.view(pairs), b4, bias2, None, None, epilogue, *consts)
+            return bound(x.view(pairs), b4, bias2, scale2, shift2, epilogue, *consts)
 
+    elif scale is not None or shift is not None:
+        # The affine blocked path keeps its per-call staging.
+        return general
     else:
         blocks_n, blocks_k, block_k, block_n = map(int, b4.shape)
         n_pad = blocks_n * BLOCK_N

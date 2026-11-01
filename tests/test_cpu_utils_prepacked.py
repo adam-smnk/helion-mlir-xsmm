@@ -4,6 +4,7 @@ call that :func:`linear` caches, and the small-M VNNI panel choice."""
 from __future__ import annotations
 
 import importlib
+import os
 
 from helion_mlir_utils.linear import linear
 from helion_mlir_utils.matmul import identity_epilogue
@@ -130,3 +131,153 @@ def test_small_m_vnni_panel(monkeypatch: pytest.MonkeyPatch) -> None:
     # From 256 rows on, the rule for shared rows is unchanged.
     assert mm.vnni_panel(256, 4096) == 64
     assert mm.vnni_panel(1024, 8192) == 256
+
+
+@pytest.mark.parametrize("post_bias", [False, True])
+def test_linear_affine_reuses_its_call(
+    monkeypatch: pytest.MonkeyPatch, post_bias: bool
+) -> None:
+    """bf16 ``linear_affine`` (L2/33, L2/39) prepares its call once, like
+    ``linear``: later calls skip ``matmul_prepacked_b``'s per-call staging and
+    give the same bits."""
+    from helion_mlir_utils.linear import linear_affine
+
+    torch.manual_seed(1)
+    dtype = torch.bfloat16
+    layer = torch.nn.Linear(128, 64).to(dtype)
+    scale = torch.randn(64, dtype=dtype)
+    shift = torch.randn(64, dtype=dtype) if post_bias else None
+    x = torch.randn(32, 128, dtype=dtype)
+    with torch.no_grad():
+        y, cache = linear_affine(x, layer, scale, shift, torch.relu)
+        assert cache.call is not None
+        general = mm.matmul_prepacked_b(
+            x, cache.packed_weight, 64, cache.bias, torch.relu, scale, shift
+        )
+        assert torch.equal(y, general)
+
+        def no_general(*args: object, **kwargs: object) -> torch.Tensor:
+            raise AssertionError("the prepared call took the general path")
+
+        monkeypatch.setattr(mm, "matmul_prepacked_b", no_general)
+        x2 = torch.randn(32, 128, dtype=dtype)
+        y2, cache2 = linear_affine(x2, layer, scale, shift, torch.relu, cache=cache)
+        assert cache2.call is cache.call
+        monkeypatch.undo()
+        assert torch.equal(
+            y2,
+            mm.matmul_prepacked_b(
+                x2, cache.packed_weight, 64, cache.bias, torch.relu, scale, shift
+            ),
+        )
+        # Another epilogue, then another thread count: each rebuilds the
+        # call, which stays bit-equal to the general path.
+        y5, cache5 = linear_affine(
+            x2, layer, scale, shift, identity_epilogue, cache=cache2
+        )
+        assert cache5.call is not cache2.call
+        assert torch.equal(
+            y5,
+            mm.matmul_prepacked_b(
+                x2, cache.packed_weight, 64, cache.bias, identity_epilogue, scale, shift
+            ),
+        )
+        threads = os.environ.get("OMP_NUM_THREADS")
+        monkeypatch.setenv("OMP_NUM_THREADS", "3" if threads != "3" else "5")
+        y6, cache6 = linear_affine(x2, layer, scale, shift, torch.relu, cache=cache5)
+        assert cache6.call is not cache5.call
+        assert cache6.call[1] == os.environ["OMP_NUM_THREADS"]
+        assert torch.equal(
+            y6,
+            mm.matmul_prepacked_b(
+                x2, cache.packed_weight, 64, cache.bias, torch.relu, scale, shift
+            ),
+        )
+        # Another activation layout takes the general path, same result.
+        xt = torch.randn(128, 32, dtype=dtype).t()
+        y3, _ = linear_affine(xt, layer, scale, shift, torch.relu, cache=cache)
+        assert torch.equal(
+            y3, linear_affine(xt.contiguous(), layer, scale, shift, torch.relu)[0]
+        )
+        # A scale mutated in place: a new cache, and the output follows.
+        scale.mul_(-1.0)
+        y4, cache4 = linear_affine(x2, layer, scale, shift, torch.relu, cache=cache)
+        assert cache4.key != cache.key
+        expected = x2.float() @ layer.weight.float().T + layer.bias.float()
+        expected = expected.to(dtype).float() * scale.float()
+        if shift is not None:
+            expected = expected + shift.float()
+        err = (y4.float() - torch.relu(expected)).abs().max() / expected.abs().max()
+        assert err < 2e-2
+
+
+def test_linear_affine_f32_keeps_the_general_path() -> None:
+    from helion_mlir_utils.linear import linear_affine
+
+    torch.manual_seed(2)
+    layer = torch.nn.Linear(64, 64)
+    scale = torch.randn(64)
+    x = torch.randn(32, 64)
+    with torch.no_grad():
+        y, cache = linear_affine(x, layer, scale, None, torch.relu)
+        y2, _ = linear_affine(x, layer, scale, None, torch.relu, cache=cache)
+    assert torch.equal(y, y2)
+    torch.testing.assert_close(y, torch.relu(layer(x) * scale), atol=1e-4, rtol=1e-4)
+
+
+def test_row_sum_binds_once_per_shape_and_epilogue() -> None:
+    red = importlib.import_module("helion_mlir_utils.reduction")
+
+    def half(t: torch.Tensor) -> torch.Tensor:
+        return t * 0.5
+
+    torch.manual_seed(3)
+    x = torch.randn(40, 96, dtype=torch.bfloat16)
+    red._ROW_SUM_BOUND.clear()
+    out = red.row_sum(x, half)
+    assert len(red._ROW_SUM_BOUND) == 1
+    out2 = red.row_sum(x.clone(), half)
+    assert len(red._ROW_SUM_BOUND) == 1
+    assert torch.equal(out, out2)
+    # The unbound kernel call (the previous path) gives the same bits.
+    (block_sizes,) = {key[0] for key in red._ROW_SUM_BOUND}
+    assert torch.equal(out, red._ROW_SUM_KERNELS[block_sizes](x, half))
+    red.row_sum(x, identity_epilogue)
+    red.row_sum(torch.randn(8, 96, dtype=torch.bfloat16), half)
+    assert len(red._ROW_SUM_BOUND) == 3
+    ref = x.float().sum(1, keepdim=True) * 0.5
+    torch.testing.assert_close(out.float(), ref, atol=0.1, rtol=1e-2)
+
+
+def test_row_sum_cache_evicts_least_recently_used() -> None:
+    """Past ``_ROW_SUM_BOUND_SIZE`` keys the least recently used bound kernel
+    goes, a key in use stays, and evicted keys rebind with the right result."""
+    red = importlib.import_module("helion_mlir_utils.reduction")
+    size = red._ROW_SUM_BOUND_SIZE
+
+    def scale_by(factor: float):
+        def epilogue(t: torch.Tensor) -> torch.Tensor:
+            return t * factor
+
+        return epilogue
+
+    torch.manual_seed(4)
+    x = torch.randn(8, 32, dtype=torch.bfloat16)
+    epilogues = [scale_by(float(i + 1)) for i in range(size + 1)]
+    red._ROW_SUM_BOUND.clear()
+    outs = {}
+    for i, epilogue in enumerate(epilogues):
+        # Key 0, the oldest, is used again before every new key: the new key
+        # past the size evicts key 1, not key 0 (as first-in first-out would).
+        if i:
+            red.row_sum(x, epilogues[0])
+        outs[i] = red.row_sum(x, epilogue)
+    assert len(red._ROW_SUM_BOUND) == size
+    keys = [key[-1] for key in red._ROW_SUM_BOUND]
+    assert epilogues[0] in keys
+    assert epilogues[1] not in keys  # the least recently used
+    ref = x.float().sum(1, keepdim=True)
+    for i in (0, 1, 2, size):
+        out = red.row_sum(x, epilogues[i])
+        assert torch.equal(out, outs[i])
+        torch.testing.assert_close(out.float(), ref * (i + 1.0), atol=0.5, rtol=2e-2)

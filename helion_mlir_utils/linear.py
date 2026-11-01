@@ -47,6 +47,8 @@ class AffineLinearCache(NamedTuple):
     post_scale: Tensor
     post_bias: Tensor | None
     out_features: int
+    call: tuple | None = None
+    """``(epilogue, OMP_NUM_THREADS, prepacked_b_call(...))`` of the last call."""
 
 
 def _parameter_key(parameter: Tensor | None) -> tuple | None:
@@ -185,13 +187,31 @@ def linear_affine(
             int(layer.out_features),
         )
 
-    result = matmul_prepacked_b(
-        x,
-        cache.packed_weight,
-        cache.out_features,
-        cache.bias,
-        epilogue,
-        cache.post_scale,
-        cache.post_bias,
-    )
-    return result, cache if use_cache else None
+    if not use_cache:
+        result = matmul_prepacked_b(
+            x,
+            cache.packed_weight,
+            cache.out_features,
+            cache.bias,
+            epilogue,
+            cache.post_scale,
+            cache.post_bias,
+        )
+        return result, None
+    # The call's host work is done once, as in linear().
+    threads = os.environ.get("OMP_NUM_THREADS")
+    prepared = cache.call
+    if prepared is None or prepared[0] is not epilogue or prepared[1] != threads:
+        call = prepacked_b_call(
+            x,
+            cache.packed_weight,
+            cache.out_features,
+            cache.bias,
+            epilogue,
+            cache.post_scale,
+            cache.post_bias,
+        )
+        cache = cache._replace(call=(epilogue, threads, call))
+    else:
+        call = prepared[2]
+    return call(x), cache
