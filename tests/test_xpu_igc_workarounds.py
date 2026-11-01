@@ -2,7 +2,7 @@
 (IGC's own dumps, no device) and on the device. Causes and reproducers are in
 helion-mlir-dev's ``agent-wiki/upstream-repro/xpu-nan/README.md``.
 
-- ``IGC_OPTIONS``'s ``VectorizerAllowCMP=0``: ``IGCVectorizer`` rebuilds a
+- ``IGC_OPTIONS``'s ``EnableVectorizer=0``: ``IGCVectorizer`` rebuilds a
   compare and select as a vector one, and IGC emits that as a size-1 min/max
   into a vector: the other elements read stale registers. The kernels here are
   deterministic: they are wrong on any run with it (the row value stays in the
@@ -361,7 +361,11 @@ def test_problems_have_no_narrow_minmax_and_use_all_registers(
         assert narrow_minmax(visaasm) == [], visaasm.name
     options = [path.read_text() for path in dump.glob("*_options.txt")]
     assert any("-ze-opt-large-register-file" in text for text in options)
-    assert any("VectorizerAllowCMP=0" in text for text in options)
+    assert any("EnableVectorizer=0" in text for text in options)
+    optimized = list(dump.glob("*_optimized.ll"))
+    assert optimized
+    for path in optimized:
+        assert "vectorized_" not in path.read_text(errors="replace"), path.name
 
 
 @BINARIES

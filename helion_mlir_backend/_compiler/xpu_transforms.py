@@ -164,7 +164,7 @@ def legalize_host_ops() -> ir.Module:
     return schedule
 
 
-IGC_OPTIONS = r"-ze-opt-large-register-file\" \"-igc_opts \'VectorizerAllowCMP=0\'"
+IGC_OPTIONS = r"-ze-opt-large-register-file\" \"-igc_opts \'EnableVectorizer=0\'"
 """IGC options of the device binaries (lighthouse's ``xegpu_to_binary``). Only
 ``gpu-module-to-binary``'s ``opts`` pass them to IGC (the XPU target's binary
 stage); this LLVM never reads a target's ``cmd-options`` flag.
@@ -176,29 +176,31 @@ in one pair silently lose the large register file (128 GRFs, with no error). The
 escaped quotes close the first pair and open a second one.
 
 - The large register file: 256 GRFs; without it GEMMs get 128 and spill.
-- ``VectorizerAllowCMP=0`` works around an IGC miscompile. ``IGCVectorizer``
-  rebuilds scalar compares and selects as ``select <8 x i1> (fcmp a, b), a, b``,
-  and ``CodeGenPatternMatch::MatchMinMax`` takes it for an integer min/max: its
-  guard ``isFloatingPointTy()`` is false for ``<8 x float>``, and ``EmitMinMax``
-  has no vector path. Only element 0 is written; the rest read whatever the
-  registers hold, also from earlier kernels (IGC 2.41, B50). In what we tried it
-  takes a row value compared with another one kept over a loop, or with a second
-  row value: a running maximum, or a row sum through a clamp.
+- ``EnableVectorizer=0`` turns off ``IGCVectorizer``, which miscompiled kernels
+  in the two ways below (IGC 2.41, B50) and took a compiler crash on a Triton
+  kernel. Measured on the B50 against ``VectorizerAllowCMP=0``, 3 processes: 97
+  1.7 % less device time and no spill; level 1 problems at most 1.6 % more
+  (6, 29, 9, 7), the others within 0.4 %.
 
-IGC's switches over ``IGCVectorizer`` (``-igc_opts``, comma separated), and what
-each avoids. Keep this if the partial flags give way to the master switch: it
-says which pieces of the vectorizer were found wrong, and how.
+The pass's partial switches (``-igc_opts``, comma separated), kept to re-enable
+it piece by piece, and what each avoids:
 
-- ``EnableVectorizer=0``: the whole pass. Avoids both below; measured on the
-  B50, 97 takes about 1.7 % less and level 1 problems move by at most 1.6 %.
-- ``VectorizerAllowCMP=0``: no vector compares, so no vector compare and select
-  taken for a min/max (above: stale registers).
-- ``VectorizerAllowFPTRUNC=0``: no vector ``fptrunc``; the ``xpu-math`` branch's,
-  where ``fptrunc <8 x float>`` placed before the ``insertelement``s of its operand
-  rounds whatever the register holds (22_Tanh and others).
-- ``VectorizerAllowSelect``, ``FADD``, ``FSUB``, ``FMUL``, ``FDIV``, ``EXP2``,
-  ``MAXNUM``, ``WAVEALL``, ``WAVEALLJoint``, ``UniformCMP``, ``UniformSelect``:
-  no bug known in them, none tried on our kernels."""
+- ``VectorizerAllowCMP=0``: no vector compares. ``IGCVectorizer`` rebuilds scalar
+  compares and selects as ``select <8 x i1> (fcmp a, b), a, b``, and
+  ``CodeGenPatternMatch::MatchMinMax`` takes it for an integer min/max: its guard
+  ``isFloatingPointTy()`` is false for ``<8 x float>``, and ``EmitMinMax`` has no
+  vector path. Only element 0 is written; the rest read whatever the registers
+  hold, also from earlier kernels. In what we tried it takes a row value compared
+  with another one kept over a loop, or with a second row value: a running
+  maximum, or a row sum through a clamp.
+- ``VectorizerAllowFPTRUNC=0``: no vector ``fptrunc``. ``fptrunc <8 x float>`` is
+  placed before the ``insertelement``s of its operand, so the kernel rounds
+  whatever the register holds (16-bit results of branchy builtins).
+- ``VectorizerAllowSelect=0``: avoids the Triton compiler crash through ``ocloc``,
+  as ``VectorizerAllowCMP=0`` also does; cause not investigated.
+- ``VectorizerAllowFADD``, ``FSUB``, ``FMUL``, ``FDIV``, ``EXP2``, ``MAXNUM``,
+  ``WAVEALL``, ``WAVEALLJoint``, ``UniformCMP``, ``UniformSelect``: no bug known in
+  them, none tried on our kernels."""
 XEVM_TARGET = '#xevm.target<O = 3, chip = "bmg">'
 """The one XeVM target of every GPU module: lighthouse's (``O = 3``, ``bmg``)."""
 _NO_MODULE = "^$"
