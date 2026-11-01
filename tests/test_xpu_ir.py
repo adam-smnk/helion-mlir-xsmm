@@ -7,6 +7,7 @@ pipeline compiles fail with ``UnsupportedOperationError`` before lowering.
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import io
 import re
@@ -291,6 +292,29 @@ def row_maxima(x: torch.Tensor) -> torch.Tensor:
         for tile_n in hl.tile(n, block_size=block_n):
             top = torch.maximum(top, x[tile_m, tile_n])
         out[tile_m, :] = torch.amax(top, dim=-1, keepdim=True)
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 64]))
+def running_row_maxima(x: torch.Tensor) -> torch.Tensor:
+    """A row value carried over column tiles, stored as a vector."""
+    m, n = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        top = hl.full([tile_m], float("-inf"), dtype=x.dtype)
+        for tile_n in hl.tile(n):
+            top = torch.maximum(top, x[tile_m, tile_n].amax(-1))
+        out[tile_m] = top
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[1, 64, 64]))
+def batched_row_maxima(x: torch.Tensor) -> torch.Tensor:
+    """Rank 3: the row vector's buffer is a collapsed unit tile."""
+    batch, m, _ = x.shape
+    out = torch.empty([batch, m], dtype=x.dtype, device=x.device)
+    for tile_b, tile_m in hl.tile([batch, m]):
+        out[tile_b, tile_m] = x[tile_b, tile_m, :].amax(-1)
     return out
 
 
@@ -678,6 +702,52 @@ def test_row_reduction_results(name: str, layout: str) -> None:
     assert "xegpu.store_nd" not in text and "gpu.alloc" not in text
     assert "known_block_size = array<i32: 128, 1, 1>" in text
     _check_xevm(lowered, name, 1)
+
+
+def _shuffle_masks(lowered: str) -> dict[int, int]:
+    """How many ``sub_group_shuffle_xor`` calls of each constant mask."""
+    constants = dict(
+        re.findall(r"(%\d+) = llvm\.mlir\.constant\((\d+) : i32\) : i32", lowered)
+    )
+    masks = re.findall(r"@_Z21sub_group_shuffle_xor\w+\(%\d+, (%\d+)\)", lowered)
+    return collections.Counter(int(constants[mask]) for mask in masks)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("name", "shape"),
+    [("running_row_maxima", (256, 512)), ("batched_row_maxima", (2, 256, 128))],
+    ids=["loop-carried", "rank-3"],
+)
+def test_row_vectors_reduce_over_all_lanes(name: str, shape: tuple[int, ...]) -> None:
+    """Row vectors other than a reduction's direct result into a plain buffer
+    are stored as columns as well (keep_row_dims): the reduction's source keeps
+    the 2D block load's lanes, and joins all 16 of them for every row."""
+    kernel = {
+        "running_row_maxima": running_row_maxima,
+        "batched_row_maxima": batched_row_maxima,
+    }[name]
+    text, lowered = lower_xpu_stages(kernel, [xpu_tensor(*shape)])
+    assert _layouts(text, "xegpu.store") == [
+        "#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 1]>"
+    ]
+    masks = _shuffle_masks(str(lowered))
+    assert masks and {masks[1]} == {masks[2], masks[4], masks[8]}, masks
+
+
+@pytest.mark.isolated
+def test_row_vector_store_unrewritten_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without keep_row_dims, the layout XeGPU derives from the ``[rows]`` store
+    reduces columns over pairs of lanes: wrong rows. Upstream only warns on the
+    load and that warning does not reach this path, so nothing fails until the
+    check on the lowered kernel refuses it."""
+    monkeypatch.setattr(xpu, "keep_row_dims", lambda module: 0)
+    with pytest.raises(
+        UnsupportedOperationError, match="row reduction over part of a subgroup"
+    ):
+        lower_xpu(running_row_maxima, [xpu_tensor(256, 512)], stop_at="xevm")
 
 
 @pytest.mark.isolated

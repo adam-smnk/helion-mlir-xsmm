@@ -5,6 +5,7 @@ rank-1 buffer become ``[rows, 1]`` stores into the buffer expanded to
 from __future__ import annotations
 
 import re
+import time
 
 from mlir import ir
 import pytest
@@ -91,9 +92,142 @@ def test_row_results_are_stored_as_columns(body: str, args: str, element: str) -
     assert f": vector<64x{element}>, memref<128x{element}>" not in text
 
 
+_RUNNING = """%r = scf.for %c = %i to %i step %i iter_args(%a = %init) -> (vector<64xf32>) {{
+        {reduce}
+        %m = arith.maximumf %a, %s : vector<64xf32>
+        scf.yield {yielded} : vector<64xf32>
+      }}"""
+
+
 @pytest.mark.parametrize(
     ("body", "args"),
     [
+        # A running maximum over column tiles (the store takes the loop's result).
+        (
+            _RUNNING.format(reduce=_SUM, yielded="%m")
+            + """
+      vector.transfer_write %r, %out[%i] {in_bounds = [true]} : vector<64xf32>, memref<128xf32>""",
+            "%out: memref<128xf32>",
+        ),
+        # Through an op after the loop.
+        (
+            _RUNNING.format(reduce=_SUM, yielded="%m")
+            + """
+      %d = arith.addf %r, %r : vector<64xf32>
+      vector.transfer_write %d, %out[%i] {in_bounds = [true]} : vector<64xf32>, memref<128xf32>""",
+            "%out: memref<128xf32>",
+        ),
+        # A loop in a loop.
+        (
+            """%o = scf.for %e = %i to %i step %i iter_args(%b = %init) -> (vector<64xf32>) {
+        """
+            + _RUNNING.format(reduce=_SUM, yielded="%m")
+            + """
+        scf.yield %r : vector<64xf32>
+      }
+      vector.transfer_write %o, %out[%i] {in_bounds = [true]} : vector<64xf32>, memref<128xf32>""",
+            "%out: memref<128xf32>",
+        ),
+    ],
+    ids=["running", "running-then-op", "nested-loops"],
+)
+def test_loop_carried_row_results_are_stored_as_columns(body: str, args: str) -> None:
+    count, _, text = _rewrite(_gpu_module(body, args))
+    assert count == 1, text
+    assert "memref<128x1xf32>" in text
+    assert ": vector<64xf32>, memref<128xf32>" not in text
+
+
+_TWO_ITER_ARGS = """%r:2 = scf.for %c = %i to %i step %i iter_args(%a = %init, %b = %init) -> (vector<64xf32>, vector<64xf32>) {{
+        %v = vector.transfer_read %out[%i], %f {{in_bounds = [true]}} : memref<128xf32>, vector<64xf32>
+        {reduce}
+        scf.yield {yields} : vector<64xf32>, vector<64xf32>
+      }}
+      vector.transfer_write %r#0, %out[%i] {{in_bounds = [true]}} : vector<64xf32>, memref<128xf32>
+      vector.transfer_write %r#1, %out2[%i] {{in_bounds = [true]}} : vector<64xf32>, memref<128xf32>"""
+
+
+@pytest.mark.parametrize(
+    ("yields", "rewritten"),
+    [("%s, %v", "%arg2"), ("%v, %s", "%arg4")],
+    ids=["first-is-row", "second-is-row"],
+)
+def test_several_iter_args_follow_the_result_number(
+    yields: str, rewritten: str
+) -> None:
+    """Only the loop result whose own yield is a row result is rewritten."""
+    args = "%out: memref<128xf32>, %f: f32, %out2: memref<128xf32>"
+    count, _, text = _rewrite(
+        _gpu_module(_TWO_ITER_ARGS.format(reduce=_SUM, yields=yields), args)
+    )
+    assert count == 1, text
+    expanded = re.findall(r"memref\.expand_shape (%arg\d+)", text)
+    assert expanded == [rewritten], text
+
+
+def test_both_iter_args_swapped_are_rewritten() -> None:
+    """Row results that swap iter args are row results either way."""
+    body = f"""%r:2 = scf.for %c = %i to %i step %i iter_args(%a = %init, %b = %init) -> (vector<64xf32>, vector<64xf32>) {{{{
+        {_SUM}
+        %m = arith.maximumf %b, %s : vector<64xf32>
+        %n = arith.addf %a, %s : vector<64xf32>
+        scf.yield %m, %n : vector<64xf32>, vector<64xf32>
+      }}}}
+      vector.transfer_write %r#0, %out[%i] {{{{in_bounds = [true]}}}} : vector<64xf32>, memref<128xf32>
+      vector.transfer_write %r#1, %out2[%i] {{{{in_bounds = [true]}}}} : vector<64xf32>, memref<128xf32>""".format()
+    count, _, text = _rewrite(
+        _gpu_module(body, "%out: memref<128xf32>, %out2: memref<128xf32>")
+    )
+    assert count == 2, text
+
+
+def test_a_deep_chain_with_no_row_result_is_quick() -> None:
+    """A value used twice by each op of a chain: every path is looked at once
+    (2^24 paths otherwise, minutes: not 5 s)."""
+    body = "%v0 = vector.transfer_read %out[%i], %f {in_bounds = [true]} : memref<128xf32>, vector<64xf32>\n"
+    for depth in range(24):
+        body += f"%v{depth + 1} = arith.addf %v{depth}, %v{depth} : vector<64xf32>\n"
+    body += "vector.transfer_write %v24, %out[%i] {in_bounds = [true]} : vector<64xf32>, memref<128xf32>"
+    start = time.monotonic()
+    count, before, after = _rewrite(_gpu_module(body, "%out: memref<128xf32>, %f: f32"))
+    assert time.monotonic() - start < 5
+    assert count == 0
+    assert after == before
+
+
+def test_contiguous_strided_buffer_is_stored_as_a_column() -> None:
+    """A rank-3+ kernel's row buffer: a collapsed unit tile, stride 1 and a
+    dynamic offset."""
+    args = "%out: memref<128xf32, strided<[1], offset: ?>>"
+    body = f"""{_SUM}
+      vector.transfer_write %s, %out[%i] {{in_bounds = [true]}} : vector<64xf32>, memref<128xf32, strided<[1], offset: ?>>"""
+    count, _, text = _rewrite(_gpu_module(body, args))
+    assert count == 1, text
+    assert (
+        "memref<128xf32, strided<[1], offset: ?>> into "
+        "memref<128x1xf32, strided<[1, 1], offset: ?>>"
+    ) in text
+
+
+@pytest.mark.parametrize(
+    ("body", "args"),
+    [
+        # A loop that yields no row result: its iter arg, unchanged.
+        (
+            _RUNNING.format(reduce=_SUM, yielded="%a")
+            + """
+      vector.transfer_write %r, %out[%i] {in_bounds = [true]} : vector<64xf32>, memref<128xf32>""",
+            "%out: memref<128xf32>",
+        ),
+        # A loop that yields a value read from memory.
+        (
+            """%r = scf.for %c = %i to %i step %i iter_args(%a = %init) -> (vector<64xf32>) {
+        %v = vector.transfer_read %out[%i], %f {in_bounds = [true]} : memref<128xf32>, vector<64xf32>
+        scf.yield %v : vector<64xf32>
+      }
+      vector.transfer_write %r, %out[%i] {in_bounds = [true]} : vector<64xf32>, memref<128xf32>""",
+            "%out: memref<128xf32>, %f: f32",
+        ),
         # Not a row result: a value read from memory.
         (
             """%v = vector.transfer_read %out[%i], %c {in_bounds = [true]} : memref<128xf32>, vector<64xf32>
@@ -138,6 +272,8 @@ def test_row_results_are_stored_as_columns(body: str, args: str, element: str) -
         ),
     ],
     ids=[
+        "loop-yields-iter-arg",
+        "loop-yields-load",
         "not-reduced",
         "column-reduction",
         "masked",

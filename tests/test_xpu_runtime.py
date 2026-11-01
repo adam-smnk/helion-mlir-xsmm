@@ -448,6 +448,269 @@ def test_kernelbench_reduction(name: str) -> None:
     _check(problem.kernel(x), _REDUCTION_REFERENCES[name](x))
 
 
+def _running_row_maximum(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        r = hl.full([tm], float("-inf"), dtype=x.dtype)
+        for tn in hl.tile(n):
+            r = torch.maximum(r, x[tm, tn].amax(-1))
+        out[tm] = r
+    return out
+
+
+def _running_row_minimum(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        r = hl.full([tm], float("inf"), dtype=x.dtype)
+        for tn in hl.tile(n):
+            r = torch.minimum(r, x[tm, tn].amin(-1))
+        out[tm] = r
+    return out
+
+
+def _running_row_sum(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        r = hl.zeros([tm], dtype=x.dtype)
+        for tn in hl.tile(n):
+            r = r + x[tm, tn].sum(-1)
+        out[tm] = r
+    return out
+
+
+def _row_sum(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        out[tm] = x[tm, :].sum(-1)
+    return out
+
+
+def _row_sum_keepdim(x: torch.Tensor) -> torch.Tensor:
+    m, _ = x.shape
+    out = torch.empty([m, 1], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        out[tm, :] = x[tm, :].sum(-1, keepdim=True)
+    return out
+
+
+def _batched_row_maximum(x: torch.Tensor) -> torch.Tensor:
+    b, m, _ = x.shape
+    out = torch.empty([b, m], dtype=x.dtype, device=x.device)
+    for tb, tm in hl.tile([b, m]):
+        out[tb, tm] = x[tb, tm, :].amax(-1)
+    return out
+
+
+def _batched_running_row_maximum(x: torch.Tensor) -> torch.Tensor:
+    b, m, n = x.shape
+    out = torch.empty([b, m], dtype=x.dtype, device=x.device)
+    for tb, tm in hl.tile([b, m]):
+        r = hl.full([tb, tm], float("-inf"), dtype=x.dtype)
+        for tn in hl.tile(n):
+            r = torch.maximum(r, x[tb, tm, tn].amax(-1))
+        out[tb, tm] = r
+    return out
+
+
+def _run_row_kernel(
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    shape: tuple[int, ...],
+    blocks: list[int],
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x = (_randn(*shape, dtype=F32) * 3).to(dtype)
+    kernel = helion.kernel(
+        fn,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=blocks),
+    )
+    return kernel(x), x
+
+
+@pytest.mark.parametrize("dtype", [F32, BF16], ids=["f32", "bf16"])
+@pytest.mark.parametrize(
+    ("shape", "blocks"),
+    [
+        # The shapes and block sizes the wrong rows were found with, and a
+        # smaller failing one.
+        ((256, 512), [64, 64]),
+        ((256, 128), [64, 64]),
+        ((256, 256), [64, 128]),
+        ((128, 128), [64, 64]),
+        ((64, 64), [16, 16]),
+    ],
+    ids=str,
+)
+def test_running_row_maximum_as_a_vector(
+    shape: tuple[int, ...], blocks: list[int], dtype: torch.dtype
+) -> None:
+    """A row value carried over column tiles, stored as ``[rows]``: bit for bit
+    (it gave pairs of equal wrong values, 238 of 256 rows wrong)."""
+    out, x = _run_row_kernel(_running_row_maximum, shape, blocks, dtype)
+    _check(out, x.amax(-1), bound=0.0)
+
+
+@pytest.mark.parametrize("rows", [16, 32])
+@pytest.mark.parametrize(
+    "fn", [_running_row_maximum, _running_row_sum], ids=["maximum", "sum"]
+)
+def test_running_row_values_in_larger_subgroups(
+    fn: Callable[[torch.Tensor], torch.Tensor], rows: int
+) -> None:
+    """Forced subgroups of 16 and 32 rows: the ``[rows]`` store failed to lower
+    (``xevm.blockload2d``), stored as a column it is right."""
+    x = _randn(128, 64, dtype=F32) * 3
+    kernel = helion.kernel(
+        fn,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[64, 16], xegpu_sg_tiles=[[rows, 0]]),
+    )
+    ref = x.amax(-1) if fn is _running_row_maximum else x.cpu().double().sum(-1)
+    _check(
+        kernel(x),
+        ref.to(DEVICE, F32),
+        bound=0.0 if fn is _running_row_maximum else None,
+    )
+
+
+@pytest.mark.parametrize(
+    ("shape", "blocks"),
+    [
+        ((128, 64), [64, 16]),
+        ((256, 256), [64, 128]),
+        ((256, 512), [64, 64]),
+        ((128, 128), [32, 64]),
+        ((64, 64), [32, 32]),
+    ],
+    ids=str,
+)
+@pytest.mark.parametrize(
+    "fn",
+    [_running_row_sum, _row_sum, _row_sum_keepdim],
+    ids=["running", "direct", "keepdim"],
+)
+def test_bf16_row_sums(
+    fn: Callable[[torch.Tensor], torch.Tensor],
+    shape: tuple[int, ...],
+    blocks: list[int],
+) -> None:
+    """bf16 sums on the row path: within two ulps of the f64 reference
+    (``_BOUND``); they reach 7.65e-3."""
+    out, x = _run_row_kernel(fn, shape, blocks, BF16)
+    ref = x.cpu().double().sum(-1).to(DEVICE, F32)
+    _check(out, ref.reshape(out.shape))
+
+
+def _running_keepdim_then_tile(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        r = hl.full([tm, 1], float("-inf"), dtype=x.dtype)
+        for tn in hl.tile(n, block_size=16):
+            r = torch.maximum(r, x[tm, tn].amax(-1, keepdim=True))
+        for tn in hl.tile(n, block_size=16):
+            out[tm, tn] = x[tm, tn] - r
+    return out
+
+
+def test_running_keepdim_maximum_then_tile() -> None:
+    """A running row maximum broadcast over 2D tiles. Wrong in 7 of 8 rows of
+    each subgroup with IGC's vector min/max match (only the first row written);
+    the row layouts are right."""
+    x = _randn(128, 64, dtype=F32) * 3
+    kernel = helion.kernel(
+        _running_keepdim_then_tile,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[64, 16]),
+    )
+    _check(kernel(x), x - x.amax(-1, keepdim=True), bound=1e-5)
+
+
+def _keepdim_running_then_tile_and_rows(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    rows = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        r = hl.full([tm, 1], float("-inf"), dtype=x.dtype)
+        for tn in hl.tile(n, block_size=16):
+            r = torch.maximum(r, x[tm, tn].amax(-1, keepdim=True))
+        for tn in hl.tile(n, block_size=16):
+            out[tm, tn] = x[tm, tn] - r
+        rows[tm] = r.squeeze(-1)
+    return out, rows
+
+
+def _rows_running_then_tile_and_rows(
+    x: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    m, n = x.shape
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    rows = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        r = hl.full([tm], float("-inf"), dtype=x.dtype)
+        for tn in hl.tile(n, block_size=16):
+            r = torch.maximum(r, x[tm, tn].amax(-1))
+        rows[tm] = r
+        k = r.unsqueeze(-1)
+        for tn in hl.tile(n, block_size=16):
+            out[tm, tn] = x[tm, tn] - k
+    return out, rows
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [_keepdim_running_then_tile_and_rows, _rows_running_then_tile_and_rows],
+    ids=["keepdim", "vector"],
+)
+def test_running_row_maximum_stored_and_broadcast(
+    fn: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor]],
+) -> None:
+    """A running row maximum stored as a vector and subtracted from 2D tiles
+    (112 of 128 rows wrong with IGC's vector min/max match)."""
+    x = _randn(128, 64, dtype=F32) * 3
+    kernel = helion.kernel(
+        fn,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[64, 16]),
+    )
+    out, rows = kernel(x)
+    _check(rows, x.amax(-1), bound=0.0)
+    _check(out, x - x.amax(-1, keepdim=True), bound=1e-5)
+
+
+def test_running_row_minimum_as_a_vector() -> None:
+    out, x = _run_row_kernel(_running_row_minimum, (256, 512), [64, 64], F32)
+    _check(out, x.amin(-1), bound=0.0)
+
+
+def test_running_row_sum_as_a_vector() -> None:
+    out, x = _run_row_kernel(_running_row_sum, (256, 512), [64, 64], F32)
+    _check(out, x.cpu().double().sum(-1).to(DEVICE, F32))
+
+
+@pytest.mark.parametrize(
+    ("fn", "blocks"),
+    [(_batched_row_maximum, [1, 64]), (_batched_running_row_maximum, [1, 64, 16])],
+    ids=["direct", "running"],
+)
+def test_rank3_row_maximum_as_a_matrix(
+    fn: Callable[[torch.Tensor], torch.Tensor], blocks: list[int]
+) -> None:
+    """``out[tb, tm]`` stores rows into a collapsed unit tile of the buffer."""
+    out, x = _run_row_kernel(fn, (8, 128, 64), blocks, F32)
+    _check(out, x.amax(-1), bound=0.0)
+
+
 _ROW_REDUCTION_SHAPE = (128, 16384)
 """Sixteen 1024-column segments per row (``row_segments``): 32 workgroups of
 partials, two of row results, 2 x 128 one-row output tiles."""

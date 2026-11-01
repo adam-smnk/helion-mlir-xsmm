@@ -58,6 +58,7 @@ from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
+from ..mlir_transforms.xevm_lane_reductions import check_lane_reductions
 from ..mlir_transforms.xevm_nsz_minmax import nsz_minmax
 from ..mlir_transforms.xevm_unit_clamps import unit_clamps_without_sat
 from .base import MLIRTarget
@@ -182,6 +183,10 @@ def _stages(
     # hardware limits (xegpu_block_surfaces), as part of the stage.
     index = next(i for i, (name, _) in enumerate(stages) if name == "xegpu-wg")
     stages[index] = ("xegpu-wg", _CheckBlockSurfaces(stages[index][1]))
+    if stop_at != "xegpu-wg":
+        # The reductions as lowered are checked (xevm_lane_reductions).
+        index = next(i for i, (name, _) in enumerate(stages) if name == "xevm")
+        stages[index] = ("xevm", _CheckLaneReductions(stages[index][1]))
     if stop_at == "binary":
         # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays,
         # xevm_nsz_minmax, xevm_unit_clamps and xevm_bf16_extensions.
@@ -230,6 +235,19 @@ class _CheckBlockSurfaces(Stage):
     def apply(self, module: ir.Module) -> ir.Module:
         module = self.stage.apply(module)
         check_block_surfaces(module)
+        return module
+
+
+class _CheckLaneReductions(Stage):
+    """``stage``, then a failure on row reductions over part of a subgroup
+    (silently wrong rows, :mod:`xevm_lane_reductions`)."""
+
+    def __init__(self, stage: Stage) -> None:
+        self.stage = stage
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        module = self.stage.apply(module)
+        check_lane_reductions(module)
         return module
 
 
