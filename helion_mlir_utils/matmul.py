@@ -1055,6 +1055,114 @@ def _pad_to(t: Tensor, shape: tuple[int, int]) -> Tensor:
     return padded
 
 
+def _split_k_partials(a3: Tensor, b3: Tensor) -> Tensor:
+    """f32 partial products ``[S, M, N]`` of ``a3`` ``[M, S, C]`` and ``b3``
+    ``[S, C, N]``: row-major ``A`` ``[M, K]`` and ``B`` ``[K, N]`` viewed with
+    ``K = S * C``, read in place (no packing)."""
+    m, splits, chunk = a3.shape
+    n = b3.size(2)
+    chunk = hl.specialize(chunk)
+    hl.specialize(b3.size(1))
+    out = torch.empty((splits, m, n), dtype=torch.float32, device=a3.device)
+    for tile_s, tile_m, tile_n in hl.tile([splits, m, n]):
+        acc = hl.zeros([tile_s, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(chunk):
+            acc = acc + torch.einsum(
+                "msc,scn->smn", a3[tile_m, tile_s, tile_k], b3[tile_s, tile_k, tile_n]
+            )
+        out[tile_s, tile_m, tile_n] = acc
+    return out
+
+
+def _sum_partials(partials: Tensor, dtype: torch.dtype) -> Tensor:
+    """``partials`` ``[S, M, N]`` summed over S, as ``dtype``."""
+    splits, m, n = partials.shape
+    hl.specialize(splits)
+    out = torch.empty((m, n), dtype=dtype, device=partials.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = partials[:, tile_m, tile_n].sum(0).to(dtype)
+    return out
+
+
+# Split-K tiles (rows, columns, K step): 64x128 f32 accumulators reuse each
+# loaded A and B element 128 and 64 times (32x32 tiles: 32), so a K split of a
+# few output tiles beats more, smaller tiles (256x256x8192 on 64 threads:
+# 0.20 ms with S=8, 64x128; one K loop of 64 32x32 tiles: 0.26 ms).
+_SPLIT_K_TILE_M = 64
+_SPLIT_K_TILE_N = 128
+_SPLIT_K_STEP = 256
+# K elements per split at least: shorter chunks make the partial sums (S x M x
+# N f32, written and read again) cost more than the parallelism gains.
+_SPLIT_K_MIN_CHUNK = 512
+_SPLIT_K_PARTIALS = helion.kernel(
+    _split_k_partials,
+    backend="mlir",
+    static_shapes=True,
+    config=helion.Config(
+        block_sizes=[1, _SPLIT_K_TILE_M, _SPLIT_K_TILE_N, _SPLIT_K_STEP]
+    ),
+)
+_SPLIT_K_SUM = helion.kernel(
+    _sum_partials,
+    backend="mlir",
+    static_shapes=True,
+    config=helion.Config(block_sizes=[32, 256]),
+)
+
+
+def _omp_threads() -> int:
+    """The thread count OpenMP uses at the outermost level: the first entry of
+    ``OMP_NUM_THREADS`` (a list such as ``64,8`` sets nested levels), else
+    the CPU count."""
+    value = os.environ.get("OMP_NUM_THREADS", "").split(",")[0].strip()
+    return int(value) if value.isdigit() and int(value) > 0 else os.cpu_count() or 1
+
+
+def _split_k(
+    m: int,
+    n: int,
+    k: int,
+    trans_a: bool,
+    trans_b: bool,
+    bias: Tensor | None,
+    scale: Tensor | None,
+    shift: Tensor | None,
+    epilogue: Callable[[Tensor], Tensor],
+) -> int:
+    """K splits of an f32 GEMM with fewer 64x128 output tiles than threads,
+    whole tiles and a K of whole chunks (0: run it unsplit). The splits fill
+    the threads: e.g. 256x256x8192 on 64 threads, 8 tiles x 8 splits."""
+    if trans_a or trans_b or bias is not None or scale is not None or shift is not None:
+        return 0
+    if epilogue is not identity_epilogue:
+        return 0
+    if m % _SPLIT_K_TILE_M or n % _SPLIT_K_TILE_N:
+        return 0
+    threads = _omp_threads()
+    tiles = (m // _SPLIT_K_TILE_M) * (n // _SPLIT_K_TILE_N)
+    splits = 1
+    while (
+        tiles * splits * 2 <= threads
+        and k % (splits * 2 * _SPLIT_K_STEP) == 0
+        and k // (splits * 2) >= _SPLIT_K_MIN_CHUNK
+    ):
+        splits *= 2
+    return splits if splits > 1 else 0
+
+
+def _matmul_split_k(a: Tensor, b: Tensor, splits: int) -> Tensor:
+    """``a @ b`` (f32 row-major) as ``splits`` K chunks read in place, then a
+    sum of the partial products: both are Helion kernels, so no other
+    runtime's threads run between them."""
+    m, k = map(int, a.shape)
+    n = int(b.shape[1])
+    a, b = a.contiguous(), b.contiguous()
+    partials = _SPLIT_K_PARTIALS(
+        a.view(m, splits, k // splits), b.view(splits, k // splits, n)
+    )
+    return _SPLIT_K_SUM(partials, a.dtype)
+
+
 def matmul(
     a: Tensor,
     b: Tensor,
@@ -1143,6 +1251,9 @@ def matmul(
         )
         return bound(a_p, b_p, bias_p, scale_p, shift_p, epilogue, *consts)[:m, :n]
 
+    splits = _split_k(m, n, k, trans_a, trans_b, bias, scale, shift, epilogue)
+    if splits:
+        return _matmul_split_k(a, b, splits)
     a4 = (
         pack_a_blocked_t(a, m_pad=m_pad, k_pad=k_pad)
         if trans_a
@@ -1410,19 +1521,82 @@ def matmul_prepacked_b_affine(
     return out4.reshape(m_pad, n_pad)[:m, :n]
 
 
-def bmm(a: Tensor, b: Tensor) -> Tensor:
-    """Batched ``A @ B``; each batch slice is contracted by its own fully
-    parallel kernel call (bf16: written in place into the batched result).
+def _bmm_direct(a: Tensor, b: Tensor) -> Tensor:
+    """Batched f32 ``a @ b``, the batch a grid dim: one kernel, A and B read in
+    place (no packing), output tiles of all batches shared by the threads."""
+    batch, m, k = a.shape
+    n = b.size(2)
+    k = hl.specialize(k)
+    hl.specialize(b.size(1))
+    out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
+    for tile_b, tile_m, tile_n in hl.tile([batch, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = acc + torch.bmm(a[tile_b, tile_m, tile_k], b[tile_b, tile_k, tile_n])
+        out[tile_b, tile_m, tile_n] = acc.to(a.dtype)
+    return out
 
-    A genuine single-kernel batched version (one extra leading tile dimension
-    threaded through the pack + contract kernels) was prototyped and measured
-    ~30% *slower* than this per-batch-call loop at BATCH=3, M=N=K=2048 -- the
-    combined kernel gets
-    worse thread-level parallelism across the batch dimension on this backend
-    than launching one fully-parallel kernel per batch slice. Kept as the
-    simpler, faster loop.
+
+# Tiles of _bmm_direct (batch, rows, columns, K step): 128x256 f32 tiles with
+# 128-deep K steps (a 128 KiB B chunk, in L2) were the fastest of 8 configs at
+# 3x2048^3 on 64 threads (7.8 ms; 128x128: 8.1, 64x128x256: 13.0).
+_BMM_TILES = (1, 128, 256, 128)
+_BMM_KERNELS: dict[tuple[int, ...], helion.Kernel] = {}
+
+
+def _divisor_tile(extent: int, largest: int) -> int | None:
+    """The largest of ``largest``, its halves down to 32, that divides ``extent``."""
+    tile = largest
+    while tile >= BLOCK_M:
+        if extent % tile == 0:
+            return tile
+        tile //= 2
+    return None
+
+
+def _bmm_f32(a: Tensor, b: Tensor) -> Tensor | None:
+    """:func:`_bmm_direct` on tiles dividing the problem (``None`` if none do):
+    partial tiles along up to four dims are versioned per dim, and the kernel
+    takes minutes to compile (2x65x129x129: 25 min)."""
+    _, m, k = map(int, a.shape)
+    n = int(b.shape[2])
+    _, tile_m, tile_n, tile_k = _BMM_TILES
+    tiles = (
+        1,
+        _divisor_tile(m, tile_m),
+        _divisor_tile(n, tile_n),
+        _divisor_tile(k, tile_k),
+    )
+    if None in tiles:
+        return None
+    if tiles not in _BMM_KERNELS:
+        _BMM_KERNELS[tiles] = helion.kernel(
+            _bmm_direct,
+            backend="mlir",
+            static_shapes=True,
+            config=helion.Config(block_sizes=list(tiles)),
+        )
+    return _BMM_KERNELS[tiles](a.contiguous(), b.contiguous())
+
+
+def bmm(a: Tensor, b: Tensor) -> Tensor:
+    """Batched ``A @ B``.
+
+    bf16: each batch slice is contracted by its own fully parallel kernel call,
+    written in place into the batched result (a single kernel with the batch
+    threaded through the pack + contract kernels was ~30% slower at
+    3x2048^3). f32: one kernel with the batch as a grid dim, operands read in
+    place (:func:`_bmm_direct`). 3x2048^3 on 64 threads, one OpenMP runtime
+    (``env.sh cpu-bench``): 8.00 ms; per-slice blocked kernels, packing both
+    operands per slice, stacked by ``torch.stack``: 11.49 ms; eager 7.36 ms.
+    Tiles that do not divide the problem fall back to the per-slice path.
     """
     batch, m, k = a.shape
+    if b.dim() != 3 or b.shape[0] != batch or b.shape[1] != k:
+        raise RuntimeError(
+            "Expected size for first two dimensions of batch2 tensor to be: "
+            f"[{batch}, {k}] but got: {list(b.shape[:2])}."
+        )
     n = b.shape[2]
     if a.dtype == torch.bfloat16 and min(m, n) >= BLOCK_M and k >= 2 * BLOCK_K:
         a, b = a.contiguous(), b.contiguous()
@@ -1433,4 +1607,12 @@ def bmm(a: Tensor, b: Tensor) -> Tensor:
             )
             bound(a[i], b[i], None, None, None, identity_epilogue, *consts, out[i])
         return out
+    if a.dtype == torch.float32:
+        # One kernel, no per-slice packing or stack (3x2048^3: 8.00 ms, not
+        # 11.49). Also no torch op between kernels: with torch on libgomp and
+        # the kernels on libomp, torch.stack's threads compete with libomp's
+        # still-spinning workers (68 ms without the cpu-bench libomp preload).
+        out = _bmm_f32(a, b)
+        if out is not None:
+            return out
     return torch.stack([matmul(a[i], b[i]) for i in range(a.shape[0])])

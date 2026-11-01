@@ -9,6 +9,7 @@ from .carry_loop_inits import carry_loop_inits
 from .dialect import HelionTransformDialect
 from .drop_accumulator_read_unit_dims import drop_accumulator_read_unit_dims
 from .fit_subviews_to_reads import fit_subviews_to_reads
+from .fold_full_insert_slices import fold_full_insert_slices
 from .fold_loop_unit_dims import fold_loop_unit_dims
 from .forward_rows import forward_rows
 from .hoist_allocas import hoist_allocas
@@ -30,6 +31,7 @@ from .pin_amx_off_tile_sizes import pin_amx_off_tile_sizes
 from .pin_transposes import pin_transposes
 from .rank_reduce_transfers import rank_reduce_transfers
 from .schedule_amx_loads import schedule_amx_loads
+from .sink_copies_into_branches import sink_copies_into_branches
 from .split_bf16_loads import split_bf16_loads
 from .split_contraction_operands import split_contraction_operands
 from .split_copies import split_copies
@@ -54,6 +56,7 @@ __all__ = [
     "carry_loop_inits",
     "drop_accumulator_read_unit_dims",
     "fit_subviews_to_reads",
+    "fold_full_insert_slices",
     "fold_loop_unit_dims",
     "forward_rows",
     "hoist_allocas",
@@ -77,6 +80,7 @@ __all__ = [
     "pin_transposes",
     "rank_reduce_transfers",
     "schedule_amx_loads",
+    "sink_copies_into_branches",
     "split_bf16_loads",
     "split_contraction_operands",
     "split_copies",

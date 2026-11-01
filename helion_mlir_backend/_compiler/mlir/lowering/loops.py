@@ -15,6 +15,7 @@ import helion.language._tracing_ops as tracing_ops
 from mlir.dialects import affine as affine_d
 from mlir.dialects import arith as arith_d
 from mlir.dialects import scf as scf_d
+from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 import torch
 
@@ -188,11 +189,82 @@ def _lower_tile(
             ctx.block_id_to_bounds[block_id],
             span=tile,
         )
-        scf_d.YieldOp(_lower_tile(ctx, graph, region_values, owned, rest))
+        # The full version's regions have the tile's static extent: its stores
+        # then overwrite them whole and bufferize in place.
+        full_values = {
+            name: _cast_dims(value, owned[name], block_id, tile, valid)
+            for name, value in region_values.items()
+        }
+        results = _lower_tile(ctx, graph, full_values, owned, rest)
+        scf_d.YieldOp(
+            [
+                tensor_d.CastOp(value.type, result).result
+                if result.type != value.type
+                else result
+                for result, value in zip(results, region_values.values(), strict=True)
+            ]
+        )
     ctx.block_id_to_valid[block_id] = valid
     with ir.InsertionPoint(if_op.else_block):
         scf_d.YieldOp(_lower_tile(ctx, graph, region_values, owned, rest))
     return list(if_op.results)
+
+
+def _cast_dims(
+    value: ir.Value,
+    owned: dict[int, OwnedDim],
+    block_id: int,
+    extent: int,
+    valid: ir.Value,
+) -> ir.Value:
+    """``value`` (a region) cast to the static ``extent`` along its dynamic dims
+    that tile ``block_id`` and whose size is the tile's ``valid`` size itself
+    (``value`` itself if there are none).
+
+    A full tile (``valid`` = ``extent``) fills exactly those dims. A dim whose
+    size is clamped to the tensor (an output shorter than the loop: the region
+    is ``min(valid, size - offset)``) may be shorter even then, and is left
+    dynamic: cast, its store would write past the tensor.
+    """
+    value_type = ir.RankedTensorType(value.type)
+    shape = list(value_type.shape)
+    for dim, owner in owned.items():
+        if (
+            owner.block_id == block_id
+            and not owner.point
+            and shape[dim] == ir.ShapedType.get_dynamic_size()
+            and _region_size(value, dim) == valid
+        ):
+            shape[dim] = extent
+    if shape == list(value_type.shape):
+        return value
+    cast_type = ir.RankedTensorType.get(shape, value_type.element_type)
+    return tensor_d.CastOp(cast_type, value).result
+
+
+def _region_size(value: ir.Value, dim: int) -> ir.Value | None:
+    """The dynamic size of dim ``dim`` of the ``tensor.extract_slice`` that
+    ``value`` is (through ``tensor.cast``s), ``None`` if it is static or
+    ``value`` is no such slice."""
+    while isinstance(value, ir.OpResult) and value.owner.name == "tensor.cast":
+        value = value.owner.operands[0]
+    if not isinstance(value, ir.OpResult) or value.owner.name != "tensor.extract_slice":
+        return None
+    slice_op = value.owner
+    static = list(ir.DenseI64ArrayAttr(slice_op.attributes["static_sizes"]))
+    # A rank-reducing slice's result dims are not its size list's dims.
+    if len(static) != ir.RankedTensorType(value.type).rank:
+        return None
+    if static[dim] != ir.ShapedType.get_dynamic_size():
+        return None
+    # operandSegmentSizes: source, offsets, sizes, strides.
+    segments = list(ir.DenseI32ArrayAttr(slice_op.attributes["operandSegmentSizes"]))
+    start = sum(segments[:2])
+    sizes = list(slice_op.operands[start : start + segments[2]])
+    dynamic_index = sum(
+        1 for size in static[:dim] if size == ir.ShapedType.get_dynamic_size()
+    )
+    return sizes[dynamic_index]
 
 
 def _emit_sequential(

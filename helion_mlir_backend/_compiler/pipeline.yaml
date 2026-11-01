@@ -8,6 +8,11 @@ Pipeline:
   - pass: symbol-dce
   - pass: cse
   - pass: canonicalize
+  # A partial grid tile's store overwrites its whole region, which has a
+  # dynamic size: the stored tile replaces the region (upstream folds this only
+  # for static sizes), else bufferization copies the region into a heap buffer
+  # before every tile, full ones too.
+  - schedule: "helion_transforms.py[gen=fold_full_insert_slices]"
 
   # Based on Lighthouse's x86 pipeline.
   # Skips packing as the entry-level IR from Helion already contains parallel loops.
@@ -108,6 +113,14 @@ Pipeline:
   # Per-tile scratch (accumulators, staging) on the stack: no malloc/free per tile.
   - schedule: "helion_transforms.py[gen=promote_buffers_to_stack]{max_alloc_size_in_bytes=1048576}"
   - include: bufferization-cleanup.yaml
+  # A versioned grid tile's copy into its output region made in the branches:
+  # the full version wrote the region in place and gets none, so only partial
+  # tiles copy (else every tile copies its region onto itself through
+  # memrefCopy). Then fold the casts and duplicate subviews this leaves.
+  - schedule: "helion_transforms.py[gen=sink_copies_into_branches]"
+  - pass: canonicalize
+  - pass: cse
+  - pass: canonicalize
   ## Out-of-bounds n-D copies (pads, packs of partial tiles) row by row: split as
   ## lone reads, their n-D vectors are rebuilt element by element.
   - schedule: "helion_transforms.py[gen=split_copies]"

@@ -367,6 +367,29 @@ def hoist_allocas() -> ir.Module:
     return schedule
 
 
+def fold_full_insert_slices() -> ir.Module:
+    """Schedule: inserts overwriting all of a dynamically sized destination
+    (the full and partial versions of a grid tile storing their whole region)
+    replaced by their source, so bufferization writes the tile in place."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.fold_full_insert_slices(funcs)
+        transform.yield_()
+    return schedule
+
+
+def sink_copies_into_branches() -> ir.Module:
+    """Schedule: copies of an ``scf.if`` result made in its branches, where a
+    full tile's copy onto its own region folds away."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.sink_copies_into_branches(funcs)
+        transform.yield_()
+    return schedule
+
+
 def fold_empty_slices() -> ir.Module:
     """Schedule: slices of empty tensors as empty tensors of the slice shape.
 
