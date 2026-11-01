@@ -3,13 +3,21 @@ by each thread in a contiguous slice before the parallel loop writing them."""
 
 from __future__ import annotations
 
+import ctypes
 import mmap
+import re
 import time
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import helion
 import helion.language as hl
+from lighthouse.utils.lib_finder import find_openmp_library
 from mlir import ir
+from mlir import passmanager
+from mlir.execution_engine import ExecutionEngine
+from mlir.runtime import get_ranked_memref_descriptor
+import numpy as np
 import pytest
 import torch
 
@@ -28,7 +36,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
 MARK = OVERWRITTEN_ATTR_NAME
-TOUCH = "llvm.atomicrmw volatile _or"
+TOUCH = "llvm.call @madvise"
 
 
 def _apply(make_schedule: Callable[[], ir.Module], source: str) -> str:
@@ -801,19 +809,29 @@ func.func @f(%arg0: {arg_type} {attrs}, %v: bf16) {{
 """
 
 
-def test_first_touch_outputs_touches_pages_first() -> None:
+def test_first_touch_outputs_populates_pages_first() -> None:
     text = _apply(first_touch_outputs, _parallel())
     assert MARK not in text
-    # A worksharing loop over the 4 KiB pages before the loop (its barrier between).
-    assert text.count("omp.wsloop schedule(static) {") == 1
+    # A static worksharing loop without a barrier over the 2 MiB-aligned ranges
+    # before the loop, one madvise per range with MADV_POPULATE_WRITE (23).
+    assert text.count("omp.wsloop nowait schedule(static)") == 1
     assert text.count("omp.wsloop") == 2
-    assert "nowait" not in text
+    assert "omp.barrier" not in text
     assert text.count(TOUCH) == 1
     assert text.index(TOUCH) < text.index("memref.store")
+    # No OpenMP API calls: with torch's libgomp loaded first, they bind to it.
+    assert "omp_get" not in text
+    assert "arith.constant 23 : i32" in text
+    assert "arith.constant -2097152 : index" in text
+    assert "arith.constant 2097152 : index" in text
+    assert re.search(r"llvm\.func @madvise\(!llvm\.ptr, i64, i32\) -> i32", text)
+    # The result is ignored (the call is a hint).
+    result = re.search(r"(%\S+) = llvm\.call @madvise", text).group(1)
+    assert text.count(result) == 1
     assert "memref.extract_aligned_pointer_as_index %arg0" in text
     assert "arith.constant -4096 : index" in text
-    # Its 32 MiB, first and last byte included.
-    assert "arith.constant 33554431 : index" in text
+    # Its 32 MiB: the end of the range.
+    assert "arith.constant 33554432 : index" in text
 
 
 @pytest.mark.parametrize(
@@ -869,8 +887,8 @@ func.func @f(%arg0: memref<4096x4096xbf16> {helion.overwritten}, %v: bf16) {
     assert _apply(first_touch_outputs, source).count(TOUCH) == 1
 
 
-def test_first_touch_outputs_shares_one_barrier() -> None:
-    # Two outputs first written in one region: the first loop has no barrier.
+def test_first_touch_outputs_populates_each_output() -> None:
+    # Two outputs first written in one region: one call each, declared once.
     source = """
 func.func @f(%arg0: memref<4096x4096xbf16> {helion.overwritten},
              %arg1: memref<4096x4096xbf16> {helion.overwritten}, %v: bf16) {
@@ -892,12 +910,10 @@ func.func @f(%arg0: memref<4096x4096xbf16> {helion.overwritten},
 """
     text = _apply(first_touch_outputs, source)
     assert text.count(TOUCH) == 2
-    assert text.count("omp.wsloop nowait schedule(static)") == 1
-    assert text.count("omp.wsloop schedule(static) {") == 1
-    first = text.index("omp.wsloop nowait")
-    assert (
-        first < text.index("omp.wsloop schedule(static) {") < text.index("memref.store")
-    )
+    assert text.count("llvm.func @madvise") == 1
+    assert text.count("omp.wsloop nowait schedule(static)") == 2
+    assert "omp.barrier" not in text
+    assert text.rindex(TOUCH) < text.index("memref.store")
 
 
 @pytest.mark.parametrize(
@@ -982,7 +998,7 @@ def test_first_touch_outputs_touches_before_a_load() -> None:
 def test_first_touch_outputs_touches_each_output_in_its_region() -> None:
     text = _apply(first_touch_outputs, _regions(STORE, SECOND, second_arg="%arg1"))
     assert text.count(TOUCH) == 2
-    assert "nowait" not in text
+    assert "omp.barrier" not in text
     second = text.index("omp.parallel", text.index("omp.parallel") + 1)
     assert text.index(TOUCH) < second < text.rindex(TOUCH)
 
@@ -1058,6 +1074,106 @@ def test_long_k_gemm_output_is_touched_and_correct() -> None:
     with opt_pipeline():
         text = str(lower_mlir(tall_gemm_kernel, [x, y]))
         assert text.count(TOUCH) == 1
+        torch.testing.assert_close(
+            tall_gemm_kernel(x, y), torch.relu(x @ y), rtol=1e-4, atol=1e-3
+        )
+
+
+# Lowers a transform-level module with an OpenMP region to the LLVM dialect.
+_TO_LLVM = (
+    "builtin.module(expand-strided-metadata, finalize-memref-to-llvm, "
+    "convert-scf-to-cf, convert-openmp-to-llvm, convert-arith-to-llvm, "
+    "convert-index-to-llvm, convert-cf-to-llvm, convert-func-to-llvm, "
+    "reconcile-unrealized-casts)"
+)
+_MADV_NOHUGEPAGE = 15
+
+
+@pytest.mark.isolated
+def test_first_touch_outputs_populates_exactly_the_output() -> None:
+    """The populated range is the output's pages, no more and no fewer: a region
+    that only reads the output's first element, run on an output 64 bytes into
+    the second page of a fresh mapping with one spare page on each side (no huge
+    pages, which would populate 2 MiB at once); ``mincore`` then sees every page
+    holding output bytes resident and the spare pages not."""
+    rows, cols, page = 1024, 1024, 4096  # 4 MiB of f32, ending 64 bytes into a page
+    source = f"""
+func.func @f(%arg0: memref<{rows}x{cols}xf32> {{helion.overwritten}}) attributes {{llvm.emit_c_interface}} {{
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c64 = arith.constant 64 : index
+  omp.parallel {{
+    omp.wsloop {{
+      omp.loop_nest (%i) : index = (%c0) to (%c64) step (%c1) {{
+        %v = memref.load %arg0[%c0, %c0] : memref<{rows}x{cols}xf32>
+        omp.yield
+      }}
+    }}
+    omp.terminator
+  }}
+  return
+}}
+"""
+    libc = ctypes.CDLL(None, use_errno=True)
+    with ir.Context(), ir.Location.unknown():
+        module = ir.Module.parse(source)
+        schedule = first_touch_outputs(0)  # kept alive: its ops' parent
+        schedule.body.operations[0].apply(module.operation)
+        assert TOUCH in str(module)
+        passmanager.PassManager.parse(_TO_LLVM).run(module.operation)
+        engine = ExecutionEngine(
+            module, opt_level=2, shared_libs=[find_openmp_library()]
+        )
+        size = rows * cols * 4
+        offset = page + 64
+        length = (offset + size + page - 1) // page * page + page
+        buffer = mmap.mmap(-1, length, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+        address = ctypes.addressof(ctypes.c_char.from_buffer(buffer))
+        assert (
+            libc.madvise(
+                ctypes.c_void_p(address), ctypes.c_size_t(length), _MADV_NOHUGEPAGE
+            )
+            == 0
+        )
+        output = np.frombuffer(
+            buffer, dtype=np.float32, count=rows * cols, offset=offset
+        ).reshape(rows, cols)
+        flags = (ctypes.c_ubyte * (length // page))()
+
+        def resident() -> list[int]:
+            assert (
+                libc.mincore(ctypes.c_void_p(address), ctypes.c_size_t(length), flags)
+                == 0
+            )
+            return [flag & 1 for flag in flags]
+
+        assert not any(resident())
+        argument = ctypes.pointer(ctypes.pointer(get_ranked_memref_descriptor(output)))
+        engine.invoke("f", argument)
+        pages = resident()
+        first, last = offset // page, (offset + size - 1) // page
+        assert all(pages[first : last + 1])
+        assert not pages[first - 1] and not pages[last + 1]
+        del output, argument
+
+
+@pytest.mark.isolated
+def test_failing_madvise_is_ignored() -> None:
+    # The fallback path: an advice the kernel rejects (EINVAL, as Linux before
+    # 5.14 does for MADV_POPULATE_WRITE) leaves the kernel correct.
+    import helion_mlir_backend._compiler.mlir_transforms as ht
+
+    original = ht.first_touch_outputs
+
+    def invalid_advice(target: ir.Value, min_bytes: int, advice: int) -> object:
+        return original(target, min_bytes, 1 << 20)
+
+    torch.manual_seed(0)
+    x, y = torch.randn(2100, 2048), torch.randn(2048, 2048)
+    with opt_pipeline(), patch.object(ht, "first_touch_outputs", invalid_advice):
+        text = str(lower_mlir(tall_gemm_kernel, [x, y]))
+        assert text.count(TOUCH) == 1
+        assert "1048576 : i32" in text
         torch.testing.assert_close(
             tall_gemm_kernel(x, y), torch.relu(x @ y), rtol=1e-4, atol=1e-3
         )

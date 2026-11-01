@@ -9,17 +9,25 @@ threads fault in each 2 MiB range together: the kernel allocates and zeroes a
 huge page for each of them and keeps one (``__do_huge_pmd_anonymous_page``
 rechecks the PMD only after zeroing), and the 4 KiB pages at the unaligned ends
 of the mapping are faulted by up to 16 threads each, which serialize on their
-page table's lock. A prologue in the same parallel region (a static worksharing
-loop over the 4 KiB pages, so each thread touches a contiguous slice, then its
-barrier) touches one byte per page: each page is faulted by one thread, each
-2 MiB range by the few whose slices it holds, as a ``memset`` of the output
-would. (Faulting each 2 MiB range by one thread first, then the pages, takes a
-second barrier: slower, measured.)
+page table's lock. A prologue in the same parallel region makes each thread
+fault in its own contiguous share of the output's pages first: a static
+worksharing loop over the output's 2 MiB-aligned ranges, one
+``madvise(MADV_POPULATE_WRITE)`` call per range, without a barrier. Each 2 MiB
+range is faulted (one huge page zeroed) by one thread, and pages already mapped
+(e.g. under TCMalloc) cost a page table walk. Smaller chunks contend: the
+populate takes the PMD lock of each huge page, and x86's split PMD lock covers
+1 GiB, so 64 threads at 512 KiB chunks spun on it (13-15 us per call, up to
+170 us; about 2.6 us per call at 2 MiB, measured on EMR).
 
-The touch is a volatile ``atomicrmw or 0``: a write access (a read would map the
-zero page and fault again on the write, with a TLB shootdown per page), which
-leaves memory unchanged and which LLVM keeps (it drops or narrows idempotent
-atomics that are not volatile). It runs only on outputs that every iteration
+The call accesses no memory: it faults the pages in for writing (contents
+unchanged; ``EFAULT`` on read-only memory), so it cannot race with the loop's
+stores and needs no barrier. A barrier costs about 1 ms per call when the
+OpenMP workers sleep (``OMP_WAIT_POLICY=passive``, or a torch op between the
+kernels; measured on EMR). It needs Linux 5.14; older kernels return
+``EINVAL`` and errors are ignored: the call is only a hint. (An earlier version
+touched one byte per page with a volatile ``atomicrmw or 0`` and a barrier.)
+
+It runs only on outputs that every iteration
 space of a top-level loop writes whole (``mark_overwritten_args``): each element
 is stored to by the function anyway, so the touch adds no page the function
 does not write itself (no fault on read-only memory, no copy-on-write after a
@@ -64,11 +72,10 @@ _PAGE = 4096
 # A huge (PMD) page of x86-64: one iteration's slice spanning this much while not
 # contiguous (narrower than its rows) means many threads write each 2 MiB range.
 _HUGE_PAGE = 2 * 1024 * 1024
-# Outputs below this are not touched. The prologue costs a barrier and one atomic
-# per page even when the pages are mapped (under TCMalloc: ~4 us, +4 % of a
-# 1024^2 bf16 GEMM; at 4096^2 between -1 % and +2.6 % across runs, i.e. noise;
-# measured on EMR), and glibc reuses smaller buffers from its heap more often
-# than not (8 MiB: fresh in some processes).
+# Outputs below this are not touched. The prologue makes one madvise call per
+# 2 MiB even when the pages are mapped (a page table walk, about 2.6 us per
+# call on EMR), and glibc reuses smaller buffers from its heap more often than
+# not (8 MiB: fresh in some processes).
 MIN_BYTES = 16 * 1024 * 1024
 # Tiles not produced by a contraction of at least this total static reduction
 # length (K) are not marked. With the pages already mapped (TCMalloc), the
@@ -78,11 +85,9 @@ MIN_BYTES = 16 * 1024 * 1024
 # +88 % at K = 64, +57 % at 128, +20 % at 256, +8 % at 512, +4.2 % at 1024,
 # +1.9 % at 1536 and +0.9 % at 2048, while saving 41-61 % at every K under glibc
 # (temp/first-touch-gate/logs/k_sweep*). Elementwise ops, reductions and norms
-# (no contraction) are memory-bound like a short-K GEMM. Caveat: the prologue's
-# barrier costs about 1 ms per call when the OpenMP workers sleep in it
-# (OMP_WAIT_POLICY=passive, or a torch op between helion calls), measured under
-# TCMalloc on EMR: L1/1 4096 bf16 +22 %, L1/7 at K = 2048 +16 %, also with the
-# canonical setup (env.sh cpu-bench); with the default active wait it is noise.
+# (no contraction) are memory-bound like a short-K GEMM. (Measured with the
+# earlier barrier-based prologue; with madvise in 512 KiB chunks and the gate
+# bypassed, under TCMalloc: L1/7 at K = 64 +17 %, HardSigmoid +2.9 %.)
 MIN_REDUCTION = 2048
 # Views of a memref: their results alias their source.
 _VIEW_OPS = (
@@ -742,16 +747,47 @@ def _index(value: int) -> ir.Value:
     return arith.ConstantOp(ir.IndexType.get(), value).result
 
 
-def _touch_loop(
-    start: ir.Value, base: ir.Value, count: ir.Value, step: int, nowait: bool
-) -> None:
-    """A worksharing loop touching ``max(start + i * step, base)``, i < count
-    (static schedule: consecutive iterations per thread; a barrier at its end
-    unless ``nowait``)."""
+# madvise(2) advice that faults a range in for writing without accessing it
+# (Linux 5.14 and later; older kernels return EINVAL, which is ignored).
+MADV_POPULATE_WRITE = 23
+# libc's madvise, which the JIT resolves in the process. (Not omp_get_thread_num
+# and friends: with torch's libgomp loaded first, those names bind to libgomp,
+# which inside a libomp team reports one thread: every thread then populated
+# the whole output, measured 2-4x slower. The worksharing loop goes through
+# libomp's own __kmpc entry points.)
+_MADVISE = "llvm.func @madvise(!llvm.ptr, i64, i32) -> i32"
+
+
+def _declare_madvise(module: ir.Operation) -> None:
+    """Declare ``madvise`` in ``module`` unless already there."""
+    body = module.regions[0].blocks[0]
+    declared = {
+        ir.StringAttr(op.attributes["sym_name"]).value
+        for op in body.operations
+        if "sym_name" in op.attributes
+    }
+    if "madvise" not in declared:
+        ir.InsertionPoint(body).insert(ir.Operation.parse(_MADVISE))
+
+
+def _populate(arg: ir.Value, size: int, advice: int) -> None:
+    """A static worksharing loop without a barrier (``nowait``) over the 2 MiB-
+    aligned ranges the ``size`` bytes at ``arg``'s aligned pointer overlap: each
+    iteration ``madvise(advice)``s its range clipped to the output's pages
+    (from the page holding its first byte to its end), each thread consecutive
+    ranges. The result is ignored: the call only faults pages in."""
+    i64 = ir.IntegerType.get_signless(64)
+    base = memref.ExtractAlignedPointerAsIndexOp(arg).result
+    first = arith.AndIOp(base, _index(-_PAGE)).result
+    start = arith.AndIOp(base, _index(-_HUGE_PAGE)).result
+    end = arith.AddIOp(base, _index(size)).result
+    span = arith.SubIOp(end, start).result
+    count = arith.DivUIOp(
+        arith.AddIOp(span, _index(_HUGE_PAGE - 1)).result, _index(_HUGE_PAGE)
+    )
     # A loop wrapper's region holds only its loop nest: bounds are defined before.
     lower, unit = _index(0), _index(1)
-    # Static, set explicitly (also the default without a clause): consecutive
-    # pages per thread, the same split every call.
+    advice_value = arith.ConstantOp(ir.IntegerType.get_signless(32), advice).result
     loop = omp.WsloopOp(
         [],
         [],
@@ -759,52 +795,54 @@ def _touch_loop(
         [],
         [],
         [],
-        nowait=nowait or None,
+        nowait=True,
         schedule_kind=ir.Attribute.parse("#omp.schedulekind<static>"),
     )
     with ir.InsertionPoint(loop.regions[0].blocks.append()):
-        nest = omp.LoopNestOp([lower], [count], [unit])
+        nest = omp.LoopNestOp([lower], [count.result], [unit])
         block = nest.regions[0].blocks.append(ir.IndexType.get())
         with ir.InsertionPoint(block):
-            offset = arith.MulIOp(block.arguments[0], _index(step)).result
-            address = arith.MaxUIOp(arith.AddIOp(start, offset).result, base).result
+            offset = arith.MulIOp(block.arguments[0], _index(_HUGE_PAGE)).result
+            aligned = arith.AddIOp(start, offset).result
+            address = arith.MaxUIOp(aligned, first).result
+            limit = arith.AddIOp(aligned, _index(_HUGE_PAGE)).result
+            stop = arith.MinUIOp(limit, end).result
+            # madvise rounds the length up to a page: the last one is the output's.
+            length = arith.SubIOp(stop, address).result
             pointer = llvm.IntToPtrOp(
-                llvm.PointerType.get(),
-                arith.IndexCastOp(ir.IntegerType.get_signless(64), address).result,
+                llvm.PointerType.get(), arith.IndexCastOp(i64, address).result
             ).result
-            zero = arith.ConstantOp(ir.IntegerType.get_signless(8), 0).result
-            llvm.AtomicRMWOp(
-                llvm.AtomicBinOp._or,
-                pointer,
-                zero,
-                llvm.AtomicOrdering.monotonic,
-                volatile_=True,
+            llvm.CallOp(
+                ir.IntegerType.get_signless(32),
+                [pointer, arith.IndexCastOp(i64, length).result, advice_value],
+                [],
+                [],
+                callee="madvise",
             )
             omp.YieldOp([])
-
-
-def _prologue(arg: ir.Value, size: int, nowait: bool) -> None:
-    """The first-touch prologue of ``size`` bytes at ``arg``'s aligned pointer:
-    one byte of each 4 KiB page it overlaps (the first one at the pointer)."""
-    base = memref.ExtractAlignedPointerAsIndexOp(arg).result
-    last = arith.AddIOp(base, _index(size - 1)).result
-    start = arith.AndIOp(base, _index(-_PAGE)).result
-    span = arith.SubIOp(last, start).result
-    count = arith.AddIOp(arith.DivUIOp(span, _index(_PAGE)).result, _index(1))
-    _touch_loop(start, base, count.result, _PAGE, nowait)
 
 
 @transform_op(modifies_payload=True)
 class FirstTouchOutputsOp(HelionTransformDialect.Operation, name="first_touch_outputs"):
     """For each argument marked by ``mark_overwritten_args`` that is a static,
     contiguous memref of at least ``min_bytes``, whose first user in the entry
-    block of its function is an ``omp.parallel``: touch its pages at the start of
-    that region (see the module docstring). Other IR is left untouched."""
+    block of its function is an ``omp.parallel``: at the start of that region,
+    each thread ``madvise``s its contiguous share of the output's pages with
+    ``advice`` (``MADV_POPULATE_WRITE``; see the module docstring), one call per
+    2 MiB-aligned range in a static worksharing loop without a barrier
+    (``nowait``): the call accesses no memory, so it cannot race with the loop's
+    stores.
+    Other IR is left untouched."""
 
     target: ext.Operand[transform.AnyOpType]
     min_bytes: ir.IntegerAttr = ext.attribute(
         default_factory=lambda: ir.IntegerAttr.get(
             ir.IntegerType.get_signless(64), MIN_BYTES
+        )
+    )
+    advice: ir.IntegerAttr = ext.attribute(
+        default_factory=lambda: ir.IntegerAttr.get(
+            ir.IntegerType.get_signless(64), MADV_POPULATE_WRITE
         )
     )
 
@@ -816,13 +854,14 @@ class FirstTouchOutputsOp(HelionTransformDialect.Operation, name="first_touch_ou
         state: transform.TransformState,
     ) -> DiagnosedSilenceableFailure:
         min_bytes = ir.IntegerAttr(op.min_bytes).value
+        advice = ir.IntegerAttr(op.advice).value
         for func in payload_ops(state, op.target, ir.OpView):
             if func.operation.name != "func.func" or not func.regions[0].blocks:
                 continue
             if "arg_attrs" not in func.attributes:
                 continue
             attrs = func.attributes["arg_attrs"]
-            # Outputs per region: their loops share one barrier, after the last.
+            # Outputs per region, populated at its start.
             regions: dict[ir.Operation, list[tuple[ir.Value, int]]] = {}
             for index, arg in enumerate(func.regions[0].blocks[0].arguments):
                 if OVERWRITTEN_ATTR_NAME not in ir.DictAttr(attrs[index]):
@@ -834,11 +873,13 @@ class FirstTouchOutputsOp(HelionTransformDialect.Operation, name="first_touch_ou
                 if user is None or user.operation.name != "omp.parallel":
                     continue
                 regions.setdefault(user.operation, []).append((arg, size))
+            if regions:
+                _declare_madvise(func.operation.parent)
             for region, outputs in regions.items():
                 body = region.regions[0].blocks[0]
                 with ir.InsertionPoint.at_block_begin(body), region.location:
-                    for position, (arg, size) in enumerate(outputs):
-                        _prologue(arg, size, nowait=position < len(outputs) - 1)
+                    for arg, size in outputs:
+                        _populate(arg, size, advice)
             # The marks are used up: an output not touched lowers as without them.
             stripped = ir.ArrayAttr.get(
                 [
@@ -860,10 +901,12 @@ class FirstTouchOutputsOp(HelionTransformDialect.Operation, name="first_touch_ou
 
 
 def first_touch_outputs(
-    target: ir.Value, min_bytes: int = MIN_BYTES
+    target: ir.Value, min_bytes: int = MIN_BYTES, advice: int = MADV_POPULATE_WRITE
 ) -> FirstTouchOutputsOp:
     """snake_case wrapper to create a FirstTouchOutputsOp."""
+    i64 = ir.IntegerType.get_signless(64)
     return FirstTouchOutputsOp(
         target=target,
-        min_bytes=ir.IntegerAttr.get(ir.IntegerType.get_signless(64), min_bytes),
+        min_bytes=ir.IntegerAttr.get(i64, min_bytes),
+        advice=ir.IntegerAttr.get(i64, advice),
     )

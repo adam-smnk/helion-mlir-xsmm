@@ -20,6 +20,9 @@ from mlir.dialects.transform import x86 as transform_x86
 
 from helion_mlir_backend._compiler import mlir_transforms as ht
 from helion_mlir_backend._compiler.mlir_transforms.first_touch import (
+    MADV_POPULATE_WRITE,
+)
+from helion_mlir_backend._compiler.mlir_transforms.first_touch import (
     MIN_BYTES as FIRST_TOUCH_MIN_BYTES,
 )
 
@@ -371,16 +374,18 @@ def mark_overwritten_args() -> ir.Module:
     return schedule
 
 
-def first_touch_outputs(min_bytes: int = FIRST_TOUCH_MIN_BYTES) -> ir.Module:
+def first_touch_outputs(
+    min_bytes: int = FIRST_TOUCH_MIN_BYTES, advice: int = MADV_POPULATE_WRITE
+) -> ir.Module:
     """Schedule: the pages of outputs marked by ``mark_overwritten_args`` (of at
-    least ``min_bytes``) touched by each thread in a contiguous slice at the
-    start of the OpenMP region first writing them: faulting a fresh output in,
-    dozens of threads then neither zero the same huge page nor contend on one
-    page table lock."""
+    least ``min_bytes``) faulted in by each thread in a contiguous share
+    (``madvise(advice)``) at the start of the OpenMP region first writing them:
+    faulting a fresh output in, dozens of threads then neither zero the same
+    huge page nor contend on one page table lock."""
     ht.HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
         funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
-        ht.first_touch_outputs(funcs, min_bytes)
+        ht.first_touch_outputs(funcs, min_bytes, advice)
         transform.yield_()
     return schedule
 
