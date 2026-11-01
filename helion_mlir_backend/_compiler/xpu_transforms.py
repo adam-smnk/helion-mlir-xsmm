@@ -66,7 +66,9 @@ def prepare_for_xegpu() -> ir.Module:
       on its leading (e.g. batch or head) dims is its lower-rank kernel: the
       reshapes the folding leaves fold into rank-reducing tile loads and
       stores (``tensor.extract_slice``/``parallel_insert_slice``) and out of
-      loop-carried accumulators (``fold_loop_unit_dims``); batched matmuls are
+      loop-carried accumulators (``fold_loop_unit_dims``), also unit dims
+      inside a tile (``fold_slice_unit_dims``: e.g. one K chunk of a
+      ``[M, S, K/S]`` view); batched matmuls are
       generalized first (as lighthouse's cleanup does) so a unit batch dim
       folds, leaving a matmul.
     - Loop-carried tensors updated elementwise into a fresh tensor (e.g. the
@@ -95,6 +97,9 @@ def prepare_for_xegpu() -> ir.Module:
         ht.fold_loop_unit_dims(module)
         with ir.InsertionPoint(transform.apply_patterns(module).patterns):
             tensor_transform.apply_patterns_tensor_reassociative_reshape_folding()
+        lh_transform.cleanup(module)
+        # After the cleanup, which leaves the collapses of unit-dim slices.
+        ht.fold_slice_unit_dims(module)
         lh_transform.cleanup(module)
         ht.carry_loop_inits(module)
         transform.yield_()
@@ -204,7 +209,9 @@ def _kernel_ops(target: ir.Value, op_name: str, index: int) -> ir.Value:
     )
 
 
-def outline_kernels(entry: str, kernels: Sequence[KernelParams]) -> ir.Module:
+def outline_kernels(
+    entry: str, kernels: Sequence[KernelParams], columns: Sequence[bool] = ()
+) -> ir.Module:
     """Schedule: lighthouse's ``outline_gpu_func_schedule`` for ``entry``, kernel
     by kernel with each kernel's parameters.
 
@@ -226,7 +233,9 @@ def outline_kernels(entry: str, kernels: Sequence[KernelParams]) -> ir.Module:
     (``rank_reduce_transfers``), where lighthouse's analyses read the matrix the
     tile belongs to (e.g. one batch of a batched matmul's operands).
     Elementwise kernels' grid loops are mapped innermost dim first
-    (``map_elementwise_grid``: grid x = the column tiles); the others keep
+    (``map_elementwise_grid``: grid x = the column tiles), and so are those of
+    kernel ``i`` if ``columns[i]`` (``map_grid_columns_first``: the GEMMs
+    ``xpu_params.columns_first`` picks); the others keep
     ``gpu-map-parallel-loops``' outermost-first order.
     """
     ht.HelionTransformDialect.load()
@@ -247,7 +256,10 @@ def outline_kernels(entry: str, kernels: Sequence[KernelParams]) -> ir.Module:
             forall = _only(_kernel_ops(func, "scf.forall", index))
             parallel = loop.loop_forall_to_parallel([anytype], forall)
             transform.annotate(parallel, KERNEL_ATTR, param=_i64_param(index))
-            ht.map_elementwise_grid(parallel)
+            if index < len(columns) and columns[index]:
+                ht.map_grid_columns_first(parallel)
+            else:
+                ht.map_elementwise_grid(parallel)
         func = convert_to_gpu_launch(module, payload_func=func)
         for index, kernel in enumerate(kernels):
             func = _set_threads(func, index, kernel)

@@ -692,9 +692,13 @@ MAPPING_ATTR = "mapping"
 _BLOCK_IDS = ("block_x", "block_y", "block_z")
 
 
-def map_grid_innermost_first(loop: ir.Operation) -> bool:
+def map_grid_innermost_first(
+    loop: ir.Operation, *, elementwise_only: bool = True
+) -> bool:
     """Map the grid loop ``loop`` (a top-level 2D or 3D ``scf.parallel``) of an
-    elementwise kernel (:func:`find_tiles`) to the GPU grid innermost dim first:
+    elementwise kernel (:func:`find_tiles`; with ``elementwise_only=False`` any
+    kernel, for the GEMMs ``xpu_params.columns_first`` picks) to the GPU grid
+    innermost dim first:
     its last dim to block x, the one before to block y (then z), as
     ``gpu-map-parallel-loops{mapping-policy=innermost-first}`` does, for this
     loop only. Returns whether it did; other loops (already mapped, nested, of
@@ -708,7 +712,8 @@ def map_grid_innermost_first(loop: ir.Operation) -> bool:
     columns-first; 1-row tiles of 4096 columns with 16-byte accesses 116
     against 196 GB/s; the read+write copy ceiling is 198). Columns first, they
     stream neighbouring tiles of the same rows. The order changes no result.
-    GEMMs keep the rows-first order their configs were tuned for."""
+    Other kernels keep the rows-first order (GEMM configs were tuned for it)
+    unless the caller maps them (``elementwise_only=False``)."""
     loop = loop.operation
     if loop.name != "scf.parallel" or MAPPING_ATTR in loop.attributes:
         return False
@@ -718,7 +723,9 @@ def map_grid_innermost_first(loop: ir.Operation) -> bool:
             return False
         parent = parent.operation.parent
     rank = len(loop.regions[0].blocks[0].arguments)
-    if rank not in (2, 3) or isinstance(find_tiles(loop), str):
+    if rank not in (2, 3):
+        return False
+    if elementwise_only and isinstance(find_tiles(loop), str):
         return False
     attrs = [
         ir.Attribute.parse(
@@ -755,3 +762,30 @@ class MapElementwiseGridOp(
 def map_elementwise_grid(target: ir.Value) -> MapElementwiseGridOp:
     """snake_case wrapper to create a MapElementwiseGridOp."""
     return MapElementwiseGridOp(target=target)
+
+
+@transform_op(modifies_payload=True)
+class MapGridColumnsFirstOp(
+    HelionTransformDialect.Operation, name="map_grid_columns_first"
+):
+    """:func:`map_grid_innermost_first` on each target ``scf.parallel`` of any
+    kernel class (``elementwise_only=False``); the caller picks the kernels
+    (GEMMs whose output store dominates, ``xpu_params.columns_first``)."""
+
+    target: ext.Operand[transform.AnyOpType]
+
+    @staticmethod
+    def run(
+        op: "MapGridColumnsFirstOp",
+        _rewriter: transform.TransformRewriter,
+        _results: transform.TransformResults,
+        state: transform.TransformState,
+    ) -> DiagnosedSilenceableFailure:
+        for target in state.get_payload_ops(op.target):
+            map_grid_innermost_first(target.operation, elementwise_only=False)
+        return DiagnosedSilenceableFailure.Success
+
+
+def map_grid_columns_first(target: ir.Value) -> MapGridColumnsFirstOp:
+    """snake_case wrapper to create a MapGridColumnsFirstOp."""
+    return MapGridColumnsFirstOp(target=target)

@@ -11,6 +11,7 @@ from .drop_accumulator_read_unit_dims import drop_accumulator_read_unit_dims
 from .fit_subviews_to_reads import fit_subviews_to_reads
 from .fold_full_insert_slices import fold_full_insert_slices
 from .fold_loop_unit_dims import fold_loop_unit_dims
+from .fold_slice_unit_dims import fold_slice_unit_dims
 from .forward_rows import forward_rows
 from .hoist_allocas import hoist_allocas
 from .hoist_invariant_scalars import hoist_invariant_scalars
@@ -44,6 +45,7 @@ from .widen_transposes import widen_transposes
 from .xegpu_elementwise import InferXeGPUElementwiseLayoutOp
 from .xegpu_elementwise import infer_xegpu_elementwise_layout
 from .xegpu_elementwise import map_elementwise_grid
+from .xegpu_elementwise import map_grid_columns_first
 from .xegpu_reduction import infer_xegpu_reduction_tiles
 from .xegpu_reduction import match_row_result_stores
 
@@ -58,6 +60,7 @@ __all__ = [
     "fit_subviews_to_reads",
     "fold_full_insert_slices",
     "fold_loop_unit_dims",
+    "fold_slice_unit_dims",
     "forward_rows",
     "hoist_allocas",
     "hoist_invariant_scalars",
@@ -67,6 +70,7 @@ __all__ = [
     "legalize_host_ops",
     "loop_bounds",
     "map_elementwise_grid",
+    "map_grid_columns_first",
     "mark_operand_packs",
     "match_row_result_stores",
     "match_scalar_contractions",

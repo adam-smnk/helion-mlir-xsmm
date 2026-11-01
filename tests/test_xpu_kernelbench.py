@@ -27,11 +27,17 @@ from tests.harness import lower_xpu_stages
 from tests.harness import xpu_tensor
 from tests.kernelbench_xpu import ATTENTION_BLOCKS
 from tests.kernelbench_xpu import ELEMENTWISE_BLOCKS
+from tests.kernelbench_xpu import GEMM_SMALL_K
+from tests.kernelbench_xpu import GEMM_SPLIT_K
 from tests.kernelbench_xpu import LEVEL2_PROBLEMS
 from tests.kernelbench_xpu import PROBLEMS
 from tests.kernelbench_xpu import RANK3_PROBLEMS
 from tests.kernelbench_xpu import Problem
+from tests.kernelbench_xpu import _matmul
+from tests.kernelbench_xpu import _matmul_split_k
+from tests.kernelbench_xpu import _sum_splits
 from tests.kernelbench_xpu import attention
+from tests.kernelbench_xpu import split_k_views
 
 from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 
@@ -298,6 +304,107 @@ def test_gemm_hand_picked_config(name: str) -> None:
     )
     assert reads == pin["block_reads"]
     assert "known_block_size = array<i32: 512, 1, 1>" in text
+
+
+def _gemm_kernel(fn: Callable[..., object], blocks: list[int], **xegpu: object):
+    return helion.kernel(
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=blocks, **xegpu),
+    )(fn)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    "name", ["7_Matmul_with_small_K_dimension_", "9_Tall_skinny_matrix_multiplication_"]
+)
+def test_gemm_small_k_config(name: str) -> None:
+    """7 and 9 (K padded to 64) run ``GEMM_SMALL_K``: 64x128 workgroups of 8x2
+    subgroups of 8x64 (256 threads), stored in 8x16 blocks, the grid columns
+    first (the output dominates: 256 N tiles in x, 512 M tiles in y)."""
+    problem = _ALL[name]
+    assert problem.block_sizes == GEMM_SMALL_K[0]
+    assert problem.shapes == ((32768, 64), (64, 32768))
+    text, lowered = lower_xpu_stages(problem.kernel, _args(problem))
+    _check_launch(text, (256, 512))
+    layout = "sg_layout = [8, 2], sg_data = [8, 64], inst_data = [8, 16]"
+    assert _anchor_layouts(text, "xegpu.store_nd") == [layout]
+    assert "known_block_size = array<i32: 256, 1, 1>" in text
+    assert "intel_sub_group_2d_block_write_16b_8r16x1c" in lowered
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("mnk", "grid"),
+    [
+        # Writes 2^22 elements, reads 2^22: the boundary maps columns first.
+        ((2048, 2048, 1024), (16, 32)),
+        # Reads 2^23 elements (K = 2048) for 2^22 written: rows first.
+        ((2048, 2048, 2048), (32, 16)),
+    ],
+)
+def test_gemm_grid_order_follows_traffic(
+    mnk: tuple[int, int, int], grid: tuple[int, int]
+) -> None:
+    """The same kernel and config (``GEMM_SMALL_K``) maps its grid columns
+    first only while it writes at least as many elements as it reads
+    (``xpu_params.columns_first``: M * N >= K * (M + N)); otherwise rows first
+    (M tiles in x), the order of the operand-bound GEMMs (1, 2, 13, 16-18 keep
+    their grids in ``test_kernelbench_problem_lowers_for_xpu``)."""
+    m, n, k = mnk
+    kernel = _gemm_kernel(_matmul, GEMM_SMALL_K[0], **GEMM_SMALL_K[1])
+    args = [
+        xpu_tensor(m, k, dtype=torch.bfloat16),
+        xpu_tensor(k, n, dtype=torch.bfloat16),
+    ]
+    text, _ = lower_xpu_stages(kernel, args)
+    _check_launch(text, grid)
+
+
+@pytest.mark.isolated
+def test_split_k_gemm_lowers() -> None:
+    """6_large_K's split K (``GEMM_SPLIT_K``) over contiguous chunk views: the
+    K chunk ``a[tm, s, tk]`` of ``A.view(M, S, K/S)`` (a unit dim inside the
+    tile, ``fold_slice_unit_dims``) is read from a ``256x16384`` view whose
+    rows are K apart (``rank_reduce_transfers``), and the kernel lowers as a
+    256x256 GEMM per chunk (32 workgroups, 32x64 subgroup tiles, A read 32x32
+    per block read, f32 stored in 8x16 blocks) with the rows-first grid (it
+    reads far more than it writes)."""
+    splits, blocks, xegpu, _ = GEMM_SPLIT_K
+    a = xpu_tensor(256, 524288, dtype=torch.bfloat16)
+    b = xpu_tensor(524288, 256, dtype=torch.bfloat16)
+    kernel = _gemm_kernel(_matmul_split_k, blocks, **xegpu)
+    text, lowered = lower_xpu_stages(kernel, list(split_k_views(a, b, splits)))
+    _check_launch(text, (splits,))
+    assert re.search(
+        r"memref\.collapse_shape [^\n]*into memref<256x16384xbf16, "
+        r"strided<\[524288, 1\], offset: \?>>",
+        text,
+    )
+    (store,) = _anchor_layouts(text, "xegpu.store_nd")
+    assert store == "sg_layout = [8, 4], sg_data = [32, 64], inst_data = [8, 16]"
+    assert re.search(r"xegpu\.store_nd [^\n]*vector<256x256xf32>", text)
+    assert "intel_sub_group_2d_block_read_16b_32r16x2c" in lowered
+    assert "intel_sub_group_2d_block_write_32b_8r16x1c" in lowered
+    assert "xegpu." not in lowered
+
+
+@pytest.mark.isolated
+def test_sum_splits_lowers() -> None:
+    """Regression (found by the 6_large_K split-K model): ``_sum_splits`` of
+    ``[32, 256, 256]`` f32 partial sums with ``GEMM_SPLIT_K``'s 8x256 tiles. Its
+    first load, ``parts[0, tm, tn]``, reads a tile at constant leading index 0,
+    whose matrix view (``rank_reduce_transfers``) has the identity layout;
+    the collapse_shape was built with the equal ``strided<[256, 1]>`` layout
+    and failed to verify in 'gpu-outlining'."""
+    splits, _, _, reduce_blocks = GEMM_SPLIT_K
+    kernel = _gemm_kernel(_sum_splits, reduce_blocks)
+    text, lowered = lower_xpu_stages(
+        kernel, [xpu_tensor(splits, 256, 256, dtype=torch.float32)]
+    )
+    _check_launch(text, (32,))
+    assert "memref.collapse_shape" in text
+    assert "xegpu." not in lowered
 
 
 @pytest.mark.isolated

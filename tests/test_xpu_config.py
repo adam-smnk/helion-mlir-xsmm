@@ -37,8 +37,12 @@ from helion_mlir_backend._compiler.targets import get_target
 from helion_mlir_backend._compiler.targets import target_config_keys
 from helion_mlir_backend._compiler.targets.xpu_params import PARAMS_ATTR
 from helion_mlir_backend._compiler.targets.xpu_params import XEGPU_CONFIG_KEYS
+from helion_mlir_backend._compiler.targets.xpu_params import ElementwiseShape
+from helion_mlir_backend._compiler.targets.xpu_params import GemmShape
 from helion_mlir_backend._compiler.targets.xpu_params import KernelParams
+from helion_mlir_backend._compiler.targets.xpu_params import ReductionShape
 from helion_mlir_backend._compiler.targets.xpu_params import attach_params
+from helion_mlir_backend._compiler.targets.xpu_params import columns_first
 from helion_mlir_backend._compiler.targets.xpu_params import take_params
 from helion_mlir_backend._compiler.targets.xpu_params import xegpu_params
 
@@ -1047,3 +1051,37 @@ def test_xpu_block_size_bounds_for_autotuning() -> None:
     # K tiles stay below K (the K loop must remain) and within the K tiles of
     # lighthouse's cost model.
     assert k.max_size == 64
+
+
+@pytest.mark.parametrize(
+    ("mnk", "expected"),
+    [
+        ((32768, 32768, 64), True),  # 7_Matmul_with_small_K_dimension_
+        ((32768, 32768, 32), True),  # 9_Tall_skinny (also padded to 64)
+        ((8192, 8192, 512), True),
+        ((4096, 4096, 2048), True),  # the boundary: as many written as read
+        ((4096, 4096, 2049), False),
+        ((4096, 4096, 4096), False),  # 1_Square, 13
+        ((2048, 4096, 8192), False),  # 2, 16-18
+        ((256, 256, 524288), False),  # 6_large_K (and its split chunks)
+        ((256, 256, 16384), False),
+    ],
+)
+def test_columns_first_rule(mnk: tuple[int, int, int], expected: bool) -> None:
+    """``columns_first``: a GEMM's grid runs columns first exactly when it
+    writes at least as many elements as it reads, M * N >= K * (M + N)."""
+    shape = GemmShape(mnk, (256, 256), 32, transpose_a=False, transpose_b=False)
+    assert columns_first(shape) is expected
+
+
+def test_columns_first_rule_needs_a_known_gemm() -> None:
+    """Unknown sizes and other kernel classes keep their order."""
+    unknown = GemmShape(None, (256, 256), 32, transpose_a=False, transpose_b=False)
+    assert not columns_first(unknown)
+    dynamic = ir.ShapedType.get_dynamic_size()
+    for mnk in ((dynamic, dynamic, 64), (32768, 32768, dynamic), (0, 0, 0)):
+        shape = GemmShape(mnk, (256, 256), 32, transpose_a=False, transpose_b=False)
+        assert not columns_first(shape), mnk
+    assert not columns_first(None)
+    assert not columns_first(ReductionShape(64, 64))
+    assert not columns_first(ElementwiseShape((1, 8192), (16,), (16,)))

@@ -117,7 +117,7 @@ _MATMUL_MNK = {
     "2_Standard_matrix_multiplication_": (512, 512, 256),
     "6_Matmul_with_large_K_dimension_": (256, 256, 4096),
     "7_Matmul_with_small_K_dimension_": (512, 512, 64),
-    "9_Tall_skinny_matrix_multiplication_": (512, 512, 32),
+    "9_Tall_skinny_matrix_multiplication_": (512, 512, 32),  # K padded to 64
     "13_Matmul_for_symmetric_matrices": (512, 512, 256),
     "16_Matmul_with_transposed_A": (512, 512, 256),
     "17_Matmul_with_transposed_B": (512, 512, 256),
@@ -161,11 +161,57 @@ def _matmul_operands(
     return a, b, (a.T if transposed_a else a) @ (b.T if transposed_b else b)
 
 
+_PAD_K = {"9_Tall_skinny_matrix_multiplication_": 64}
+"""K padded with zeros before the kernel, as the model does (AI-bench's
+``pad_k``)."""
+
+
 @pytest.mark.parametrize("name", list(_MATMUL_MNK))
 def test_kernelbench_matmul(name: str) -> None:
     problem = {p.name: p for p in kb.PROBLEMS}[name]
     a, b, ref = _matmul_operands(name, problem.dtype)
+    if name in _PAD_K:
+        pad = _PAD_K[name] - a.shape[1]
+        a, b = F.pad(a, (0, pad)), F.pad(b, (0, 0, 0, pad))
     _check(problem.kernel(a, b), ref)
+
+
+def test_matmul_k_step_16() -> None:
+    """K = 32 in K steps of 16 on 256x256 workgroups (9_Tall_skinny's config
+    before its K was padded, ``GEMM_SMALL_K``)."""
+    a, b = _randn(512, 32), _randn(32, 512)
+    _check(_kernel(kb._matmul, [256, 256, 16])(a, b), a @ b)
+
+
+def test_small_k_gemm_columns_first_bit_exact() -> None:
+    """``GEMM_SMALL_K`` with its columns-first grid (``columns_first``: the
+    output dominates) on 32x16 workgroups of 64x128 (2048x2048x64): bit for
+    bit ``torch.matmul``, as at the spec shape (the grid order moves no
+    arithmetic)."""
+    a, b = _randn(2048, 64), _randn(64, 2048)
+    kernel = _kernel(kb._matmul, kb.GEMM_SMALL_K[0], **kb.GEMM_SMALL_K[1])
+    _check(kernel(a, b), a @ b, bound=0.0)
+
+
+def test_split_k_gemm() -> None:
+    """``GEMM_SPLIT_K`` (6_large_K: 32 K chunks of the strided A view, f32
+    partial sums, ``_sum_splits``) at 256x256x32768: as close to the f32
+    result as ``torch.matmul`` (one bf16 rounding of a sum in another order)."""
+    splits, blocks, xegpu, reduce_blocks = kb.GEMM_SPLIT_K
+    a, b = _randn(256, 32768), _randn(32768, 256)
+    gemm = _kernel(kb._matmul_split_k, blocks, **xegpu)
+    reduce = _kernel(kb._sum_splits, reduce_blocks)
+    parts = gemm(*kb.split_k_views(a, b, splits))
+    ref32 = a.float() @ b.float()
+    # The f32 partial sums against the f32 chunk products.
+    chunks = [
+        a[:, i * 1024 : (i + 1) * 1024].float() @ b[i * 1024 : (i + 1) * 1024].float()
+        for i in range(splits)
+    ]
+    _check(parts, torch.stack(chunks), bound=1e-5)
+    out = reduce(parts)
+    _check(out, ref32)
+    assert normalized_error(out, ref32) <= 2 * normalized_error(a @ b, ref32) + 2**-9
 
 
 _GEMM_AT_SCALE = {

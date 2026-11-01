@@ -650,6 +650,33 @@ def _reduction_shape(
     )
 
 
+def columns_first(shape: KernelShape | None) -> bool:
+    """Whether the GEMM ``shape`` maps its grid columns first (grid x = the N
+    tiles, ``map_grid_columns_first``): when it writes at least as many output
+    elements as it must read operand elements, ``M * N >= K * (M + N)`` (all
+    sizes known), so the output store dominates its DRAM traffic. Other
+    kernels and GEMMs keep their order (elementwise kernels are mapped
+    columns first by ``map_elementwise_grid`` itself).
+
+    Why: workgroups are dispatched with grid x fastest. Rows first (the
+    default), the workgroups resident at a time are a column of output tiles,
+    each of its rows in another DRAM page; columns first, they write
+    neighbouring tiles of the same rows, as for the elementwise kernels. Where
+    the operands dominate (4096^3, 2048x4096x8192, K = 524288) rows first keeps
+    the operand reuse the configs were tuned for (e.g. ``GEMM_SQUARE``'s waves
+    of half of M). Arc B50, 2026-10-31, e2e, rows -> columns first:
+    32768x32768x64 256x256 tiles 43.5 -> 25.1 ms (64x256 tiles of 8x64
+    subgroups 40.2 -> 16.5 ms); 8192x8192x512 2.65 -> 2.22 ms; 8192x8192x1024 4.29 -> 3.92 ms;
+    4096x4096x2048 (the boundary, equal traffic) 1.80 -> 1.70 ms."""
+    if not isinstance(shape, GemmShape) or shape.mnk is None:
+        return False
+    m, n, k = shape.mnk
+    if min(m, n, k) <= 0:
+        # Unknown or dynamic sizes (ShapedType's dynamic sentinel is negative).
+        return False
+    return m * n >= k * (m + n)
+
+
 # --- Validation ------------------------------------------------------------------
 
 

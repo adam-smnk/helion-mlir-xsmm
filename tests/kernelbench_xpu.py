@@ -15,8 +15,9 @@ chosen per shape:
   1 and 13 use 128x512 workgroups (``GEMM_SQUARE``), so the 256x256 rule no
   longer holds for them; lighthouse infers 32x64 for the transposed 16-18;
   a 128x128 workgroup tile for the
-  256x256 output of 6_large_K (4 workgroups), a 16 K step for K = 32
-  (9_Tall_skinny; the K loop must stay, DPAS K is 16). Transposed operands
+  256x256 output of 6_large_K (4 workgroups; the model splits K instead,
+  :data:`GEMM_SPLIT_K`), :data:`GEMM_SMALL_K` for the output-bound 7 and 9
+  (9's K padded from 32 to 64, as the model does). Transposed operands
   (16-18: A stored ``[K, M]``, B ``[N, K]``, as the specs give them) are loaded
   as transposed 16x16 tiles.
 - Elementwise (bf16, 4096x393216): one-row workgroup tiles of 8192 columns
@@ -85,6 +86,49 @@ def _matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
             acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
         out[tm, tn] = acc.to(a.dtype)
     return out
+
+
+def _matmul_split_k(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """f32 partial products ``[S, M, N]`` of ``a: [M, S, Kc]`` and
+    ``b: [S, Kc, N]``, contiguous views of ``[M, K]`` and ``[K, N]`` operands
+    (:func:`split_k_views`): chunk ``s`` of a K split into ``S`` chunks of
+    ``Kc``. A chunk of ``a`` is the tile ``a[tm, s, tk]``, rows ``K`` apart:
+    passing a strided ``[S, M, Kc]`` view instead would copy all of A on every
+    call (kernel arguments are contiguous)."""
+    m, splits, kc = a.size()
+    _, _, n = b.size()
+    out = torch.empty([splits, m, n], dtype=torch.float32, device=a.device)
+    for ts, tm, tn in hl.tile([splits, m, n]):
+        acc = hl.zeros([ts, tm, tn], dtype=torch.float32)
+        for tk in hl.tile(kc):
+            chunk = a[tm, ts.begin, tk].unsqueeze(0)
+            acc = hl.dot(chunk, b[ts, tk, tn], acc=acc)
+        out[ts, tm, tn] = acc
+    return out
+
+
+def _sum_splits(parts: torch.Tensor) -> torch.Tensor:
+    """``parts.sum(0)`` of f32 ``[S, M, N]`` partial products, rounded to bf16
+    (in split order): the second kernel of a split K."""
+    splits, m, n = parts.size()
+    out = torch.empty([m, n], dtype=torch.bfloat16, device=parts.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = parts[0, tm, tn]
+        for index in hl.static_range(1, splits):
+            acc = acc + parts[index, tm, tn]
+        out[tm, tn] = acc.to(torch.bfloat16)
+    return out
+
+
+def split_k_views(
+    a: torch.Tensor, b: torch.Tensor, splits: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``a: [M, K]`` and ``b: [K, N]`` as ``splits`` K chunks, the operands of
+    :func:`_matmul_split_k`: the contiguous views ``[M, S, K/S]`` and
+    ``[S, K/S, N]``."""
+    m, k = a.size()
+    _, n = b.size()
+    return a.view(m, splits, k // splits), b.view(splits, k // splits, n)
 
 
 def _matmul_transposed_a(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -685,6 +729,45 @@ config)``. Keep in sync with ``GEMM_STANDARD`` in AI-bench's
   to ``torch.matmul``.
 """
 
+GEMM_SMALL_K = ([64, 128, 32], {"xegpu_sg_tiles": [[8, 64]]})
+"""7_Matmul_with_small_K_dimension_ (32768x32768x64) and, with K zero-padded
+from 32 to 64 by the model, 9_Tall_skinny_matrix_multiplication_ on the Arc
+B50: ``(block sizes, xegpu config)``. Keep in sync with ``GEMM_SMALL_K`` in
+AI-bench's ``backends/utils/helion_mlir_xpu_utils/matmul.py`` (the full
+rationale and the measurements).
+
+- Output-store bound (2 GiB of bf16 written, 8 MiB of operands read), so the
+  grid runs columns first (``xpu_params.columns_first``): 53.6 -> 140.9 GB/s.
+- 64x128 workgroups of 16 subgroups of 8x64: each subgroup writes 8 rows of
+  128 bytes, the 16-bit block stores being 32 bytes wide (256x256 with the
+  inferred 64x32: 86 GB/s columns first). 64 rows are lighthouse's minimum
+  (16 prefetching subgroups at a K step of 32).
+- Measured 2026-10-31 on the B50 (e2e): 15.1 ms, 142.7 GB/s (torch 18.4 ms,
+  117 GB/s; was 43.5 ms). Bit-identical to ``torch.matmul``.
+"""
+GEMM_SPLIT_K = (
+    32,
+    [1, 256, 256, 32],
+    {
+        "xegpu_sg_tiles": [[32, 64]],
+        "xegpu_load_tiles": [[32, 32, 16, 32]],
+        "xegpu_prefetch_depths": [[4, 2]],
+    },
+    [8, 256],
+)
+"""6_Matmul_with_large_K_dimension_ (256x256x524288) on the Arc B50 as a split
+K: ``(splits, GEMM block sizes, its xegpu config, reduction block sizes)``.
+Keep in sync with ``GEMM_SPLIT_K`` in AI-bench's
+``backends/utils/helion_mlir_xpu_utils/matmul.py`` (full rationale).
+
+- 32 K chunks of 16384 (contiguous views, :func:`split_k_views`): 32
+  workgroups of 256x256 (32 subgroups of 32x64, A read 32x32 per block read,
+  prefetched 4 K steps ahead, B 2) write f32 partial sums ``[32, 256, 256]``;
+  ``_sum_splits`` adds them (8-row tiles, 32 workgroups).
+- 3.33 ms e2e against 9.95 unsplit (4 workgroups of 128x128 on 16 Xe cores);
+  torch 3.16 ms.
+"""
+
 ELEMENTWISE_BLOCKS = [1, 8192]
 """Elementwise block sizes ``[rows, cols]`` of the bf16 4096x393216 problems
 (19-32) on the Arc B50, measured 2026-10-31. Keep in sync with
@@ -768,14 +851,18 @@ def _gemm(
     transposed: str = "",
     blocks: list[int] = _GEMM_BLOCKS,
     xegpu: dict[str, object] | None = None,
+    columns_first: bool = False,
 ) -> Problem:
     """A matmul of ``M x K`` and ``K x N`` operands, stored ``[K, M]`` /
     ``[N, K]`` when ``transposed`` names them; ``xegpu`` are the config keys
-    besides the block sizes (default: inferred)."""
+    besides the block sizes (default: inferred). ``columns_first``: the grid
+    runs the N tiles first (x), as the backend maps output-bound GEMMs."""
     m, n, k = mnk
     a = (k, m) if "a" in transposed else (m, k)
     b = (n, k) if "b" in transposed else (k, n)
     grid = (m // blocks[0], n // blocks[1])
+    if columns_first:
+        grid = grid[::-1]
     return Problem(
         name,
         "matmul",
@@ -819,11 +906,20 @@ PROBLEMS: tuple[Problem, ...] = (
     _gemm(
         "6_Matmul_with_large_K_dimension_", (256, 256, 524288), blocks=[128, 128, 32]
     ),
-    _gemm("7_Matmul_with_small_K_dimension_", (32768, 32768, 64)),
+    _gemm(
+        "7_Matmul_with_small_K_dimension_",
+        (32768, 32768, 64),
+        blocks=GEMM_SMALL_K[0],
+        xegpu=GEMM_SMALL_K[1],
+        columns_first=True,
+    ),
+    # K = 32 zero-padded to 64 by the model (AI-bench's pad_k).
     _gemm(
         "9_Tall_skinny_matrix_multiplication_",
-        (32768, 32768, 32),
-        blocks=[256, 256, 16],
+        (32768, 32768, 64),
+        blocks=GEMM_SMALL_K[0],
+        xegpu=GEMM_SMALL_K[1],
+        columns_first=True,
     ),
     _gemm(
         "13_Matmul_for_symmetric_matrices",

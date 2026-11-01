@@ -61,6 +61,7 @@ from .xpu_params import XEGPU_CONFIG_KEYS
 from .xpu_params import KernelParams
 from .xpu_params import attach_params
 from .xpu_params import check_params
+from .xpu_params import columns_first
 from .xpu_params import kernel_shape
 from .xpu_params import take_params
 from .xpu_params import xegpu_params
@@ -138,11 +139,15 @@ def _translated(exc: Exception, stage: str) -> Exception:
 
 
 def _stages(
-    entry: str, kernels: Sequence[KernelParams], stop_at: str
+    entry: str,
+    kernels: Sequence[KernelParams],
+    stop_at: str,
+    columns: Sequence[bool] = (),
 ) -> list[tuple[str, Stage]]:
     """The XeGPU stage list of ``entry``, whose tagged grid loops are GPU kernels
-    with parameters ``kernels``, up to ``stop_at``; lighthouse's dialects must
-    be loaded (schedules use its transform ops)."""
+    with parameters ``kernels``, up to ``stop_at``; ``columns[i]``: kernel
+    ``i``'s grid is mapped columns first (:func:`columns_first`). Lighthouse's
+    dialects must be loaded (schedules use its transform ops)."""
     context = ir.Context.current
     schedules = [
         # "prepare" ran before the capability checks (XpuTarget.lowering).
@@ -152,7 +157,7 @@ def _stages(
         ("bufferized", xegpu.bufferize_schedule()),
         ("host-legalized", xpu_transforms.legalize_host_ops()),
         # Lighthouse's outline_gpu_func and annotate_layouts schedules, per kernel.
-        ("gpu-outlining", xpu_transforms.outline_kernels(entry, kernels)),
+        ("gpu-outlining", xpu_transforms.outline_kernels(entry, kernels, columns)),
         # Row results stored as [rows, 1] columns: see keep_row_dims.
         ("row-results", _KeepRowDims()),
         ("xegpu-initial", xegpu.vector_to_xegpu_schedule()),
@@ -309,12 +314,14 @@ class XpuTarget(MLIRTarget):
         _apply_stage("prepare", prepare, module, dump)
         loops = check_xegpu_capabilities(module, entry)
         params = take_params(module)
-        check_params(params, [kernel_shape(loop) for loop in loops])
+        shapes = [kernel_shape(loop) for loop in loops]
+        check_params(params, shapes)
         i64 = ir.IntegerType.get_signless(64)
         for index, loop in enumerate(loops):
             loop.attributes[xpu_transforms.KERNEL_ATTR] = ir.IntegerAttr.get(i64, index)
         kernels = [*params, *[KernelParams()] * (len(loops) - len(params))]
-        stages = _stages(entry, kernels, stop_at or self.stop_points[-1])
+        columns = [columns_first(shape) for shape in shapes]
+        stages = _stages(entry, kernels, stop_at or self.stop_points[-1], columns)
         return XpuLowering(stages, dump)
 
     def runner(self, module: ir.Module) -> Runner:
