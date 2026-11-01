@@ -1,9 +1,9 @@
 """``bf16_extensions_as_shifts``: in XeVM GPU modules, the ``llvm.fpext``s
-from bf16 to f32 that an f32-to-bf16 ``llvm.fptrunc`` is computed from become
-the same extension in integer ops: ``bitcast(zext(bitcast x : i16) << 16)``.
+from bf16 to f32 become the same extension in integer ops:
+``bitcast(zext(bitcast x : i16) << 16)``.
 
-Works around wrong rounding by IGC (no LLVM or IGC patch, by policy). The
-LLVM and SPIR-V we emit are right: e.g. ``bf16(f32(a) + f32(b))`` is an
+Works around IGC narrowing f32 math to bf16 (no LLVM or IGC patch, by policy),
+which rounds wrong. The LLVM and SPIR-V we emit are right: e.g. ``bf16(f32(a) + f32(b))`` is an
 ``OpFAdd`` of f32 values and an ``OpFConvert`` to bf16 without a rounding-mode
 decoration (round to nearest even). IGC's optimizer shrinks
 ``fptrunc(fadd(fpext a, fpext b))`` to ``fadd bfloat`` (InstCombine: exact for
@@ -27,23 +27,23 @@ The rewrite is exact (a bf16 value's bits are the upper half of its f32 value's
 bits, also for infinities, NaNs and subnormals). It is not free in code size:
 IGC emits a zero-extending ``mov`` and a shift per conversion (the bf16 add
 kernel at ``[1, 8192]`` tiles: 401 instructions against 145). Measured on the
-B50 (review of the change): level 1 elementwise kernels are within noise
-(memory bound), level 2 40_Matmul_Scaling_ResidualAdd at 4096x4096x256
-(epilogue-heavy) about 2.3 % slower. A variant without the ``zext`` (two bf16
-values bitcast as one i32, then ``shl 16`` and ``and 0xFFFF0000``) is a
-possible later improvement.
+B50 for the first, narrower form of this rewrite (only extensions a bf16
+truncation is computed from): level 1 elementwise within noise, level 2
+40_Matmul_Scaling_ResidualAdd at 4096x4096x256 (epilogue-heavy) about 2.3 % slower;
+a later review of the current form saw about 1 % on 40. A variant without the
+``zext`` (two bf16 values bitcast as one i32, then ``shl 16`` and ``and
+0xFFFF0000``) is a possible later improvement.
+
+The same narrowing breaks functions on extended values: OpenCL's ``atan`` takes
+an ``fabs`` of its argument, and after inlining ``fabs(fpext x)`` becomes
+``fpext(fabs x)`` on bf16, a no-op (:mod:`xevm_fabs`; seen in IGC's dump). ``atan``
+of a bf16 value was wrong below -1 and ``cosh`` wrong, also with f32 results;
+both are right on the shifted extensions.
 
 Matched exactly: ``llvm.fpext`` of a bf16 scalar or vector to f32 in a
-``gpu.module`` with an ``#xevm.target``, from which an ``llvm.fptrunc`` of f32
-to bf16 is computed through ops with float results and no regions and through
-block arguments (phis: IGC folds a phi of ``fpext``s into an ``fpext`` of a phi,
-then shrinks), in any number of steps. That covers what IGC was seen to shrink
-(the op feeding the ``fptrunc``, also behind a phi) without being a proof of
-coverage for all of IGC's passes; extensions that reach no bf16 truncation are
-not rewritten, so the IR behind ``xpu_checks.check_math``'s device-verified
-tables stays as it was.
-``fptrunc(fpext x)`` (exact, ``x``) does not count; other extensions (e.g. to
-f32 outputs, or of f16) and host code are left alone.
+``gpu.module`` with an ``#xevm.target``. An extension only rounded straight back
+to bf16 (``fptrunc(fpext x)``, exact: ``x``) stays, so do other extensions
+(e.g. of f16) and host code.
 """
 
 from __future__ import annotations
@@ -56,31 +56,25 @@ _FPTRUNC = "llvm.fptrunc"
 _FPEXT = "llvm.fpext"
 
 
-def _element(type_: ir.Type) -> ir.Type:
+def element(type_: ir.Type) -> ir.Type:
     if isinstance(type_, ir.VectorType):
         return ir.VectorType(type_).element_type
     return type_
 
 
-def _like(type_: ir.Type, element: ir.Type) -> ir.Type:
-    """``type_`` (a scalar or vector type) with element type ``element``."""
+def like(type_: ir.Type, element_type: ir.Type) -> ir.Type:
+    """``type_`` (a scalar or vector type) with element type ``element_type``."""
     if isinstance(type_, ir.VectorType):
-        return ir.VectorType.get(ir.VectorType(type_).shape, element)
-    return element
-
-
-def _is_float(type_: ir.Type) -> bool:
-    return isinstance(
-        _element(type_), (ir.F16Type, ir.BF16Type, ir.F32Type, ir.F64Type)
-    )
+        return ir.VectorType.get(ir.VectorType(type_).shape, element_type)
+    return element_type
 
 
 def is_bf16_extension(op: ir.Operation) -> bool:
     """``op`` is an ``llvm.fpext`` of bf16 (scalar or vector) to f32."""
     return (
         op.name == _FPEXT
-        and isinstance(_element(op.operands[0].type), ir.BF16Type)
-        and isinstance(_element(op.results[0].type), ir.F32Type)
+        and isinstance(element(op.operands[0].type), ir.BF16Type)
+        and isinstance(element(op.results[0].type), ir.F32Type)
     )
 
 
@@ -88,92 +82,24 @@ def is_bf16_truncation(op: ir.Operation) -> bool:
     """``op`` is an ``llvm.fptrunc`` of f32 (scalar or vector) to bf16."""
     return (
         op.name == _FPTRUNC
-        and isinstance(_element(op.operands[0].type), ir.F32Type)
-        and isinstance(_element(op.results[0].type), ir.BF16Type)
+        and isinstance(element(op.operands[0].type), ir.F32Type)
+        and isinstance(element(op.results[0].type), ir.BF16Type)
     )
 
 
-def _successor_operands(terminator: ir.Operation, index: int) -> list[ir.Value] | None:
-    """The operands ``terminator`` passes to its successor ``index``, or
-    ``None`` if its operand layout is not known."""
-    operands = list(terminator.operands)
-    if terminator.name == "llvm.br":
-        return operands
-    if terminator.name == "llvm.cond_br":
-        segments = list(
-            ir.DenseI32ArrayAttr(terminator.attributes["operandSegmentSizes"])
-        )
-        _condition, on_true, _on_false = segments
-        return operands[1 : 1 + on_true] if index == 0 else operands[1 + on_true :]
-    return None
-
-
-def incoming_values(argument: ir.Value) -> list[ir.Value]:
-    """The values a block argument takes from its predecessors (a phi's
-    incoming values): the matching successor operand of each ``llvm.br`` and
-    ``llvm.cond_br``; of another terminator, every operand of the argument's
-    type (conservative). None for an entry block's (function) arguments."""
-    block = argument.owner
-    position = ir.BlockArgument(argument).arg_number
-    values: list[ir.Value] = []
-    for predecessor in block.predecessors:
-        terminator = list(predecessor.operations)[-1]
-        for index, successor in enumerate(terminator.successors):
-            if successor != block:
-                continue
-            passed = _successor_operands(terminator, index)
-            if passed is None:
-                values.extend(o for o in terminator.operands if o.type == argument.type)
-            else:
-                values.append(passed[position])
-    return values
-
-
-def extensions_of(truncation: ir.Operation, seen: set[ir.Value]) -> list[ir.Operation]:
-    """The bf16 extensions ``truncation`` (an f32-to-bf16 ``fptrunc``) is
-    computed from, through ops with float results and no regions and through
-    block arguments (to the values their predecessors pass); none for
-    ``fptrunc(fpext x)``. Values in ``seen`` were walked already (by an earlier
-    truncation) and are skipped. Iterative: unrolled reductions make long
-    chains."""
-    source = truncation.operands[0]
-    owner = source.owner
-    if not isinstance(owner, ir.Block) and is_bf16_extension(owner):
-        return []
-    found: list[ir.Operation] = []
-    stack = [source]
-    while stack:
-        value = stack.pop()
-        if value in seen:
-            continue
-        seen.add(value)
-        if not _is_float(value.type):
-            continue
-        owner = value.owner
-        if isinstance(owner, ir.Block):
-            stack.extend(incoming_values(value))
-            continue
-        if owner.regions:
-            continue
-        if is_bf16_extension(owner):
-            found.append(owner)
-            continue
-        stack.extend(owner.operands)
-    return found
-
-
-def _constant(type_: ir.Type, value: int) -> ir.Value:
-    element = _element(type_)
-    if isinstance(type_, ir.VectorType):
-        attr = ir.DenseElementsAttr.get_splat(type_, ir.IntegerAttr.get(element, value))
-    else:
-        attr = ir.IntegerAttr.get(element, value)
+def constant(type_: ir.Type, value: int) -> ir.Value:
+    scalar = ir.IntegerAttr.get(element(type_), value)
+    attr = (
+        ir.DenseElementsAttr.get_splat(type_, scalar)
+        if isinstance(type_, ir.VectorType)
+        else scalar
+    )
     return ir.Operation.create(
         "llvm.mlir.constant", results=[type_], attributes={"value": attr}
     ).results[0]
 
 
-def _op(name: str, result: ir.Type, *operands: ir.Value) -> ir.Value:
+def llvm_op(name: str, result: ir.Type, *operands: ir.Value) -> ir.Value:
     return ir.Operation.create(name, results=[result], operands=list(operands)).results[
         0
     ]
@@ -181,33 +107,33 @@ def _op(name: str, result: ir.Type, *operands: ir.Value) -> ir.Value:
 
 def _rewrite(extension: ir.Operation) -> None:
     source = extension.operands[0]
-    i16 = _like(source.type, ir.IntegerType.get_signless(16))
-    i32 = _like(source.type, ir.IntegerType.get_signless(32))
+    i16 = like(source.type, ir.IntegerType.get_signless(16))
+    i32 = like(source.type, ir.IntegerType.get_signless(32))
     with ir.InsertionPoint(extension), extension.location:
-        bits = _op("llvm.zext", i32, _op("llvm.bitcast", i16, source))
-        shifted = _op("llvm.shl", i32, bits, _constant(i32, 16))
-        result = _op("llvm.bitcast", extension.results[0].type, shifted)
+        bits = llvm_op("llvm.zext", i32, llvm_op("llvm.bitcast", i16, source))
+        shifted = llvm_op("llvm.shl", i32, bits, constant(i32, 16))
+        result = llvm_op("llvm.bitcast", extension.results[0].type, shifted)
     extension.results[0].replace_all_uses_with(result)
     extension.erase()
+
+
+def _only_rounded_back(extension: ir.Operation) -> bool:
+    uses = [use.owner for use in extension.results[0].uses]
+    return bool(uses) and all(is_bf16_truncation(user) for user in uses)
 
 
 def bf16_extensions_as_shifts(module: ir.Module) -> int:
     """Rewrites ``module``'s matching XeVM extensions in place; returns how
     many."""
-    truncations: list[ir.Operation] = []
+    extensions: list[ir.Operation] = []
 
     def visit(op: ir.Operation) -> ir.WalkResult:
-        if is_bf16_truncation(op):
-            truncations.append(op)
+        if is_bf16_extension(op) and not _only_rounded_back(op):
+            extensions.append(op)
         return ir.WalkResult.ADVANCE
 
     for gpu_module in xevm_modules(module):
         gpu_module.walk(visit)
-    seen: set[ir.Value] = set()
-    extensions: dict[ir.Value, ir.Operation] = {}  # by result: one rewrite each
-    for truncation in truncations:
-        for extension in extensions_of(truncation, seen):
-            extensions.setdefault(extension.results[0], extension)
-    for extension in extensions.values():
+    for extension in extensions:
         _rewrite(extension)
     return len(extensions)

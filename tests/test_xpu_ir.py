@@ -606,7 +606,7 @@ def test_elementwise_bf16_math_and_casts() -> None:
     # bf16 math runs in f32 (the fast exp too: upstream's math-to-xevm would
     # call a bf16 native exp otherwise).
     assert _bf16_natives(lowered) == []
-    assert "@_Z16__spirv_ocl_tanhf" in lowered
+    assert "__spirv_ocl_tanh" not in lowered  # xpu_math_approx
     # The f32 native exp, per element or of a 16-element vector.
     assert re.search(r"@_Z22__spirv_ocl_native_exp(f|Dv16_f)\b", lowered)
 

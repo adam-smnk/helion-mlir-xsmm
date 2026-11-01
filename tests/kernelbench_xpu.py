@@ -1080,11 +1080,11 @@ What decides the bandwidth:
   workgroup, 48 x 4096 = 196608 workgroups. 1024 to 32768 columns measured
   the same for relu (195.7-196.4 GB/s); 8192 divides the spec's 393216
   columns and any multiple of 8192 (8192x8192 too).
-- 29_Softplus stays below the ceiling for another reason, a gap of the math
-  lowering: its f32 ``log1p`` becomes a scalar ``__spirv_ocl_log1pf`` call per
-  element, and the kernel runs at about 147 GB/s (at a power-limited clock,
-  for every tile width tried, 1024-16384 columns) where torch's softplus
-  reaches 191 GB/s.
+- 22_Tanh runs at the ceiling and 29_Softplus at 186 GB/s (torch 191) on
+  branch-free math (``xpu_math_approx``); OpenCL's scalar ``log1p`` per element
+  gave Softplus 154 GB/s at these tiles. Softplus reached 197 GB/s when a binary
+  had 128 GRFs by accident; why is not established, and the IGC options are one
+  set for all kernels (GEMMs need the large register file).
 """
 _ELEMENTWISE_SHAPE = (4096, 393216)
 _NCHW_BLOCKS = [1, 1, 128, 256]

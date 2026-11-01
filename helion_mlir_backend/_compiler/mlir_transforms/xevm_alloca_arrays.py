@@ -30,7 +30,7 @@ _ALLOCA = "llvm.alloca"
 _CONSTANT = "llvm.mlir.constant"
 
 
-def xevm_modules(module: ir.Module) -> list[ir.Operation]:
+def xevm_modules(module: ir.Module | ir.Operation) -> list[ir.Operation]:
     found: list[ir.Operation] = []
 
     def visit(op: ir.Operation) -> ir.WalkResult:

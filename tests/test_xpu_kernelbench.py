@@ -193,23 +193,10 @@ _CHECKS = {
 }
 
 
-_REJECTED = {
-    "22_Tanh": r"math\.tanh rounded to bf16",
-    # abs of bf16 x: right on the device for softsign's shared operand, but not
-    # separable from the wrong forms (xpu_checks.BF16_OPERAND_VERIFIED).
-    "30_Softsign": r"math\.absf of a bf16 value",
-}
-
-
 @pytest.mark.isolated
 @pytest.mark.parametrize("name", list(_ALL))
 def test_kernelbench_problem_lowers_for_xpu(name: str) -> None:
     problem = _ALL[name]
-    if name in _REJECTED:
-        # Computed wrong on the device (xpu_checks.check_math).
-        with pytest.raises(UnsupportedOperationError, match=_REJECTED[name]):
-            lower_xpu_stages(problem.kernel, _args(problem))
-        return
     text, lowered = lower_xpu_stages(problem.kernel, _args(problem))
     _check_launch(text, problem.grid)
     _CHECKS[problem.kind](text)

@@ -193,9 +193,11 @@ it piece by piece, and what each avoids:
   hold, also from earlier kernels. In what we tried it takes a row value compared
   with another one kept over a loop, or with a second row value: a running
   maximum, or a row sum through a clamp.
-- ``VectorizerAllowFPTRUNC=0``: no vector ``fptrunc``. ``fptrunc <8 x float>`` is
-  placed before the ``insertelement``s of its operand, so the kernel rounds
-  whatever the register holds (16-bit results of branchy builtins).
+- ``VectorizerAllowFPTRUNC=0``: no vector ``fptrunc``. ``fptrunc <8 x float> %v`` is
+  placed before the ``insertelement``s of ``%v``, a use before its def (22_Tanh and
+  other branchy builtins rounded to bf16 or f16): the output is whatever those
+  registers hold, left by an earlier kernel, zero only if nothing has written
+  them yet.
 - ``VectorizerAllowSelect=0``: avoids the Triton compiler crash through ``ocloc``,
   as ``VectorizerAllowCMP=0`` also does; cause not investigated.
 - ``VectorizerAllowFADD``, ``FSUB``, ``FMUL``, ``FDIV``, ``EXP2``, ``MAXNUM``,
@@ -207,25 +209,18 @@ _NO_MODULE = "^$"
 """A ``gpu.module`` name regex that matches no module (names are not empty)."""
 
 
-def lower_to_xevm() -> ir.Module:
-    """Schedule: annotated workgroup-level XeGPU lowered by upstream's
-    ``gpu-lower-to-xevm-pipeline`` (lighthouse's ``xegpu_to_binary``), stopping
-    before device binaries
-    (``binary-format=skip``: no SPIR-V target needed; the XPU target emits
-    them in a stage of its own). bf16 math is extended to f32 first (see
-    below).
+def extend_math() -> ir.Module:
+    """Schedule: every GPU module gets exactly one target, :data:`XEVM_TARGET`,
+    and its 16-bit math is extended to f32.
 
-    Each GPU module gets exactly one target, :data:`XEVM_TARGET`: lighthouse's
-    vector-to-XeGPU stage attached it, and the pipeline would attach a second
-    one (whose ``cmd-options`` flag nothing reads), so every kernel would be
-    compiled twice. The targets are set to the one, and the pipeline attaches
-    none (a module matcher matching no name). The IGC options reach the
-    binaries through ``gpu-module-to-binary``'s ``opts``."""
+    Lighthouse's vector-to-XeGPU stage attached the target, and
+    :func:`lower_to_xevm`'s pipeline would attach a second one (whose
+    ``cmd-options`` flag nothing reads), so every kernel would be compiled
+    twice. The pipeline converts fast (`afn`) math to native OpenCL calls before
+    it extends bf16 math to f32 (math-to-xevm takes any float type), which
+    leaves calls of bf16 natives that do not exist: extend first, with the
+    pipeline's own options (f16 and f32 math stay)."""
     with schedule_boilerplate() as (schedule, named_seq):
-        # The pipeline converts fast (`afn`) math to native OpenCL calls before
-        # it extends bf16 math to f32 (math-to-xevm takes any float type), which
-        # leaves calls of bf16 natives that do not exist: extend first, with the
-        # pipeline's own options (f16 and f32 math stay).
         gpu_modules = match(named_seq.bodyTarget, ops={"gpu.module"})
         targets = transform.ParamConstantOp(
             transform.AnyParamType.get(),
@@ -237,6 +232,18 @@ def lower_to_xevm() -> ir.Module:
             "math-extend-to-supported-types",
             options={"extra-types": "f16", "target-type": "f32"},
         )
+        transform.yield_()
+    return schedule
+
+
+def lower_to_xevm() -> ir.Module:
+    """Schedule: annotated workgroup-level XeGPU lowered by upstream's
+    ``gpu-lower-to-xevm-pipeline`` (lighthouse's ``xegpu_to_binary``), stopping
+    before device binaries (``binary-format=skip``: no SPIR-V target needed; the
+    XPU target emits them in a stage of its own). :func:`extend_math` ran before;
+    the pipeline attaches no target (a module matcher matching no name). The IGC
+    options reach the binaries through ``gpu-module-to-binary``'s ``opts``."""
+    with schedule_boilerplate() as (schedule, named_seq):
         apply_registered_pass(
             named_seq.bodyTarget,
             "gpu-lower-to-xevm-pipeline",

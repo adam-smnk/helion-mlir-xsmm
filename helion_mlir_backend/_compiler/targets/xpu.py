@@ -20,11 +20,9 @@ Only the IR stages run without an XPU-capable LLVM build: ``xegpu-wg`` (annotate
 XeGPU) and ``xevm`` (LLVM/XeVM without device binaries). Binaries need the SPIR-V
 target, execution the Level Zero runtime (``libmlir_levelzero_runtime.so``). The
 ``binary`` stop point lowers to ``xevm``, then rewrites the XeVM modules'
-counted allocas (``xevm_alloca_arrays``, a SPIR-V backend workaround), flags
-minima and maxima (``xevm_nsz_minmax``, cheaper in SPIR-V), keeps IGC from
-saturating clamps to [0, 1] (``xevm_unit_clamps``, an IGC workaround), rewrites
-the bf16 extensions that bf16 results are computed from
-(``xevm_bf16_extensions``, an IGC workaround), and emits the binaries: the ``xevm`` stop point's IR precedes
+counted allocas (``xevm_alloca_arrays``, a SPIR-V backend workaround), the bf16
+extensions (``xevm_bf16_extensions``) and f32 ``fabs`` (``xevm_fabs``, both IGC
+workarounds), orders long tile math (``xevm_tile_order``), and emits the binaries: the ``xevm`` stop point's IR precedes
 those rewrites.
 """
 
@@ -58,9 +56,14 @@ from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
+from ..mlir_transforms.xevm_fabs import fabs_as_integer_min
 from ..mlir_transforms.xevm_lane_reductions import check_lane_reductions
 from ..mlir_transforms.xevm_nsz_minmax import nsz_minmax
+from ..mlir_transforms.xevm_tile_order import order_tile_chunks
+from ..mlir_transforms.xevm_tile_order import spill_bytes
 from ..mlir_transforms.xevm_unit_clamps import unit_clamps_without_sat
+from ..mlir_transforms.xpu_math_approx import approximate_math
+from ..mlir_transforms.xpu_math_approx import fold_extended_splats
 from .base import MLIRTarget
 from .xpu_checks import check_xegpu_capabilities
 from .xpu_params import XEGPU_CONFIG_KEYS
@@ -174,7 +177,13 @@ def _stages(
         ("xegpu-wg", xpu_transforms.annotate_kernels(entry, kernels)),
     ]
     if stop_at != "xegpu-wg":
-        schedules.append(("xevm", xpu_transforms.lower_to_xevm()))
+        schedules.extend(
+            [
+                ("xevm-math", xpu_transforms.extend_math()),
+                ("xevm-math-approx", _ApproximateMath()),
+                ("xevm", xpu_transforms.lower_to_xevm()),
+            ]
+        )
     stages: list[tuple[str, Stage]] = [
         (name, s if isinstance(s, Stage) else TransformStage(s, context))
         for name, s in schedules
@@ -189,7 +198,8 @@ def _stages(
         stages[index] = ("xevm", _CheckLaneReductions(stages[index][1]))
     if stop_at == "binary":
         # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays,
-        # xevm_nsz_minmax, xevm_unit_clamps and xevm_bf16_extensions.
+        # xevm_nsz_minmax, xevm_unit_clamps, xevm_bf16_extensions and xevm_fabs;
+        # _ToBinary for xevm_tile_order.
         stages.extend(
             [
                 ("xevm-allocas", _AllocaArrays()),
@@ -197,6 +207,7 @@ def _stages(
                 # Before the extensions: it looks through them.
                 ("xevm-unit-clamps", _UnitClamps()),
                 ("xevm-bf16-extensions", _Bf16Extensions()),
+                ("xevm-fabs", _FabsAsIntegerMin()),
                 ("binary", _ToBinary()),
             ]
         )
@@ -205,15 +216,34 @@ def _stages(
 
 class _ToBinary(Stage):
     """The last pass of ``gpu-lower-to-xevm-pipeline`` (run with ``binary-format=
-    skip`` before), with its options: device binaries (fatbin)."""
+    skip`` before), with its options: device binaries (fatbin). A module that
+    spills is compiled again with its tile math ordered chunk by chunk, and that
+    is kept if it spills less (:mod:`xevm_tile_order`)."""
 
     def apply(self, module: ir.Module) -> ir.Module:
-        PassManager.parse(
+        ordered = module.operation.clone()
+        to_binary = PassManager.parse(
             "builtin.module(gpu-module-to-binary{format=fatbin "
             f"opts={{{xpu_transforms.IGC_OPTIONS}}}}})",
             module.context,
-        ).run(module.operation)
+        )
+        to_binary.run(module.operation)
+        spill = spill_bytes(module.operation)
+        if spill:
+            order_tile_chunks(ordered)
+            to_binary.run(ordered)
+            if spill_bytes(ordered) < spill:
+                _replace_body(module, ordered)
         return module
+
+
+def _replace_body(module: ir.Module, replacement: ir.Operation) -> None:
+    for op in list(module.body.operations):
+        op.operation.erase()
+    point = ir.InsertionPoint(module.body)
+    for op in list(replacement.regions[0].blocks[0].operations):
+        op.operation.detach_from_parent()
+        point.insert(op.operation)
 
 
 class _KeepRowDims(Stage):
@@ -279,12 +309,30 @@ class _UnitClamps(Stage):
 
 
 class _Bf16Extensions(Stage):
-    """bf16-to-f32 extensions that bf16 results are computed from as integer
-    shifts (works around IGC narrowing f32 math between the conversions to
-    bf16 math that truncates, :mod:`xevm_bf16_extensions`)."""
+    """bf16-to-f32 extensions as integer shifts (works around IGC narrowing f32
+    math on them to bf16 math, which truncates, :mod:`xevm_bf16_extensions`)."""
 
     def apply(self, module: ir.Module) -> ir.Module:
         bf16_extensions_as_shifts(module)
+        return module
+
+
+class _FabsAsIntegerMin(Stage):
+    """f32 ``fabs`` in integer ops (works around IGC's no-op bf16 ``fabs``,
+    :mod:`xevm_fabs`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        fabs_as_integer_min(module)
+        return module
+
+
+class _ApproximateMath(Stage):
+    """``tanh`` and ``log1p`` as branch-free ops instead of a builtin call per
+    element, and constants of extended math folded (:mod:`xpu_math_approx`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        fold_extended_splats(module)
+        approximate_math(module)
         return module
 
 

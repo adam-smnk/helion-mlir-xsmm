@@ -1,7 +1,7 @@
 """``xevm_bf16_extensions``: in XeVM GPU modules, the bf16-to-f32 ``fpext``s
-that an f32-to-bf16 ``fptrunc`` is computed from become integer shifts (an IGC
-rounding workaround); everything else is left alone. IR only: no XPU or SPIR-V
-target needed. The device regressions are ``tests/test_xpu_runtime.py``'s
+become integer shifts (an IGC narrowing workaround), except ones only rounded
+straight back; everything else is left alone. IR only: no XPU or SPIR-V target
+needed. The device regressions are ``tests/test_xpu_runtime.py``'s
 ``test_bf16_arithmetic_rounds_to_nearest_even``."""
 
 from __future__ import annotations
@@ -183,9 +183,8 @@ def test_extensions_of_a_rounded_sum_become_shifts() -> None:
 
 
 def test_scalar_extensions_through_several_ops() -> None:
-    """Scalars, and an extension reached through ops with float results (a
-    product, a select, a call): every extension the rounded value is computed
-    from, each once, also when two truncations share it."""
+    """Scalars, whatever uses them (a product, a select, a call), each rewritten
+    once, also when two truncations share it."""
     body = """%ea = llvm.fpext %a : bf16 to f32
       %eb = llvm.fpext %b : bf16 to f32
       %c0 = llvm.mlir.constant(0.0 : f32) : f32
@@ -283,45 +282,68 @@ _BRANCH_ARGS = "%a: bf16, %b: bf16, %c: i1, %q: !llvm.ptr<1>"
 @pytest.mark.parametrize(
     ("body", "expected"),
     [
-        (_DIAMOND, 2),
-        (_COND_BR_OPERANDS, 2),
-        (_BR_POSITIONS, 1),
+        (_DIAMOND, 3),
+        (_COND_BR_OPERANDS, 3),
+        (_BR_POSITIONS, 2),
         (_LOOP, 2),
         (_SWITCH, 2),
     ],
     ids=["diamond", "cond_br_operands", "br_positions", "loop_carried", "switch"],
 )
-def test_extensions_through_block_arguments(body: str, expected: int) -> None:
-    """A truncated value computed from block arguments (phis): the extensions
-    the predecessors pass are rewritten (IGC folds a phi of ``fpext``s into an
-    ``fpext`` of a phi and shrinks the product; device repro ``phi_mul``).
-    ``llvm.br`` passes its operands by position (only the argument that
-    reaches the truncation counts), ``llvm.cond_br`` each successor its
-    segment (the extension passed to the other block, stored as f32, is not a
-    candidate), a loop passes its init and latch values; another terminator
-    (``switch``) is taken conservatively. Extensions feeding only an f32 store
-    (``%keep``) stay."""
+def test_extensions_passed_to_blocks(body: str, expected: int) -> None:
+    """Extensions reaching a truncation through block arguments (IGC folds a
+    phi of ``fpext``s into an ``fpext`` of a phi and shrinks the product; device
+    repro ``phi_mul``) and ones feeding only an f32 store (``%keep``)."""
     count, text = _rewrite(_module(body, _BRANCH_ARGS))
     assert count == expected
     kernel = _kernel(text)
-    kept = 1 if body in (_DIAMOND, _COND_BR_OPERANDS, _BR_POSITIONS) else 0
-    assert kernel.count("llvm.fpext") == kept
+    assert kernel.count("llvm.fpext") == 0
     assert kernel.count("llvm.shl") == expected
     assert kernel.count("llvm.fptrunc") == 1
 
 
-def test_function_arguments_end_the_walk() -> None:
-    """A truncated value computed from an f32 function argument (an entry
-    block argument, no predecessors) has no extension to rewrite."""
-    body = """%e = llvm.fpext %a : bf16 to f32
-      %s = llvm.fmul %x, %x : f32
-      %t = llvm.fptrunc %s : f32 to bf16
+@pytest.mark.parametrize(
+    ("body", "args"),
+    [
+        # An f32 result: IGC moves an fabs past the extension as well.
+        (
+            """%e = llvm.fpext %a : bf16 to f32
+      %s = llvm.fadd %e, %e : f32
+      llvm.store %s, %p : f32, !llvm.ptr<1>""",
+            "%a: bf16",
+        ),
+        # bf16-derived, rounded to f16.
+        (
+            """%e = llvm.fpext %a : bf16 to f32
+      %s = llvm.fadd %e, %e : f32
+      %t = llvm.fptrunc %s : f32 to f16
+      llvm.store %t, %p : f16, !llvm.ptr<1>""",
+            "%a: bf16",
+        ),
+        # Through an integer op.
+        (
+            """%e = llvm.fpext %a : bf16 to f32
+      %i = llvm.bitcast %e : f32 to i32
+      %f = llvm.bitcast %i : i32 to f32
+      %t = llvm.fptrunc %f : f32 to bf16
+      llvm.store %t, %p : bf16, !llvm.ptr<1>""",
+            "%a: bf16",
+        ),
+        # Rounded back, and used by something else too.
+        (
+            """%e = llvm.fpext %a : bf16 to f32
+      %t = llvm.fptrunc %e : f32 to bf16
       llvm.store %t, %p : bf16, !llvm.ptr<1>
-      llvm.store %e, %p : f32, !llvm.ptr<1>"""
-    source = _module(body, "%a: bf16, %x: f32")
-    count, text = _rewrite(source)
-    assert count == 0
-    assert text == _rewrite(source, apply=False)[1]
+      llvm.store %e, %p : f32, !llvm.ptr<1>""",
+            "%a: bf16",
+        ),
+    ],
+    ids=["f32_result", "f16_result", "integer", "rounded_back_and_stored"],
+)
+def test_extensions_with_no_bf16_result_become_shifts(body: str, args: str) -> None:
+    count, text = _rewrite(_module(body, args))
+    assert count == 1
+    assert "llvm.fpext" not in _kernel(text)
 
 
 @pytest.mark.parametrize(
@@ -334,13 +356,6 @@ def test_function_arguments_end_the_walk() -> None:
       llvm.store %t, %p : vector<1xbf16>, !llvm.ptr<1>""",
             "%a: vector<1xbf16>",
         ),
-        # An f32 result: no truncation.
-        (
-            """%e = llvm.fpext %a : bf16 to f32
-      %s = llvm.fadd %e, %e : f32
-      llvm.store %s, %p : f32, !llvm.ptr<1>""",
-            "%a: bf16",
-        ),
         # f16 extensions and an f16 result.
         (
             """%e = llvm.fpext %a : f16 to f32
@@ -349,14 +364,6 @@ def test_function_arguments_end_the_walk() -> None:
       llvm.store %t, %p : f16, !llvm.ptr<1>""",
             "%a: f16",
         ),
-        # bf16-derived, rounded to f16: not a bf16 truncation.
-        (
-            """%e = llvm.fpext %a : bf16 to f32
-      %s = llvm.fadd %e, %e : f32
-      %t = llvm.fptrunc %s : f32 to f16
-      llvm.store %t, %p : f16, !llvm.ptr<1>""",
-            "%a: bf16",
-        ),
         # A rounded f32 input (e.g. a GEMM accumulator): no extension.
         (
             """%s = llvm.fadd %a, %a : f32
@@ -364,17 +371,8 @@ def test_function_arguments_end_the_walk() -> None:
       llvm.store %t, %p : bf16, !llvm.ptr<1>""",
             "%a: f32",
         ),
-        # Through an integer op: the f32 value is not computed by float ops.
-        (
-            """%e = llvm.fpext %a : bf16 to f32
-      %i = llvm.bitcast %e : f32 to i32
-      %f = llvm.bitcast %i : i32 to f32
-      %t = llvm.fptrunc %f : f32 to bf16
-      llvm.store %t, %p : bf16, !llvm.ptr<1>""",
-            "%a: bf16",
-        ),
     ],
-    ids=["exact_roundtrip", "f32_result", "f16", "f16_result", "f32_input", "integer"],
+    ids=["exact_roundtrip", "f16", "f32_input"],
 )
 def test_other_conversions_are_untouched(body: str, args: str) -> None:
     source = _module(body, args)

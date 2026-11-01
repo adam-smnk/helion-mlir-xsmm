@@ -37,12 +37,12 @@ from tests import kernelbench_xpu as kb
 from tests import test_nan_minmax as nan_kernels
 from tests import test_xevm_bf16_extensions as bf16_kernels
 from tests import test_xpu_ir as ir_kernels
+from tests import xpu_math_full_kernels as full_kernels
 from tests import xpu_math_kernels as mk
 from tests.test_xpu_kernelbench import _reference as level2_reference
 
 from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler import execution
-from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 from helion_mlir_backend._compiler.targets import xpu as xpu_target
 from helion_mlir_backend._compiler.targets.xpu import XpuTarget
 
@@ -251,13 +251,6 @@ def test_kernelbench_hand_picked_gemm_at_scale(name: str) -> None:
 
 _EXACT = {"19_ReLU", "32_HardTanh", "19_ReLU_NCHW"}
 """Problems computing an exact op (no rounding): bit for bit."""
-_GUARDED_ELEMENTWISE = {
-    "22_Tanh": r"math\.tanh rounded to bf16",
-    "30_Softsign": r"math\.absf of a bf16 value",
-}
-"""Problems the XPU target rejects (``xpu_checks.check_math``): computed on the
-device they are wrong (22_Tanh: zeros) or not separable from wrong forms
-(30_Softsign's abs of bf16 values)."""
 
 
 def _poison_output(shape: tuple[int, ...], dtype: torch.dtype) -> int:
@@ -277,10 +270,6 @@ def test_kernelbench_elementwise(name: str) -> None:
     # N(0, 3): both sides of every kink (hardtanh, hardsigmoid, ELU, SELU).
     x = _randn(*_ELEMENTWISE_SHAPE) * 3
     bound = 0.0 if name in _EXACT else None
-    if name in _GUARDED_ELEMENTWISE:
-        with pytest.raises(UnsupportedOperationError, match=_GUARDED_ELEMENTWISE[name]):
-            problem.kernel(x)
-        return
     poisoned = _poison_output(x.shape, x.dtype)
     out = problem.kernel(x)
     assert out.data_ptr() == poisoned
@@ -375,43 +364,6 @@ def test_misaligned_inout_is_staged_and_copied_back() -> None:
 
 
 _MATH_DTYPES = {"bf16": BF16, "f16": F16, "f32": F32}
-_KNOWN_WRONG: dict[str, set[tuple[str, str]]] = {
-    **{
-        name: {(i, o) for i in _MATH_DTYPES for o in ("bf16", "f16")}
-        for name in (
-            "exp2",
-            "log",
-            "log2",
-            "log1p",
-            "expm1",
-            "sin",
-            "cos",
-            "tanh",
-            "pow",
-        )
-    },
-    **{
-        name: {("bf16", o) for o in _MATH_DTYPES} | {("f32", "bf16")}
-        for name in ("abs", "abs_raw")
-    },
-    "abs_p1": {("bf16", "bf16"), ("bf16", "f16")},
-    "abs_x2": {("bf16", "bf16"), ("bf16", "f16")},
-    "atan": {("bf16", o) for o in _MATH_DTYPES},
-    # The reviewer's rows (bf16 and f16 inputs measured).
-    **{
-        name: {(i, o) for i in ("bf16", "f16") for o in ("bf16", "f16")}
-        for name in ("tan", "acos", "atanh", "sinh")
-    },
-    "cosh": {(i, o) for i in ("bf16", "f16") for o in ("bf16", "f16")}
-    | {("bf16", "f32")},
-    **{
-        name: {("bf16", o) for o in _MATH_DTYPES}
-        for name in ("abs_neg", "abs_mul1", "atan_mul1")
-    },
-}
-"""``(input, output)`` dtypes each kernel computed wrong on the B50 without the
-math check (llvm-project 79ab4054, /swtools/intel-gpu/latest IGC): these must
-be rejected."""
 # Rounded f32 math: half a 16-bit ulp of the output twice over; f32 native
 # functions (``native_exp``, OpenCL tanh) are accurate to a few f32 ulps.
 _MATH_BOUND = {BF16: 2**-7, F16: 2**-10, F32: 1e-4}
@@ -419,11 +371,13 @@ _MATH_BOUND = {BF16: 2**-7, F16: 2**-10, F32: 1e-4}
 
 @pytest.mark.parametrize("name", list(mk.EXPRS))
 def test_math_functions(name: str) -> None:
-    """``out = f(x.float())`` for every input and output dtype: right, or
-    rejected by the XPU math check; the forms known to compute wrong values on
-    the device are rejected."""
+    """``out = f(x.float())`` on x in [-2, 2], error normalized by ``max|ref|``, for
+    every input and output dtype, in 2D tiles: compound forms (GELU, Mish, shared
+    operands) and none rejected by the XPU math check. IGC computed most of the
+    16-bit forms wrong before ``EnableVectorizer=0``, ``xevm_bf16_extensions``
+    and ``xevm_fabs`` (zeros, garbage or ``abs`` returning its operand). Full ranges,
+    1D tiles and the input's own dtype: :func:`test_math_every_pattern`."""
     kernel = getattr(mk, f"k_{name}")
-    rejected = set()
     for (i, in_dtype), (o, out_dtype) in itertools.product(
         _MATH_DTYPES.items(), _MATH_DTYPES.items()
     ):
@@ -431,14 +385,252 @@ def test_math_functions(name: str) -> None:
         out = torch.empty(x.shape, dtype=out_dtype, device=DEVICE)
         v, tile = x.float(), slice(None)  # noqa: F841 - read by the expression
         ref = eval(mk.EXPRS[name])
-        try:
-            result = kernel(x, out)
-        except UnsupportedOperationError:
-            rejected.add((i, o))
-            continue
+        result = kernel(x, out)
         error = normalized_error(result, ref)
         assert error <= _MATH_BOUND[out_dtype], f"{name} {i}->{o}: {error:.3g}"
-    assert _KNOWN_WRONG.get(name, set()) <= rejected, rejected
+
+
+_FULL_TILES = {"1d": ((16, 8192), [1, 8192]), "2d": ((256, 512), [128, 256])}
+_FULL_CASES = (
+    ("cast", "1d", "bf16", "bf16"),
+    ("cast", "1d", "bf16", "f32"),
+    ("cast", "1d", "f16", "f16"),
+    ("cast", "1d", "f32", "bf16"),
+    ("nat", "1d", "bf16", "bf16"),
+    ("nat", "1d", "f16", "f16"),
+    ("cast", "2d", "bf16", "bf16"),
+)
+"""The forms of the reviewer's 638-case matrix most likely to differ: 7 of the 22
+per function. The rest (f16 in, f32 out, f32 in, f16 out, ... and 2D in full) gave
+the same or smaller errors when it ran."""
+_FULL_F32_ULPS = {"exp": 60, "softplus": 60}
+"""f32 outputs through the fast native ``exp``: up to 60 ulps, as measured; others 5."""
+_FULL_F16_EXP_ULPS = 10
+"""``exp`` in f16 itself (native): 10 ulps at x = 10.375; others 1. Not attributed."""
+
+
+def _full_patterns(dtype: torch.dtype, shape: tuple[int, int]) -> torch.Tensor:
+    """Every 16-bit pattern of ``dtype``, repeated; f32: every bf16 value, then
+    random bit patterns."""
+    n = shape[0] * shape[1]
+    bits = (torch.arange(n) % 65536).to(torch.int32).to(torch.uint16).view(torch.int16)
+    if dtype != F32:
+        return bits.reshape(shape).view(dtype).clone()
+    values = bits[:65536].view(BF16).float()
+    generator = torch.Generator().manual_seed(1)
+    rest = torch.randint(
+        -(2**31), 2**31, (n - 65536,), dtype=torch.int32, generator=generator
+    )
+    return torch.cat([values, rest.view(F32)]).reshape(shape)
+
+
+def _ordered(value: torch.Tensor) -> torch.Tensor:
+    """Bit patterns in value order, so that the difference counts ulps."""
+    size = value.element_size()
+    raw = value.view({2: torch.int16, 4: torch.int32}[size]).to(torch.int64)
+    return torch.where(raw < 0, -(raw & ((1 << (8 * size - 1)) - 1)), raw)
+
+
+@pytest.mark.parametrize("name", list(full_kernels.FN))
+def test_math_every_pattern(name: str) -> None:
+    """Each math function on every bf16 or f16 pattern (±0, ±inf, NaNs, subnormals,
+    every magnitude), against fp64 rounded to the output's dtype: NaNs and infinities
+    exactly where the reference has them, finite values within 1 ulp of a 16-bit
+    output and a few of an f32 one. Rejected on 2ec9e93, or computed wrong."""
+    expression = full_kernels.FN[name].format(v="v")
+    for kind, tile, i, o in _FULL_CASES:
+        shape, blocks = _FULL_TILES[tile]
+        case = f"{name} {kind} {tile} {i}->{o}"
+        x = _full_patterns(_MATH_DTYPES[i], shape)
+        out = torch.empty(shape, dtype=_MATH_DTYPES[o], device=DEVICE)
+        fn = getattr(full_kernels, f"{kind}_{name}")
+        result = _kernel(fn, blocks)(x.to(DEVICE), out).cpu()
+        v = x.to(torch.float64)
+        ref = eval(expression, {"torch": torch, "F": F, "v": v}).to(_MATH_DTYPES[o])
+        nans = ref.float().isnan()
+        assert result.float().isnan().equal(nans), case
+        assert result.float().isinf().equal(ref.float().isinf()), case
+        ulps = (_ordered(result) - _ordered(ref)).abs()[~nans].max().item()
+        if o == "f32":
+            bound = _FULL_F32_ULPS.get(name, 5)
+        elif (kind, i, name) == ("nat", "f16", "exp"):
+            bound = _FULL_F16_EXP_ULPS
+        else:
+            bound = 1
+        assert ulps <= bound, f"{case}: {ulps} ulps"
+
+
+def _pow_native(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.pow(x[tile], 2.5)
+    return out
+
+
+def _pow_reference(v: torch.Tensor) -> torch.Tensor:
+    return torch.pow(v, 2.5)
+
+
+def _exp2_native(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.exp2(x[tile])
+    return out
+
+
+@pytest.mark.parametrize(
+    ("fn", "reference"),
+    [
+        (_pow_native, _pow_reference),
+        (_exp2_native, torch.exp2),
+    ],
+    ids=["pow", "exp2"],
+)
+@pytest.mark.parametrize(
+    ("shape", "blocks"), list(_FULL_TILES.values()), ids=list(_FULL_TILES)
+)
+def test_bf16_powf_with_a_constant(fn, reference, shape, blocks) -> None:
+    """``powf`` with a constant operand on bf16, no cast (a constant extended to
+    f32 stayed at tile size through XeGPU's distribution: an invalid op, reported
+    as an internal error): bit for bit the fp64 reference."""
+    x = _full_patterns(BF16, shape)
+    out = torch.empty(shape, dtype=BF16, device=DEVICE)
+    result = _kernel(fn, blocks)(x.to(DEVICE), out)
+    _same_bits(result, reference(x.to(torch.float64)).to(BF16))
+
+
+def _every_bf16_pattern() -> torch.Tensor:
+    """All 65536 bf16 bit patterns (±0, ±inf, NaNs, subnormals, every magnitude),
+    four times over: the 1D tiles' spec-like shape."""
+    bits = torch.arange(_ELEMENTWISE_SHAPE[0] * _ELEMENTWISE_SHAPE[1]) % 65536
+    bits = bits.to(torch.uint16).reshape(_ELEMENTWISE_SHAPE)
+    return bits.view(torch.int16).to(DEVICE).view(BF16)
+
+
+def _same_bits(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """``out`` and ``ref`` are the same values bit for bit; NaNs of any payload
+    and sign are the same value."""
+    out, ref = out.cpu(), ref.cpu()
+    assert out.isnan().equal(ref.isnan())
+    differ = (out.view(torch.int16) != ref.view(torch.int16)) & ~out.isnan()
+    assert not differ.any(), (
+        f"{differ.sum().item()} patterns differ, first inputs "
+        f"{differ.nonzero()[:4].tolist()}"
+    )
+
+
+_BF16_ROUNDED_ONCE = {
+    "22_Tanh": torch.tanh,
+    "29_Softplus": F.softplus,
+    "30_Softsign": lambda v: v / (1 + torch.abs(v)),
+}
+"""KernelBench problems of the IGC fixes: the fp64 result rounded to bf16 is what
+one rounding of f32 math gives. (torch's 30_Softsign rounds ``1 + |x|`` to bf16
+first: 1 ulp off this in 1.7 % of the patterns.)"""
+
+
+@pytest.mark.parametrize("name", list(_BF16_ROUNDED_ONCE))
+def test_elementwise_every_bf16_pattern(name: str) -> None:
+    """The KernelBench kernel at its elementwise tiles on every bf16 pattern,
+    poisoned output: bit for bit the fp64 reference."""
+    problem = {p.name: p for p in kb.PROBLEMS}[name]
+    x = _every_bf16_pattern()
+    poisoned = _poison_output(x.shape, x.dtype)
+    out = problem.kernel(x)
+    assert out.data_ptr() == poisoned
+    _same_bits(out, _BF16_ROUNDED_ONCE[name](x.cpu().to(torch.float64)).to(BF16))
+
+
+def _abs_kernel(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.abs(x[tile].to(F32)).to(x.dtype)
+    return out
+
+
+def test_abs_every_bf16_pattern() -> None:
+    """``abs`` rounded straight to bf16 (IGC's no-op ``mov (abs):uw``): only the
+    sign bit changes, NaNs included."""
+    x = _every_bf16_pattern()
+    out = _kernel(_abs_kernel, kb.ELEMENTWISE_BLOCKS)(x)
+    _same_bits(out, (x.view(torch.int16) & 0x7FFF).view(BF16))
+
+
+def _tanh_f32(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.tanh(x[tile])
+    return out
+
+
+def _log1p_f32(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.log1p(x[tile])
+    return out
+
+
+_F32_SPECIALS = (
+    0.0,
+    -0.0,
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+    1e-45,  # the smallest subnormals
+    -1e-45,
+    1e-39,
+    -1e-39,
+    1e-38,
+    1e-20,
+    1e-4,
+    3.9e-4,  # tanh's tiny threshold
+    4.1e-4,
+    0.0078,  # the native log's worst in log1p's Kahan form
+    0.5,
+    1.0,
+    -0.5,
+    -1.0,  # log1p: -inf
+    -1.5,  # log1p: NaN
+    7.9,  # tanh's clamp
+    8.1,
+    20.0,
+    1e30,
+    -1e30,
+    3.4e38,
+    -3.4e38,
+)
+
+
+@pytest.mark.parametrize(
+    ("fn", "reference", "bound"),
+    [
+        (_tanh_f32, torch.tanh, 8),
+        (_log1p_f32, torch.log1p, 8),
+    ],
+    ids=["tanh", "log1p"],
+)
+def test_approximated_f32_math(fn, reference, bound: int) -> None:
+    """``xpu_math_approx`` on f32: special values and random values of every
+    exponent, within a few ulps of the fp64 reference (4 for both in a sweep of
+    2^32 / 7 patterns), NaNs where it has NaNs, exact at signed zeros and
+    subnormals."""
+    bits = torch.randint(-(2**31), 2**31, _ELEMENTWISE_SHAPE, dtype=torch.int32)
+    x = bits.view(F32).clone()
+    specials = torch.tensor(_F32_SPECIALS, dtype=F32)
+    x.view(-1)[: len(specials)] = specials
+    out = _kernel(fn, kb.ELEMENTWISE_BLOCKS)(x.to(DEVICE)).cpu()
+    ref = reference(x.to(torch.float64)).to(F32)
+    assert out.isnan().equal(ref.isnan())
+    finite = ~ref.isnan()
+    assert out[finite].isinf().equal(ref[finite].isinf())
+    assert torch.equal(out[finite].signbit(), ref[finite].signbit())
+
+    def ordered(value: torch.Tensor) -> torch.Tensor:
+        raw = value.view(torch.int32).to(torch.int64)
+        return torch.where(raw < 0, -(raw & 0x7FFFFFFF), raw)
+
+    ulps = (ordered(out[finite]) - ordered(ref[finite])).abs()
+    assert ulps.max().item() <= bound, ulps.max().item()
+    tiny = finite & (x.abs() < 1e-30)
+    assert torch.equal(out[tiny].view(torch.int32), x[tiny].view(torch.int32))
 
 
 @pytest.mark.parametrize("name", list(_REDUCTION_REFERENCES))
@@ -1441,6 +1633,18 @@ def test_one_binary_per_kernel() -> None:
     binaries = _objects(text)
     assert len(binaries) == 2, text[:2000]
     assert [len(objects) for objects in binaries] == [1, 1]
+
+
+def test_mish_mish_binary_does_not_spill() -> None:
+    """29_Matmul_Mish_Mish's nested polynomials, tile by tile: 92544 bytes of
+    spill and 11 ms against 3.9 in vector-op order (``xevm_tile_order``). The
+    binary keeps the 256 GRFs."""
+    problem = {p.name: p for p in kb.LEVEL2_PROBLEMS}["29_Matmul_Mish_Mish"]
+    inputs = [_randn(*shape, dtype=problem.dtype) for shape in problem.shapes]
+    binary = lower_mlir(problem.kernel, list(problem.args(*inputs)), stop_at="binary")
+    ((zebin,),) = _objects(str(binary))
+    assert re.findall(rb"grf_count:\s*(\d+)", zebin) == [b"256"]
+    assert not re.search(rb"spill_size:\s*[1-9]", zebin)
 
 
 def test_gemm_binary_has_the_large_register_file() -> None:

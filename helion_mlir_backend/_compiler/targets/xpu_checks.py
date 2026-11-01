@@ -20,8 +20,8 @@ The gates are conservative, by IR property (not by kernel):
 - a contraction runs in a K loop (an inner ``hl.tile`` with a block size below
   K), on f16/bf16 operands (also f32 values the contraction truncates to them,
   e.g. attention's ``P``) accumulating in f32 (XeGPU DPAS);
-- no math function in a form that computes wrong values on the device
-  (:func:`check_math`).
+- no math function outside the device-verified ones in a form IGC is known to
+  miscompile (:func:`check_math`).
 """
 
 from __future__ import annotations
@@ -60,95 +60,75 @@ def check_xegpu_capabilities(module: ir.Module, entry: str) -> list[ir.Operation
 
 
 _HALF = frozenset({"f16", "bf16"})
-TRUNCATION_VERIFIED: dict[str, frozenset[str]] = {
-    "math.exp": _HALF,
-    "math.sqrt": _HALF,
-    "math.rsqrt": _HALF,
-    "math.erf": _HALF,
-    "math.atan": _HALF,
-    "math.asin": _HALF,
-    "math.floor": _HALF,
-    "math.ceil": _HALF,
-    "math.roundeven": _HALF,
-    "math.fpowi": _HALF,
-    "math.absf": frozenset({"f16"}),
-}
-"""Math functions whose result, rounded straight to a 16-bit float, computes
-right on the device (Arc B50, IGC of /swtools/intel-gpu/latest, llvm-project
-79ab4054; ``tests/test_xpu_runtime.py::test_math_functions``), by the 16-bit
-type. Any other math function rounded straight to ``f16``/``bf16`` (or computed
-on 16-bit values, which the pipeline extends to f32 and rounds back) is
-rejected: tanh gives zeros; log, log2, log1p, expm1, sin, cos, tan, sinh, cosh,
-acos, atanh, exp2 and pow garbage, although their f32 results are right and
-the SPIR-V looks right (suspected IGC; erf and sqrt are lowered the same way
-and are right, so the trigger depends on the builtin). A function followed by
-more math (``tanh(x) * 2``, mish, GELU's tanh) is right. Knowingly
-conservative: e.g. ``tanh`` of a row maximum stored as a bf16 ``keepdim``
-column is right on the device but rejected."""
-BF16_OPERAND_VERIFIED = frozenset(
+DEVICE_VERIFIED = frozenset(
     {
+        "math.absf",
+        "math.acos",
+        "math.asin",
+        "math.atan",
+        "math.atanh",
+        "math.ceil",
+        "math.cos",
+        "math.cosh",
+        "math.erf",
         "math.exp",
-        "math.powf",
-        "math.log",
-        "math.log2",
-        "math.log1p",
+        "math.exp2",
         "math.expm1",
-        "math.sqrt",
+        "math.floor",
+        "math.fpowi",
+        "math.log",
+        "math.log1p",
+        "math.log2",
+        "math.powf",
+        "math.roundeven",
         "math.rsqrt",
         "math.sin",
-        "math.cos",
+        "math.sinh",
+        "math.sqrt",
         "math.tan",
         "math.tanh",
-        "math.sinh",
-        "math.asin",
-        "math.acos",
-        "math.atanh",
-        "math.erf",
-        "math.floor",
-        "math.ceil",
-        "math.roundeven",
-        "math.fpowi",
     }
 )
-"""Math functions that compute right on the device on a bf16 value extended to
-f32, also after elementwise arithmetic on it (same tests). Any other function
-on such a value is rejected: ``abs`` returns its operand (also of ``-x`` or
-``x * 1.0``), ``atan`` is wrong below -1, ``cosh`` is wrong, at every output
-dtype; f16 operands are right. Correctness over coverage: ``abs`` of a bf16
-value that other ops also use (softsign's ``x / (1 + |x|)``) was right in the
-cases measured, but has no rule that separates it from the wrong forms, so it is
-rejected too."""
+"""Math functions that compute right on the device on bf16 values and with their
+result rounded straight to a 16-bit float, in 1D and 2D tiles, for every input
+and output dtype, in f32 and in the input's own dtype (Arc B50, IGC of
+/swtools/intel-gpu/latest, llvm-project 79ab4054;
+``tests/test_xpu_runtime.py``: ``test_math_every_pattern``, every bf16 and f16
+pattern; ``test_math_functions``, compound forms). Any other
+function in those forms is rejected: these forms hit IGC miscompiles that the
+pipeline works around (``xpu_transforms.IGC_OPTIONS``, ``xevm_bf16_extensions``,
+``xevm_fabs``), and a function nobody ran on the device has no such evidence.
+f32 math on f32 values is not affected."""
 
 
 def check_math(loop: ir.Operation) -> None:
-    """Raise :class:`UnsupportedOperationError` for a math function in ``loop``
-    in a form the device computes wrong: one not in
-    :data:`TRUNCATION_VERIFIED` whose result is rounded straight to a 16-bit
-    float, or one not in :data:`BF16_OPERAND_VERIFIED` on a bf16 value."""
+    """Raise :class:`UnsupportedOperationError` for a math function in ``loop``,
+    not in :data:`DEVICE_VERIFIED`, in a form that IGC is known to miscompile:
+    its result rounded straight to a 16-bit float, or on a bf16 value."""
     for op in _walk(loop):
-        if not op.name.startswith("math.") or len(op.results) != 1:
+        if (
+            not op.name.startswith("math.")
+            or len(op.results) != 1
+            or op.name in DEVICE_VERIFIED
+        ):
             continue
         rounded = _rounded_to(op)
-        if rounded is not None and rounded not in TRUNCATION_VERIFIED.get(
-            op.name, frozenset()
-        ):
+        if rounded is not None:
             raise UnsupportedOperationError(
                 f"{op.name} rounded to {rounded} on XPU",
                 reason=(
-                    f"the device computes {op.name}'s result rounded straight to "
-                    f"{rounded} wrong (verified right: f32 results, or more math "
-                    "on the result before the rounding)"
+                    f"{op.name}'s result rounded straight to {rounded} was not "
+                    "verified on the device (verified right: f32 results, or "
+                    "more math on the result before the rounding)"
                 ),
                 alternatives=["an f32 output", _CPU],
             )
-        if op.name not in BF16_OPERAND_VERIFIED and any(
-            _from_bf16(operand, {}) for operand in op.operands
-        ):
+        if any(_from_bf16(operand, {}) for operand in op.operands):
             raise UnsupportedOperationError(
                 f"{op.name} of a bf16 value on XPU",
                 reason=(
-                    f"the device computes {op.name} of a bf16 value (extended to "
-                    "f32, also after arithmetic on it) wrong"
+                    f"{op.name} of a bf16 value (extended to f32, also after "
+                    "arithmetic on it) was not verified on the device"
                 ),
                 alternatives=["f16 or f32 inputs", _CPU],
             )
