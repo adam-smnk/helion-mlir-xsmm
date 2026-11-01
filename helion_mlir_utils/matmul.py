@@ -342,6 +342,27 @@ _MIN_SHARED_ROWS = 256
 _VNNI_PANEL = 64
 # K pairs per tile of :func:`pack_b_vnni_t` (literal in its pack kernel).
 _PANEL_PAIRS = 16
+# A prepacked VNNI GEMM runs K as one chunk while its packed B panel is at most
+# _SINGLE_CHUNK_PANEL_BYTES and K at most _SINGLE_CHUNK_K. One chunk keeps each
+# 32x32 register block's accumulator in AMX tiles over the whole K and applies
+# the epilogue from there; chunks keep a whole-tile f32 accumulator in memory,
+# zeroed, reloaded and stored per chunk and read again by the epilogue. Per
+# register block the K loop streams a 32-row A strip (32 x K x 2 B) and the
+# panel's column block; the panel and the strip stay in the 2 MiB L2. EMR,
+# kernel alone: 16384x4096x2048 4.1 ms (1024-deep chunks 5.1), 16384x4096x4096
+# at 128-column panels 8.8-9.0 (256 columns in chunks 9.8; 256 in one 2 MiB
+# chunk 15.1), 16384x1024x4096 2.16 (2.38); K = 8192 loses even at a 1 MiB
+# panel (1024x8192x8192 at 64 columns: 3.7 vs 3.0, 128x8192x8192 0.74 vs 0.59).
+_SINGLE_CHUNK_PANEL_BYTES = 1 << 20
+_SINGLE_CHUNK_K = 4096
+
+
+def _single_k_chunk(panel: int, k: int) -> bool:
+    """Whether a bf16 VNNI panel of ``panel`` columns runs ``k`` as one chunk,
+    apart from a padded tail: K as :func:`pack_b_vnni_t` pads it, in whole
+    pairs of AMX steps."""
+    k = _round_up(k, 2 * _PANEL_PAIRS) // (2 * BLOCK_K) * (2 * BLOCK_K)
+    return k <= _SINGLE_CHUNK_K and panel * k * 2 <= _SINGLE_CHUNK_PANEL_BYTES
 
 
 def _fused_pack_tiles(
@@ -791,6 +812,21 @@ def _prepacked_tile_m(m: int, panels: int, panel: int) -> int:
     )
 
 
+def _prepacked_k_chunk(pairs_even: int, panel: int, tile_m: int) -> int:
+    """K pairs per chunk of :func:`_matmul_prepacked_vnni` for ``pairs_even``
+    pairs (a multiple of ``BLOCK_K``) of a ``panel``-column bf16 panel and
+    ``tile_m``-row tiles: all of them while :func:`_single_k_chunk` allows,
+    else the fewest even chunks whose packed B stays within 512 KiB, 256 KiB
+    for tiles of few rows, which stream the weight (128x32768x32768 at 256
+    columns: 8.7 ms, 9.2 at 512 KiB)."""
+    if pairs_even and _single_k_chunk(panel, 2 * pairs_even):
+        return pairs_even
+    chunk_bytes = (256 if tile_m < _MIN_SHARED_ROWS else 512) << 10
+    max_pairs = max(chunk_bytes // (panel * 2 * 2), BLOCK_K)
+    chunks = max(1, -(-pairs_even // max_pairs))
+    return max(_round_up(-(-pairs_even // chunks), BLOCK_K), BLOCK_K)
+
+
 def _prepacked_bound(
     a3: Tensor,
     b4: Tensor,
@@ -822,12 +858,7 @@ def _prepacked_bound(
     )
     if (cached := _FUSED_PACK_BOUND.get(key)) is None:
         pairs_even = pairs // BLOCK_K * BLOCK_K
-        # Packed B per K chunk: 512 KiB, 256 KiB for tiles of few rows, which
-        # stream the weight (128x32768x32768 at 256 columns: 8.7 ms, 9.2 at 512 KiB).
-        chunk_bytes = (256 if tile_m < _MIN_SHARED_ROWS else 512) << 10
-        max_pairs = max(chunk_bytes // (panel * 2 * b4.element_size()), BLOCK_K)
-        chunks = max(1, -(-pairs_even // max_pairs))
-        chunk = max(_round_up(-(-pairs_even // chunks), BLOCK_K), BLOCK_K)
+        chunk = _prepacked_k_chunk(pairs_even, panel, tile_m)
         pairs_chunked = pairs_even // chunk * chunk
         tiles = (tile_m, 1, chunk, max(pairs_even - pairs_chunked, BLOCK_K))
         if tiles not in _PREPACKED_KERNELS:
@@ -975,11 +1006,13 @@ def _pack_b_vnni_panels_kernel_t(b3_t: Tensor, panel: hl.constexpr) -> Tensor:
 _PANEL_PACK_KERNELS: dict[int, helion.Kernel] = {}
 
 
-def vnni_panel(m: int, n: int) -> int:
+def vnni_panel(m: int, n: int, k: int | None = None) -> int:
     """Columns of :func:`pack_b_vnni_t` panels for ``m`` rows: the widest (up to
     256) that still gives every thread a tile of at least ``_MIN_SHARED_ROWS``
     rows, or one of all rows. Wider panels reuse each A row over more columns
-    (1024x8192x8192: 64 columns 3118 us, 256: 2458)."""
+    (1024x8192x8192: 64 columns 3118 us, 256: 2458). Given ``k``, the widest of
+    those whose K runs as one chunk (:func:`_single_k_chunk`) comes first
+    (16384x4096x4096: 128 columns in one chunk 8.8-9.0 ms, 256 in chunks 9.8)."""
     threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
     if m < _MIN_SHARED_ROWS:
         # One row tile does not give every thread a tile, so the threads split
@@ -994,10 +1027,35 @@ def vnni_panel(m: int, n: int) -> int:
 
         return min((_VNNI_PANEL, 128, 256), key=cost)
     row_tiles = max(1, m // _MIN_SHARED_ROWS)
-    for panel in (256, 128):
-        if -(-n // panel) * row_tiles >= threads:
-            return panel
-    return _VNNI_PANEL
+    fits = [panel for panel in (256, 128) if -(-n // panel) * row_tiles >= threads]
+    single = [panel for panel in fits if k is not None and _single_k_chunk(panel, k)]
+    return (single or fits or [_VNNI_PANEL])[0]
+
+
+def whole_row_tiles(
+    m: int, n: int, panel: int | None = None
+) -> tuple[int, int] | None:
+    """``(rows, columns)`` of bf16 VNNI tiles with which each thread computes
+    whole rows of an ``[m, n]`` output: one row of tiles per thread, every
+    panel of it (the static schedule gives a thread consecutive tiles, panels
+    innermost), so each row of A is read by one core. ``None`` unless the rows
+    split evenly into tiles of at least ``_MIN_SHARED_ROWS`` and a panel of 256,
+    128 or 64 columns (of ``panel`` columns, if given) divides ``n``, with the
+    f32 accumulator within the 1 MiB stack limit.
+
+    For an A that a later kernel rewrites: lines that several cores cached
+    while reading it make that rewrite slow. L2/45's first layer writes the
+    16384x4096 input of its second on every call; read by 8 cores per row
+    (2048x128 tiles) the first layer took 5.6 ms instead of 4.6; with whole
+    rows (256x256 tiles) 4.7, the second layer 2.6 -> 2.8 ms."""
+    threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+    rows = m // threads
+    if m % threads or rows % BLOCK_M or rows < _MIN_SHARED_ROWS:
+        return None
+    for columns in (256, 128, 64) if panel is None else (panel,):
+        if not n % columns and rows * columns * 4 <= 1 << 20:
+            return rows, columns
+    return None
 
 
 def pack_b_vnni_t(b_t: Tensor, panel: int = _VNNI_PANEL) -> Tensor:
@@ -1554,6 +1612,7 @@ def prepacked_b_call(
     epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
     scale: Tensor | None = None,
     shift: Tensor | None = None,
+    tile_m: int | None = None,
 ) -> Callable[[Tensor], Tensor]:
     """``lambda x: matmul_prepacked_b(x, b4, n, bias, epilogue, scale, shift)``
     with the host work of a call (operand views, tile choice, kernel lookup)
@@ -1565,7 +1624,8 @@ def prepacked_b_call(
     ``_version``, so ``load_state_dict`` and in-place ops are seen; an
     in-place change through ``.data``, which leaves ``_version`` unchanged,
     is not seen in every layout). Valid while ``OMP_NUM_THREADS`` stays the
-    same."""
+    same. ``tile_m`` sets the rows of a bf16 VNNI tile (a multiple of
+    ``BLOCK_M`` dividing ``a``'s rows; e.g. from :func:`whole_row_tiles`)."""
 
     def general(x: Tensor) -> Tensor:
         return matmul_prepacked_b(x, b4, n, bias, epilogue, scale, shift)
@@ -1588,7 +1648,10 @@ def prepacked_b_call(
     if b4.shape[-1] == 2:
         panels, pairs_b, panel, _ = map(int, b4.shape)
         n_pad = panels * panel
-        tile_m = _prepacked_tile_m(m, panels, panel)
+        if tile_m is None:
+            tile_m = _prepacked_tile_m(m, panels, panel)
+        elif tile_m <= 0 or tile_m % BLOCK_M:
+            raise ValueError(f"tile_m must be a positive multiple of {BLOCK_M}")
         if (
             dtype != torch.bfloat16
             or k % 2

@@ -365,3 +365,258 @@ def test_prepared_call_keeps_the_closure_for_padded_columns() -> None:
     call = mm.prepacked_b_call(a, b4, 70, None, torch.relu)
     assert type(call).__name__ == "function"
     assert torch.equal(call(a), mm.matmul_prepacked_b(a, b4, 70, None, torch.relu))
+
+
+@pytest.mark.parametrize(
+    ("pairs_even", "panel", "tile_m", "chunk"),
+    [
+        (1024, 256, 1024, 1024),  # K 2048, 1 MiB panel: one chunk
+        (2048, 128, 2048, 2048),  # K 4096, 1 MiB panel: one chunk
+        (2048, 64, 64, 2048),  # few rows, 512 KiB panel: one chunk
+        (2048, 256, 1024, 512),  # 2 MiB panel: 512 KiB chunks, as before
+        (4096, 64, 1024, 2048),  # K 8192 at a 1 MiB panel: chunks, as before
+        (4096, 64, 128, 1024),  # K 8192, few rows: 256 KiB chunks, as before
+        (16384, 256, 64, 256),  # 128x32768x32768: 256 KiB chunks, as before
+    ],
+)
+def test_prepacked_k_chunk(pairs_even: int, panel: int, tile_m: int, chunk: int) -> None:
+    assert mm._prepacked_k_chunk(pairs_even, panel, tile_m) == chunk
+
+
+def test_vnni_panel_prefers_one_k_chunk(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", "64")
+    # K = 4096: 128-column panels run K as one chunk; 256 would need chunks.
+    assert mm.vnni_panel(16384, 4096, 4096) == 128
+    assert mm.vnni_panel(16384, 1024, 4096) == 128
+    # K = 2048: 256 columns already run as one chunk.
+    assert mm.vnni_panel(16384, 4096, 2048) == 256
+    # No panel runs K = 8192 as one chunk, and without K: the widest that fits.
+    assert mm.vnni_panel(1024, 8192, 8192) == 256
+    assert mm.vnni_panel(16384, 4096) == 256
+    # 128 columns would leave threads idle: 256 rows x 1024 columns.
+    assert mm.vnni_panel(256, 1024, 4096) == 64
+
+
+@pytest.mark.parametrize("k", [2048, 2080])
+def test_one_k_chunk_matches_chunked_bits(k: int) -> None:
+    """The whole K as one chunk (the prepared call's choice) gives the bits of
+    1024-deep chunks: the f32 sums run in the same K order. 2080 adds a
+    padded tail chunk after the one chunk."""
+    import helion
+    import helion.language as hl
+
+    m, n, panel = 64, 256, 256
+    torch.manual_seed(k)
+    a = torch.randn(m, k, dtype=torch.bfloat16)
+    w = torch.randn(n, k, dtype=torch.bfloat16)
+    bias = torch.randn(n, dtype=torch.bfloat16)
+    b4 = mm.pack_b_vnni_t(w, panel)
+    pairs_even = int(b4.shape[1]) // mm.BLOCK_K * mm.BLOCK_K
+    assert mm._prepacked_k_chunk(pairs_even, panel, m) == pairs_even
+    one = mm.prepacked_b_call(a, b4, n, bias, torch.relu)(a)
+    kernel = helion.kernel(
+        mm._matmul_prepacked_vnni,
+        backend="mlir",
+        config=helion.Config(block_sizes=[m, 1, 512, 32]),
+        ignore_warnings=mm._OUT_CHECK_WARNINGS,
+    )
+    chunked = kernel(
+        a.view(m, k // 2, 2),
+        b4,
+        bias.view(n // panel, panel),
+        None,
+        None,
+        torch.relu,
+        hl.constexpr(pairs_even // 512 * 512),
+        hl.constexpr(pairs_even),
+    ).view(m, n)
+    assert torch.equal(one, chunked)
+    expected = torch.relu(a.float() @ w.float().T + bias.float())
+    error = (one.float() - expected).abs().max() / expected.abs().max()
+    assert error.item() < 1e-2
+
+
+def test_whole_row_tiles(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", "64")
+    # L2/45's second layer: 256 rows per thread, all four 256-column panels.
+    assert mm.whole_row_tiles(16384, 1024) == (256, 256)
+    # The f32 accumulator stays within 1 MiB: narrower panels for more rows.
+    assert mm.whole_row_tiles(65536, 1024) == (1024, 256)
+    assert mm.whole_row_tiles(131072, 1024) == (2048, 128)
+    assert mm.whole_row_tiles(16384, 4160) == (256, 64)
+    # Fewer than 256 rows per thread, rows that do not split evenly or into
+    # whole register tiles, no dividing panel: None.
+    assert mm.whole_row_tiles(128, 1024) is None
+    assert mm.whole_row_tiles(8192, 1024) is None
+    assert mm.whole_row_tiles(16384 + 64, 1024) is None
+    assert mm.whole_row_tiles(16384 + 1, 1024) is None
+    assert mm.whole_row_tiles(16384, 1000) is None
+    # A given panel: its columns or nothing.
+    assert mm.whole_row_tiles(16384, 1024, 128) == (256, 128)
+    assert mm.whole_row_tiles(131072, 1024, 256) is None
+    assert mm.whole_row_tiles(16384, 1024, 96) is None
+
+
+def test_linear_whole_rows(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``whole_rows`` packs and tiles for one row of tiles per thread, with the
+    default's bits; shapes it does not cover keep the default."""
+    monkeypatch.setenv("OMP_NUM_THREADS", "2")
+    torch.manual_seed(0)
+    layer = torch.nn.Linear(256, 512).bfloat16()
+    with torch.no_grad():
+        for m, tiles in ((512, (256, 256)), (520, None)):
+            x = torch.randn(m, 256, dtype=torch.bfloat16)
+            ref, ref_cache = linear(x, layer, torch.relu)
+            out, cache = linear(x, layer, torch.relu, whole_rows=True)
+            assert torch.equal(out, ref)
+            assert mm.whole_row_tiles(m, 512) == tiles
+            panel = int(cache.packed_weight.shape[2])
+            if tiles is None:
+                assert panel == int(ref_cache.packed_weight.shape[2])
+                continue
+            assert panel == tiles[1]
+            # The default runs one 512-row tile per panel here.
+            assert mm._prepacked_tile_m(m, 512 // panel, panel) == 512
+            assert any(
+                key[0] == "prepacked" and key[1] == m and key[5] == tiles[0]
+                for key in mm._FUSED_PACK_BOUND
+            )
+            # Later calls reuse the prepared call.
+            out2, cache2 = linear(x, layer, torch.relu, cache, whole_rows=True)
+            assert cache2.call is cache.call
+            assert torch.equal(out2, ref)
+
+
+def test_prepared_call_rejects_partial_register_tiles() -> None:
+    a = torch.randn(64, 64, dtype=torch.bfloat16)
+    b4 = mm.pack_b_vnni_t(torch.randn(64, 64, dtype=torch.bfloat16), 64)
+    with pytest.raises(ValueError, match="tile_m"):
+        mm.prepacked_b_call(a, b4, 64, tile_m=48)
+
+
+def test_panel_rule_agrees_with_chunk_rule(monkeypatch: pytest.MonkeyPatch) -> None:
+    """K = 2080 pads to 2080: 2048 in whole pairs of AMX steps plus a tail.
+    The panel picker and the chunk rule both see one chunk at 256 columns."""
+    monkeypatch.setenv("OMP_NUM_THREADS", "64")
+    assert mm.vnni_panel(16384, 4096, 2080) == 256
+    pairs_even = 2080 // 2 // mm.BLOCK_K * mm.BLOCK_K
+    assert mm._prepacked_k_chunk(pairs_even, 256, 1024) == pairs_even
+    # 4128 in the same way: 4096 at 128 columns.
+    assert mm.vnni_panel(16384, 4096, 4128) == 128
+
+
+@pytest.mark.parametrize(
+    ("k", "chunk", "forced"),
+    [
+        (8224, 2048, 1024),  # two chunks and a padded tail
+        (4192, 1056, 512),  # chunk, rest chunk and a padded tail
+    ],
+)
+def test_two_k_chunks_and_tail_match_forced_chunks(
+    monkeypatch: pytest.MonkeyPatch, k: int, chunk: int, forced: int
+) -> None:
+    """K past the one-chunk limit: the chosen chunks, the rest and the tail
+    give the bits of other chunks, and the right result."""
+    import helion
+    import helion.language as hl
+
+    monkeypatch.setenv("OMP_NUM_THREADS", "1")
+    m, n, panel = 256, 64, 64
+    torch.manual_seed(k)
+    a = torch.randn(m, k, dtype=torch.bfloat16)
+    w = torch.randn(n, k, dtype=torch.bfloat16)
+    bias = torch.randn(n, dtype=torch.bfloat16)
+    b4 = mm.pack_b_vnni_t(w, panel)
+    pairs = int(b4.shape[1])
+    pairs_even = pairs // mm.BLOCK_K * mm.BLOCK_K
+    assert pairs > pairs_even, "a padded tail"
+    assert mm._prepacked_k_chunk(pairs_even, panel, m) == chunk
+    out = mm.prepacked_b_call(a, b4, n, bias, torch.relu)(a)
+    chunked = pairs_even // forced * forced
+    kernel = helion.kernel(
+        mm._matmul_prepacked_vnni,
+        backend="mlir",
+        config=helion.Config(
+            block_sizes=[m, 1, forced, max(pairs_even - chunked, mm.BLOCK_K)]
+        ),
+        ignore_warnings=mm._OUT_CHECK_WARNINGS,
+    )
+    other = kernel(
+        a.view(m, k // 2, 2),
+        b4,
+        bias.view(n // panel, panel),
+        None,
+        None,
+        torch.relu,
+        hl.constexpr(chunked),
+        hl.constexpr(pairs_even),
+    ).view(m, n)
+    assert torch.equal(out, other)
+    expected = torch.relu(a.double() @ w.double().T + bias.double())
+    error = (out.double() - expected).abs().max() / expected.abs().max()
+    assert error.item() < 2e-2
+
+
+def test_whole_rows_keep_the_accumulator_limit_after_a_thread_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Packed for 8 threads (256x256 tiles), then run on one: 2048x256 would
+    be a 2 MiB accumulator, so the default rows take over, with the same bits.
+    """
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    torch.manual_seed(0)
+    m, n = 2048, 256
+    layer = torch.nn.Linear(64, n).bfloat16()
+    x = torch.randn(m, 64, dtype=torch.bfloat16)
+    mm._FUSED_PACK_BOUND.clear()
+    with torch.no_grad():
+        ref, cache = linear(x, layer, torch.relu, whole_rows=True)
+        assert int(cache.packed_weight.shape[2]) == 256
+        monkeypatch.setenv("OMP_NUM_THREADS", "1")
+        assert mm.whole_row_tiles(m, n, 256) is None
+        out, cache = linear(x, layer, torch.relu, cache, whole_rows=True)
+    assert torch.equal(out, ref)
+    assert int(cache.packed_weight.shape[2]) == 256
+    rows = {key[5] for key in mm._FUSED_PACK_BOUND if key[0] == "prepacked"}
+    assert all(tile * 256 * 4 <= 1 << 20 for tile in rows)
+    assert rows == {256, 1024}
+
+
+def test_linear_panel_and_whole_rows_together(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``panel`` sets the columns, ``whole_rows`` the rows; each is in the key
+    of the cache, and the bits stay those of the default."""
+    monkeypatch.setenv("OMP_NUM_THREADS", "2")
+    torch.manual_seed(0)
+    m, n = 512, 512
+    layer = torch.nn.Linear(256, n).bfloat16()
+    x = torch.randn(m, 256, dtype=torch.bfloat16)
+    mm._FUSED_PACK_BOUND.clear()
+    with torch.no_grad():
+        ref, _ = linear(x, layer, torch.relu)
+        out, cache = linear(x, layer, torch.relu, panel=128, whole_rows=True)
+        assert torch.equal(out, ref)
+        assert int(cache.packed_weight.shape[2]) == 128
+        assert any(
+            key[0] == "prepacked" and key[3] == 128 and key[5] == 256
+            for key in mm._FUSED_PACK_BOUND
+        )
+        # Either argument changing rebuilds the cache.
+        out, panel_only = linear(x, layer, torch.relu, cache, panel=128)
+        assert panel_only.key != cache.key
+        assert panel_only.packed_weight is not cache.packed_weight
+        assert torch.equal(out, ref)
+        out, rows_only = linear(x, layer, torch.relu, cache, whole_rows=True)
+        assert rows_only.key != cache.key
+        assert int(rows_only.packed_weight.shape[2]) == 256
+        assert torch.equal(out, ref)
+        # Same arguments: the prepared call is reused.
+        out, again = linear(x, layer, torch.relu, cache, panel=128, whole_rows=True)
+        assert again.call is cache.call
+        assert torch.equal(out, ref)
+        # A panel not dividing N has no whole-row tiles: the default rows.
+        assert mm.whole_row_tiles(m, n, 96) is None
+        out, odd = linear(x, layer, torch.relu, panel=96, whole_rows=True)
+        assert int(odd.packed_weight.shape[2]) == 96
+        assert torch.equal(out, ref)

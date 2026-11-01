@@ -16,6 +16,7 @@ from .matmul import pack_b_blocked_t
 from .matmul import pack_b_vnni_t
 from .matmul import prepacked_b_call
 from .matmul import vnni_panel
+from .matmul import whole_row_tiles
 
 if TYPE_CHECKING:
     from torch import Tensor
@@ -78,9 +79,19 @@ def _pack_weight(weight: Tensor, rows: int, panel: int | None = None) -> Tensor:
     :func:`vnni_panel`'s choice), else 32x32 blocks."""
     if weight.dtype == torch.bfloat16 and not weight.shape[1] % 2:
         if panel is None:
-            panel = vnni_panel(rows, int(weight.shape[0]))
+            n, k = map(int, weight.shape)
+            panel = vnni_panel(rows, n, k)
         return pack_b_vnni_t(weight, panel)
     return pack_b_blocked_t(weight)
+
+
+def _whole_row_tiles(
+    x: Tensor, layer: nn.Linear, whole_rows: bool, panel: int | None
+) -> tuple[int, int] | None:
+    """:func:`~.matmul.whole_row_tiles` of a bf16 layer if ``whole_rows``."""
+    if not whole_rows or x.dtype != torch.bfloat16 or layer.in_features % 2:
+        return None
+    return whole_row_tiles(int(x.shape[0]), int(layer.out_features), panel)
 
 
 def linear(
@@ -90,6 +101,7 @@ def linear(
     cache: LinearCache | None = None,
     biases: tuple[Tensor, ...] | None = None,
     panel: int | None = None,
+    whole_rows: bool = False,
 ) -> tuple[Tensor, LinearCache | None]:
     """Run a linear layer, by default with its constant weight packed once and
     reused until the source parameters, input dtype, or device change;
@@ -101,6 +113,13 @@ def linear(
     pointers and ``_version``: in-place ops and ``load_state_dict`` are
     seen, but a change through ``.data`` (``p.data.mul_(2)``) changes
     neither, so the packed weight goes stale; pass ``cache=None`` after one.
+
+    ``whole_rows``: each thread computes whole rows of the output where
+    :func:`~.matmul.whole_row_tiles` allows it (bf16, cached weights), so each
+    row of ``x`` is read by one core; for an ``x`` rewritten by a later kernel.
+    It sets the tile's rows, and its columns unless ``panel`` does. The panel
+    stays as packed if ``OMP_NUM_THREADS`` changes later; tiles it cannot
+    serve within the accumulator limit take the default rows.
     """
     if biases is None:
         bias = layer.bias  # (a module attribute lookup: once per call)
@@ -127,13 +146,15 @@ def linear(
         x.device,
         x.shape[0],
         panel,
+        whole_rows,
     )
     if cache is None or cache.key != key:
         weight = layer.weight.detach().to(dtype=x.dtype, device=x.device)
         bias = _combine_biases(source_biases, x)
+        tiles = _whole_row_tiles(x, layer, whole_rows, panel)
         cache = LinearCache(
             key,
-            _pack_weight(weight, int(x.shape[0]), panel),
+            _pack_weight(weight, int(x.shape[0]), tiles[1] if tiles else panel),
             bias,
             int(layer.out_features),
         )
@@ -142,8 +163,16 @@ def linear(
     threads = os.environ.get("OMP_NUM_THREADS")
     prepared = cache.call
     if prepared is None or prepared[0] is not epilogue or prepared[1] != threads:
+        tiles = _whole_row_tiles(
+            x, layer, whole_rows, int(cache.packed_weight.shape[2])
+        )
         call = prepacked_b_call(
-            x, cache.packed_weight, cache.out_features, cache.bias, epilogue
+            x,
+            cache.packed_weight,
+            cache.out_features,
+            cache.bias,
+            epilogue,
+            tile_m=tiles and tiles[0],
         )
         cache = cache._replace(call=(epilogue, threads, call))
     else:
