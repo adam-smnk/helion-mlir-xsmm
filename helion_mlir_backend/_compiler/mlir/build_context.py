@@ -65,6 +65,9 @@ class BuildContext:
     signature: KernelSignature | None = None
     # Runtime scalar values of the current function, by ``_get_symnode`` key.
     scalars: dict[str, ir.Value] = field(default_factory=dict)
+    # Nesting depth of the ``if`` branches and ``while`` loops being lowered:
+    # accesses there run only where their condition holds.
+    guard_depth: int = 0
 
     mlir_module: ir.Module | None = None
     mlir_context: ir.Context | None = None

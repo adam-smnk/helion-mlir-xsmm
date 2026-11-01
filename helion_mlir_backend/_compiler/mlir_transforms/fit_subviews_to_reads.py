@@ -1,6 +1,6 @@
 """``fit_subviews_to_reads``: a subview only read by in-bounds vector reads of
-contraction accumulators at constant indices, shrunk to the region those reads
-cover.
+contraction accumulators at constant indices, or of contraction operands not
+starting at its origin, shrunk to the region those reads cover.
 
 ``move_offsets_to_subview`` re-bases reads on subviews that keep their base's
 sizes (they extend past its end). Upstream's x86 AMX rewrite of a K loop
@@ -29,8 +29,7 @@ aside) tiling a region of 32x32 inner extents without overlap, lighthouse's AMX
 register tile (2x2 contractions of 16x16).
 
 Left alone: subviews with other uses (other ops, nested subviews), reads of
-anything but accumulators (e.g. contraction operands, whose subviews AMX tile
-loads read in place as they are), reads with runtime indices, permuted, masked
+anything but accumulators (contraction operands: see below), reads with runtime indices, permuted, masked
 or bounds-checked reads, other strides, rank-reducing subviews, a single group
 that already fills its subview, subviews some read would exceed (it would be
 out of bounds), and subviews with a group of another shape. None of those
@@ -41,8 +40,26 @@ taller or wider. The rewrite pairs contractions along N and leaves 2x1 groups
 alone ("Coudn't find the pair"); a 1x2 group (16x32) unfitted keeps its
 buffer's sizes, so in a taller buffer the rewrite would store more result
 tiles than it has results and assert (the eudsl wheel has assertions), as all
-tiles did before this fit: loud, not silent."""
+tiles did before this fit: loud, not silent.
 
+Operand subviews whose reads do not start at their origin are fitted too.
+In a K loop, the rewrite packs a flat RHS (``K x N``) to VNNI from the
+origin of its read's memref: the 32 x 32 block at row 0, column 0, whatever
+the reads' indices (it only pairs the two reads 16 columns apart). A
+column-shifted tile (``b[tk, tn.index + 1]``: reads at columns 1 and 17)
+was packed from column 0, silently wrong. Matched: a subview as above
+whose every use is such a read (constant indices) used only as a
+``vector.contract`` LHS or RHS, with the minimum of its reads' region not
+at the origin. It gets one subview of exactly that region (in bounds of
+the old one), the minimum moved from the indices to the offsets, so the
+reads start at the origin. Dims whose offset is a loop's induction
+variable are not shifted (the rewrite finds the K loop's tile by that
+offset; an ``arith.addi`` of it would hide it): such subviews are left
+(``widen_misread_amx_operands`` then moves them off AMX). Operand reads
+that start at their origin, as every lighthouse register tile's do, are
+left as they are."""
+
+from collections.abc import Callable
 import math
 
 from mlir import ir
@@ -74,9 +91,12 @@ def _accumulated_by(value: ir.Value) -> frozenset:
     return frozenset(keys)
 
 
-def _read_region(use: ir.OpOperand, rank: int) -> tuple[list[int], list[int]] | None:
+def _read_region(
+    use: ir.OpOperand, rank: int, used_as: Callable[[ir.Value], bool] = is_accumulator
+) -> tuple[list[int], list[int]] | None:
     """The start and end, per dim, of the region the read ``use`` covers;
-    ``None`` if it is no read as matched."""
+    ``None`` if it is no read as matched (its result used as ``used_as``
+    accepts: accumulators by default)."""
     read = opview(use.owner)
     if not isinstance(read, vector.TransferReadOp) or use.operand_number != 0:
         return None
@@ -88,7 +108,7 @@ def _read_region(use: ir.OpOperand, rank: int) -> tuple[list[int], list[int]] | 
     permutation = read.permutation_map.value
     if permutation != ir.AffineMap.get_minor_identity(rank, len(shape)):
         return None
-    if not is_accumulator(read.result):
+    if not used_as(read.result):
         return None
     indices = [int_constant(index) for index in read.indices]
     if len(indices) != rank or any(index is None for index in indices):
@@ -165,6 +185,69 @@ def _fitted_groups(subview: memref.SubViewOp) -> list[_Group] | None:
     return list(groups.values())
 
 
+def _is_operand(value: ir.Value) -> bool:
+    """Whether every use of ``value`` is a ``vector.contract`` LHS or RHS."""
+    uses = list(value.uses)
+    return bool(uses) and all(
+        isinstance(opview(use.owner), vector.ContractionOp)
+        and use.operand_number in (0, 1)
+        for use in uses
+    )
+
+
+def _is_loop_iv(value: ir.Value) -> bool:
+    """Whether ``value`` is the induction variable of an ``scf.for``."""
+    if not isinstance(value, ir.BlockArgument):
+        return False
+    owner = value.owner.owner
+    return owner is not None and owner.name == "scf.for" and value.arg_number == 0
+
+
+def _fitted_operand_group(subview: memref.SubViewOp) -> list[_Group] | None:
+    """The reads of ``subview`` as one group with the region they cover, if
+    ``subview`` is matched as an operand subview (see the module docstring)
+    and that region does not start at its origin."""
+    source_type = ir.MemRefType(subview.source.type)
+    result_type = ir.MemRefType(subview.result.type)
+    rank = result_type.rank
+    if rank != source_type.rank or list(subview.static_strides) != [1] * rank:
+        return None
+    uses = list(subview.result.uses)
+    if not uses:
+        return None
+    low: list[int] | None = None
+    high: list[int] | None = None
+    for use in uses:
+        region = _read_region(use, rank, _is_operand)
+        if region is None:
+            return None
+        start, end = region
+        low = start if low is None else list(map(min, low, start))
+        high = end if high is None else list(map(max, high, end))
+    if not any(low):
+        return None
+    dynamic = ir.ShapedType.get_dynamic_size()
+    shape = result_type.shape
+    if any(h > d for h, d in zip(high, shape, strict=True) if d != dynamic):
+        return None
+    dynamic_offset = ir.ShapedType.get_dynamic_stride_or_offset()
+    values = iter(subview.offsets)
+    for offset, shift in zip(subview.static_offsets, low, strict=True):
+        if offset != dynamic_offset:
+            continue
+        value = next(values)
+        if shift and _is_loop_iv(value):
+            return None
+    return [(uses, low, high)]
+
+
+def _after_definition(value: ir.Value) -> ir.InsertionPoint:
+    """An insertion point right after ``value`` is defined."""
+    if isinstance(value, ir.BlockArgument):
+        return ir.InsertionPoint.at_block_begin(value.owner)
+    return ir.InsertionPoint.after(value.owner)
+
+
 def _shifted_offsets(
     subview: memref.SubViewOp, low: list[int]
 ) -> tuple[list[ir.Value], list[int]]:
@@ -180,7 +263,11 @@ def _shifted_offsets(
             continue
         value = values.pop(0)
         if shift:
-            value = arith.addi(value, arith.constant(index, shift))
+            # At the offset's definition: an add in the loop body would be
+            # cloned with the subview by the AMX rewrite (which only clones
+            # the subview), and abort without LICM in between.
+            with _after_definition(value):
+                value = arith.addi(value, arith.constant(index, shift))
         dynamic.append(value)
         static.append(dynamic_offset)
     return dynamic, static
@@ -234,8 +321,9 @@ def _fit(subview: memref.SubViewOp, groups: list[_Group]) -> None:
 class FitSubviewsToReadsOp(
     HelionTransformDialect.Operation, name="fit_subviews_to_reads"
 ):
-    """Shrink every matched ``memref.subview`` in the target to the region its
-    reads cover (see the module docstring)."""
+    """Shrink every matched ``memref.subview`` in the target (accumulator
+    tiles, and operand subviews whose reads do not start at their origin) to
+    the region its reads cover (see the module docstring)."""
 
     target: ext.Operand[transform.AnyOpType]
 
@@ -247,7 +335,7 @@ class FitSubviewsToReadsOp(
         state: transform.TransformState,
     ) -> DiagnosedSilenceableFailure:
         for subview in payload_ops(state, op.target, memref.SubViewOp):
-            groups = _fitted_groups(subview)
+            groups = _fitted_groups(subview) or _fitted_operand_group(subview)
             if groups is not None:
                 _fit(subview, groups)
         return DiagnosedSilenceableFailure.Success

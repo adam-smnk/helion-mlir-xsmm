@@ -24,23 +24,51 @@ are then widened to f32: the rewrite takes only bf16 operands, so the
 contraction lowers on the f32 path (exact products of bf16 values, f32
 sums), as on a host without AMX.
 
-Left alone: contractions with only plain operand reads (the rewrite reads
-those right), of other element types, and every contraction on a target
-without AMX (the rewrite matches no register tile there).
+In a K loop (the accumulator an iter arg of the ``scf.for`` around the
+contraction), the rewrite rebuilds the loop: it re-creates each operand's
+view per iteration by cloning the op defining the read's memref with the
+loop's induction variable substituted for the offset it finds equal to it,
+and packs a flat RHS (``K x N``) to VNNI from the origin of that view,
+ignoring the read's indices (also software-pipelined: the next iteration's
+RHS is packed before the current one's tile products). Also misread there,
+so also matched:
+- an LHS or RHS whose memref is not a ``memref.subview`` with the loop's
+  induction variable among its offsets: e.g. a buffer the loop copies the
+  RHS block into, viewed above the loop (``align_operand_rows``, K tile of
+  32). The rewrite takes an offset operand the view does not have
+  (``MutableArrayRef<OpOperand>::operator[]`` "Invalid index!"), or another
+  offset for the induction variable, or packs the buffer before the loop
+  writes it;
+- a flat RHS read at other indices than its view's origin, or column 16 of
+  it (the pair the rewrite packs together): e.g. columns 1 and 17 of a
+  column-shifted tile ``b[tk, tn.index + 1]`` whose view could not be
+  re-based (``fit_subviews_to_reads``), rows of a K-shifted one.
+VNNI operands (``... x 2``) are loaded with tile loads at the read's
+indices, so only the first applies to them.
+
+Left alone: contractions with only plain operand reads the rewrite reads
+right, of other element types, and every contraction on a target without
+AMX (the rewrite matches no register tile there).
 """
 
 from lighthouse.execution.target import TargetInfo
 from mlir import ir
 from mlir.dialects import arith
 from mlir.dialects import ext
+from mlir.dialects import memref
+from mlir.dialects import scf
 from mlir.dialects import transform
 from mlir.dialects import vector
 from mlir.dialects.transform import DiagnosedSilenceableFailure
 
 from .dialect import HelionTransformDialect
 from .dialect import transform_op
+from .utils import int_constant
 from .utils import opview
 from .utils import payload_ops
+
+# The column of the second RHS read of a pair the rewrite packs together.
+_PAIR_COLUMN = 16
 
 
 def _element_type(value: ir.Value) -> ir.Type | None:
@@ -76,6 +104,56 @@ def _is_plain_read(value: ir.Value) -> bool:
     )
 
 
+def _k_loop(op: vector.ContractionOp) -> scf.ForOp | None:
+    """The ``scf.for`` whose body holds ``op`` and whose iter arg is its
+    accumulator: the K loop the AMX rewrite rebuilds."""
+    acc = op.acc
+    if not isinstance(acc, ir.BlockArgument) or acc.owner != op.operation.block:
+        return None
+    loop = acc.owner.owner
+    if loop is None or loop.name != "scf.for" or acc.arg_number == 0:
+        return None
+    return opview(loop)
+
+
+def _is_loop_view(read: vector.TransferReadOp, loop: scf.ForOp) -> bool:
+    """Whether ``read``'s memref is a subview at ``loop``'s induction
+    variable (the view the rewrite re-creates per iteration)."""
+    base = read.base
+    if not isinstance(base, ir.OpResult):
+        return False
+    view = opview(base.owner)
+    return isinstance(view, memref.SubViewOp) and any(
+        offset == loop.induction_variable for offset in view.offsets
+    )
+
+
+def _is_packed_from_origin(read: vector.TransferReadOp) -> bool:
+    """Whether the rewrite's VNNI packing of the flat RHS ``read`` (32 x 32
+    from its view's origin, paired along N) gets its elements: indices all
+    0 but the last, 0 or 16."""
+    indices = [int_constant(index) for index in read.indices]
+    return all(index == 0 for index in indices[:-1]) and indices[-1:] in (
+        [0],
+        [_PAIR_COLUMN],
+    )
+
+
+def _is_vnni(value: ir.Value) -> bool:
+    shape = ir.VectorType(value.type).shape
+    return len(shape) > 2 and shape[-1] == 2
+
+
+def _is_misread_in_k_loop(op: vector.ContractionOp) -> bool:
+    loop = _k_loop(op)
+    if loop is None:
+        return False
+    lhs, rhs = (opview(value.owner) for value in (op.lhs, op.rhs))
+    if not (_is_loop_view(lhs, loop) and _is_loop_view(rhs, loop)):
+        return True
+    return not _is_vnni(op.rhs) and not _is_packed_from_origin(rhs)
+
+
 def _is_misread(op: vector.ContractionOp) -> bool:
     lhs, rhs, acc = op.lhs, op.rhs, op.acc
     bf16 = ir.BF16Type
@@ -85,7 +163,9 @@ def _is_misread(op: vector.ContractionOp) -> bool:
         and isinstance(_element_type(acc), ir.F32Type)
     ):
         return False
-    return not (_is_plain_read(lhs) and _is_plain_read(rhs))
+    if not (_is_plain_read(lhs) and _is_plain_read(rhs)):
+        return True
+    return _is_misread_in_k_loop(op)
 
 
 def _widen(op: vector.ContractionOp) -> None:

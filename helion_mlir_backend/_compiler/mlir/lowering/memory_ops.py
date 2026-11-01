@@ -77,7 +77,14 @@ def lower_store(ctx: BuildContext, node: torch.fx.Node) -> None:
     index_nodes, value_node = node.args[1], node.args[2]
     extra_mask = node.args[3] if len(node.args) > 3 else node.kwargs.get("extra_mask")
     state = ctx.tensors.value(name)
-    plan = plan_slice(ctx, index_nodes, state, ctx.tensors.owned(name), name)
+    plan = plan_slice(
+        ctx,
+        index_nodes,
+        state,
+        ctx.tensors.owned(name),
+        name,
+        masked=extra_mask is not None,
+    )
     if plan.gathers():
         raise UnsupportedOperationError(
             "store", reason="stores indexed by a tensor (scatter) are not supported"

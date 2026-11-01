@@ -103,6 +103,8 @@ def plan_slice(
     base: ir.Value,
     owned: dict[int, OwnedDim] | None = None,
     name: str | None = None,
+    *,
+    masked: bool = False,
 ) -> SlicePlan:
     """Build a SlicePlan from authoritative index metadata.
 
@@ -117,6 +119,9 @@ def plan_slice(
     ``owned`` marks dims where ``base`` is only the current iteration's region
     of a larger tensor (see ``tensor_state``); those are indexed from its origin.
     ``name`` is the host tensor ``base`` holds, for its runtime extents.
+    ``masked``: the access has an ``extra_mask`` (Helion's zero-padding idiom
+    ``hl.load(x, [t.index - 1], extra_mask=t.index >= 1)``), so its indices
+    may be negative where the mask is false.
 
     Raises NodeLoweringError if a tile index cannot be resolved to a block id.
     """
@@ -181,6 +186,16 @@ def plan_slice(
             dims.append(DimSlice("tile", zero, size, tile, owner.block_id))
             continue
 
+        if isinstance(index_node, int) and not isinstance(index_node, bool):
+            dims.append(
+                _literal_scalar(
+                    ctx, index_node, ctx.sizes.extent(base, dimension, name)
+                )
+            )
+            continue
+        if not masked and not ctx.guard_depth:
+            _reject_negative(ctx, index_node, dimension, base_shape[dimension])
+
         if descriptor.is_scalar:
             block_id = descriptor.block_id
             if descriptor.is_offset and block_id in ctx.block_id_to_iv:
@@ -228,6 +243,61 @@ def plan_slice(
         dims.append(full(len(dims), slice(None)))
 
     return SlicePlan(dims)
+
+
+def _literal_scalar(ctx: BuildContext, index: int, extent: emit.Size) -> DimSlice:
+    """A literal integer position; a negative one counts from the end, as in
+    Python and Helion's Triton codegen (``x[-1]`` is the last element)."""
+    if index >= 0:
+        offset = ctx.index_const(index)
+    elif isinstance(extent, int):
+        if index < -extent:
+            from ..support.errors import UnsupportedOperationError
+
+            raise UnsupportedOperationError(
+                "subscript",
+                reason=f"index {index} is out of bounds of a dimension of {extent}",
+            )
+        offset = ctx.index_const(extent + index)
+    else:
+        offset = arith_d.addi(ctx.as_index(extent), ctx.index_const(index))
+    return DimSlice("scalar", offset, 1, 1, None, reduces=True)
+
+
+def _reject_negative(
+    ctx: BuildContext, index_node: object, dimension: int, extent: int
+) -> None:
+    """Raise if the computed index ``index_node`` of an unconditional, unmasked
+    access is negative at its loops' lower bounds (statically:
+    ``index_lower_bound``).
+
+    Helion leaves such indices undefined: its Triton codegen adds them to the
+    tensor's address unchecked, while torch (and Helion's eager reference
+    mode) count them from the end. A shifted window (``x[tile.index - 1]``)
+    usually means zero padding, which only a mask or a guard gives
+    (``hl.load(..., extra_mask=...)``, an ``if``; those accesses are not
+    checked), so the kernel is rejected rather than read before the tensor
+    start or wrap silently."""
+    from ..support.errors import UnsupportedOperationError
+    from ..support.index_meta import index_lower_bound
+
+    bound = index_lower_bound(ctx, index_node)
+    if bound is not None and bound < 0:
+        size = "?" if ir.ShapedType.is_dynamic_size(extent) else str(extent)
+        raise UnsupportedOperationError(
+            "subscript",
+            reason=(
+                f"the index of dimension {dimension} (size {size}) is as low as "
+                f"{bound} on the first iteration of its loops, before the "
+                "tensor start, and the access is neither masked nor guarded"
+            ),
+            alternatives=[
+                "mask it: hl.load(x, [t.index - 1], extra_mask=t.index >= 1)",
+                "guard it with an if",
+                "start the loop later (hl.tile(1, n))",
+                "pad the tensor on the host",
+            ],
+        )
 
 
 def _inner_tile(
