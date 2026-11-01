@@ -30,7 +30,7 @@ _ALLOCA = "llvm.alloca"
 _CONSTANT = "llvm.mlir.constant"
 
 
-def _xevm_modules(module: ir.Module) -> list[ir.Operation]:
+def xevm_modules(module: ir.Module) -> list[ir.Operation]:
     found: list[ir.Operation] = []
 
     def visit(op: ir.Operation) -> ir.WalkResult:
@@ -120,7 +120,7 @@ def alloca_arrays(module: ir.Module) -> int:
             allocas.append((op, count))
         return ir.WalkResult.ADVANCE
 
-    for gpu_module in _xevm_modules(module):
+    for gpu_module in xevm_modules(module):
         gpu_module.walk(visit)
     for alloca, count in allocas:
         _rewrite(alloca, count)

@@ -34,6 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from tests import kernelbench_xpu as kb
+from tests import test_xevm_bf16_extensions as bf16_kernels
 from tests import test_xpu_ir as ir_kernels
 from tests import xpu_math_kernels as mk
 from tests.test_xpu_kernelbench import _reference as level2_reference
@@ -447,6 +448,91 @@ def test_kernelbench_level2(name: str, dtype: torch.dtype) -> None:
     assert out.dtype == dtype
     linear = F.linear(x.float(), weight.float(), bias.float())
     _check(out, level2_reference(name)(linear, *problem.scalars))
+
+
+# --- bf16 rounding (xevm_bf16_extensions) --------------------------------------
+
+_BF16_SPECIALS = [
+    float("inf"),
+    float("-inf"),
+    float("nan"),
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    3.0,
+    3.3895313892515355e38,  # the largest bf16
+    1.1754943508222875e-38,  # the smallest normal
+    9.183549615799121e-41,  # the smallest subnormal
+    -2.5,
+    0.5,
+    1.0078125,
+    -7.0,
+    65280.0,
+]
+
+
+def _bf16_operands() -> tuple[torch.Tensor, torch.Tensor]:
+    """bf16 operands: N(0, 1), the first row starting with special values
+    (infinities, NaN, signed zeros, the extremes, subnormals) against each
+    other, so overflow, NaN propagation and exact results are covered too."""
+    x, y = _randn(256, 512), _randn(256, 512)
+    specials = torch.tensor(_BF16_SPECIALS, dtype=BF16, device=DEVICE)
+    n = len(_BF16_SPECIALS)
+    x[0, : n * n] = specials.repeat_interleave(n)
+    y[0, : n * n] = specials.repeat(n)
+    return x, y
+
+
+def _assert_bits(out: torch.Tensor, ref: torch.Tensor) -> None:
+    """``out`` is ``ref`` bit for bit, NaNs where ``ref`` has NaNs (any NaN):
+    the kernel wrote every element of its NaN-filled output."""
+    assert out.dtype == ref.dtype == BF16
+    nan = torch.isnan(ref)
+    assert torch.equal(torch.isnan(out), nan)
+    bits, expected = out.view(torch.int16)[~nan], ref.view(torch.int16)[~nan]
+    wrong = (bits != expected).sum().item()
+    assert wrong == 0, f"{wrong} of {out.numel()} elements differ from torch"
+
+
+@pytest.mark.parametrize("op", list(bf16_kernels.BF16_OPS))
+def test_bf16_arithmetic_rounds_to_nearest_even(op: str) -> None:
+    """One rounding of f32 math on bf16 values (``x + y`` of bf16 tensors, and
+    ``(x.float() + y.float()).to(bf16)``) is torch's, bit for bit, in one-row
+    and 2D tiles. Regression: IGC shrank the f32 add, sub and mul between the
+    two conversions to bf16 arithmetic, which truncates: 27 % of adds and 47 %
+    of muls were one ulp off (``xevm_bf16_extensions``)."""
+    bf16_fn, f32_fn, reference = bf16_kernels.BF16_OPS[op]
+    x, y = _bf16_operands()
+    ref = reference(x, y)
+    for block_sizes in ([1, 256], [32, 256]):
+        for fn in (bf16_fn, f32_fn):
+            out = torch.full_like(x, float("nan"))
+            bf16_kernels.bf16_kernel(fn, block_sizes)(x, y, out)
+            _assert_bits(out, ref)
+
+
+def test_bf16_scalar_multiplication_rounds_to_nearest_even() -> None:
+    """KernelBench level 1 ``5_Matrix_scalar_multiplication`` in bf16 (``A *
+    s``, ``s`` = 3.14 rounded to bf16): torch's result bit for bit (it was
+    truncated, see above)."""
+    a, _ = _bf16_operands()
+    out = torch.full_like(a, float("nan"))
+    bf16_kernels.scalar_mul(a, 3.140625, out)
+    _assert_bits(out, a * 3.140625)
+
+
+def test_bf16_division_rounds_to_nearest_even() -> None:
+    """bf16 division (not shrunk by IGC, so right before the workaround too) is
+    torch's bit for bit on finite operands; f32 division of special values
+    (subnormals, infinities) differs from torch's on the device, so these are
+    left out."""
+    x, y = _randn(256, 512), _randn(256, 512)
+    ref = x / y
+    for fn in (bf16_kernels._bf16_div, bf16_kernels._f32_div):
+        out = torch.full_like(x, float("nan"))
+        bf16_kernels.bf16_kernel(fn, [32, 256])(x, y, out)
+        _assert_bits(out, ref)
 
 
 # --- Backend kernels of the IR tests (tests/test_xpu_ir.py) --------------------

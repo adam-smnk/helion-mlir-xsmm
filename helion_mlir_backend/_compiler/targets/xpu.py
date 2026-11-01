@@ -20,8 +20,10 @@ Only the IR stages run without an XPU-capable LLVM build: ``xegpu-wg`` (annotate
 XeGPU) and ``xevm`` (LLVM/XeVM without device binaries). Binaries need the SPIR-V
 target, execution the Level Zero runtime (``libmlir_levelzero_runtime.so``). The
 ``binary`` stop point lowers to ``xevm``, then rewrites the XeVM modules'
-counted allocas (``xevm_alloca_arrays``, a SPIR-V backend workaround) and emits
-the binaries: the ``xevm`` stop point's IR precedes that rewrite.
+counted allocas (``xevm_alloca_arrays``, a SPIR-V backend workaround) and the
+bf16 extensions that bf16 results are computed from (``xevm_bf16_extensions``,
+an IGC workaround), and emits the binaries: the ``xevm`` stop point's IR precedes
+those rewrites.
 """
 
 from __future__ import annotations
@@ -52,6 +54,7 @@ from ..mlir_transforms.keep_row_dims import keep_row_dims
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
+from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
 from .base import MLIRTarget
 from .xpu_checks import check_xegpu_capabilities
 from .xpu_params import XEGPU_CONFIG_KEYS
@@ -162,8 +165,15 @@ def _stages(
         for name, s in schedules
     ]
     if stop_at == "binary":
-        # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays.
-        stages.extend([("xevm-allocas", _AllocaArrays()), ("binary", _ToBinary())])
+        # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays
+        # and xevm_bf16_extensions.
+        stages.extend(
+            [
+                ("xevm-allocas", _AllocaArrays()),
+                ("xevm-bf16-extensions", _Bf16Extensions()),
+                ("binary", _ToBinary()),
+            ]
+        )
     return stages
 
 
@@ -195,6 +205,16 @@ class _AllocaArrays(Stage):
 
     def apply(self, module: ir.Module) -> ir.Module:
         alloca_arrays(module)
+        return module
+
+
+class _Bf16Extensions(Stage):
+    """bf16-to-f32 extensions that bf16 results are computed from as integer
+    shifts (works around IGC narrowing f32 math between the conversions to
+    bf16 math that truncates, :mod:`xevm_bf16_extensions`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        bf16_extensions_as_shifts(module)
         return module
 
 
