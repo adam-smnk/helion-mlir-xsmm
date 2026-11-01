@@ -136,7 +136,7 @@ def test_small_m_vnni_panel(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_linear_panel_override() -> None:
     """``panel`` sets the bf16 weight's VNNI panel width (the output tile's),
     is part of the cache key, and leaves the result within bf16 rounding of
-    the default panels' (AI-bench L2/66 uses 256 at 128x16384x16384)."""
+    the default panels' (256 is the rule's choice at 128x16384x16384)."""
     torch.manual_seed(0)
     layer = torch.nn.Linear(512, 512).to(torch.bfloat16)
     x = torch.rand(64, 512).to(torch.bfloat16)
@@ -395,6 +395,128 @@ def test_vnni_panel_prefers_one_k_chunk(monkeypatch: pytest.MonkeyPatch) -> None
     assert mm.vnni_panel(16384, 4096) == 256
     # 128 columns would leave threads idle: 256 rows x 1024 columns.
     assert mm.vnni_panel(256, 1024, 4096) == 64
+
+
+@pytest.mark.parametrize(
+    ("m", "n", "k", "panel"),
+    [
+        # One tile per thread: L2/55, 56, 59 and L2/66, 68 at bench-cpu.
+        (128, 32768, 32768, 512),
+        (128, 16384, 16384, 256),
+        (128, 8192, 8192, 128),
+        # From K = 6144 on, with few rows and A of at least 1.5 MiB.
+        (128, 8192, 6144, 128),
+        (128, 8192, 6112, 64),
+        (224, 16384, 8192, 256),
+        (64, 16384, 12288, 256),
+        (96, 32768, 8192, 512),
+        # A below 1.5 MiB: the cost rule.
+        (96, 32768, 8190, 64),
+        (64, 16384, 8192, 64),
+        (32, 32768, 8192, 64),
+        (32, 16384, 6144, 64),
+        (64, 16384, 6144, 64),
+        # Smaller K (the MLP layers): the cost rule, unchanged.
+        (128, 4096, 4096, 128),
+        (128, 8192, 4096, 64),
+        (128, 32768, 4096, 64),
+        # Too few columns for a tile per thread above 64: the cost rule.
+        (128, 4096, 8192, 128),
+        (128, 2048, 32768, 64),
+        # No K given: the cost rule.
+        (128, 32768, None, 64),
+        # Padding would leave threads with two tiles beside threads with one.
+        (128, 32768 + 64, 32768, 64),
+        # 256 rows and more: the rule for shared rows.
+        (256, 32768, 32768, 256),
+    ],
+)
+def test_vnni_panel_one_tile_per_thread(
+    monkeypatch: pytest.MonkeyPatch, m: int, n: int, k: int | None, panel: int
+) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", "64")
+    assert mm.vnni_panel(m, n, k) == panel
+
+
+@pytest.mark.parametrize(
+    ("threads", "panel"),
+    [
+        (32, 512),  # two tiles each
+        (48, 256),  # 3 tiles each (1/8 above even); 512 columns would leave 2 or 1
+        (56, 128),
+        (128, 256),
+        (256, 128),
+        (512, 128),  # no panel gives each thread a tile: the cost rule
+    ],
+)
+def test_vnni_panel_tile_per_thread_counts_threads(
+    monkeypatch: pytest.MonkeyPatch, threads: int, panel: int
+) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", str(threads))
+    assert mm.vnni_panel(128, 32768, 32768) == panel
+
+
+def test_vnni_panel_invalid_thread_count(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``OMP_NUM_THREADS=0`` takes the cost rule, as it did before the
+    one-tile rule, instead of dividing by zero."""
+    monkeypatch.setenv("OMP_NUM_THREADS", "0")
+    assert mm.vnni_panel(128, 32768, 32768) == 64
+
+
+@pytest.mark.parametrize(
+    ("threads", "m", "n", "k", "panel"),
+    [
+        (1, 128, 456, 6144, 512),  # N below the panel
+        (2, 129, 1000, 6146, 512),  # ragged in every dim
+        (3, 255, 1500, 6200, 512),
+        (7, 224, 3500, 6146, 512),
+    ],
+)
+def test_one_tile_rule_matches_narrow_panel_bits(
+    monkeypatch: pytest.MonkeyPatch,
+    threads: int,
+    m: int,
+    n: int,
+    k: int,
+    panel: int,
+) -> None:
+    """Shapes on which the rule fires give the bits of 64-column panels, over
+    three calls, fused epilogue and affine linears included."""
+    from helion_mlir_utils.linear import linear_affine
+
+    linear_module = importlib.import_module("helion_mlir_utils.linear")
+
+    monkeypatch.setenv("OMP_NUM_THREADS", str(threads))
+    assert mm.vnni_panel(m, n, k) == panel
+    torch.manual_seed(m + n + k)
+    x = (torch.rand(m, k) - 0.5).to(torch.bfloat16)
+    layer = torch.nn.Linear(k, n).to(torch.bfloat16)
+    wide = narrow = None
+    for _ in range(3):
+        y, wide = linear(x, layer, torch.sigmoid, cache=wide)
+        y64, narrow = linear(x, layer, torch.sigmoid, cache=narrow, panel=64)
+        assert int(wide.packed_weight.shape[2]) == panel
+        assert torch.equal(y.float(), y64.float())
+    scale = torch.tensor([1.5], dtype=torch.bfloat16)
+    y, _ = linear_affine(x, layer, scale)
+    monkeypatch.setattr(linear_module, "vnni_panel", lambda *_: 64)
+    y64, _ = linear_affine(x, layer, scale)
+    assert torch.equal(y.float(), y64.float())
+
+
+@pytest.mark.parametrize(("m", "n"), [(32, 1024), (40, 1000)])
+def test_wide_panels_match_default_bits(m: int, n: int) -> None:
+    """A 512-column panel (one tile per thread) gives the bits of 64-column
+    panels, with partial rows and columns too: the f32 sums run in the same K
+    order."""
+    torch.manual_seed(m)
+    k = 512
+    x = torch.randn(m, k, dtype=torch.bfloat16)
+    layer = torch.nn.Linear(k, n)
+    wide, _ = linear(x, layer, panel=512)
+    narrow, _ = linear(x, layer, panel=64)
+    assert wide.shape == (m, n)
+    assert torch.equal(wide.float(), narrow.float())
 
 
 @pytest.mark.parametrize("k", [2048, 2080])

@@ -1006,15 +1006,61 @@ def _pack_b_vnni_panels_kernel_t(b3_t: Tensor, panel: hl.constexpr) -> Tensor:
 _PANEL_PACK_KERNELS: dict[int, helion.Kernel] = {}
 
 
+# A GEMM of few rows runs one tile per thread from this K and these bytes of A
+# (bf16: M x K x 2). A smaller A stays in or near L2 across a thread's tiles, so
+# there is little to save and the wider tile can lose. EMR, GEMM alone, wide vs
+# 64 columns: 128x16384xK at K = 4160 0.39 vs 0.37 ms, 5120 0.50 vs 0.48, 6144
+# 0.63 vs 0.68, 7168 0.69 vs 0.85; by A, 32x16384x6144 (384 KiB) +7 %,
+# 64x16384x6144 (768 KiB) +11 %, 64x16384x8192 (1 MiB) -3 to +10 % by node and
+# allocator, 64x16384x12288 (1.5 MiB) -20 %, 96x32768x8192 (1.5 MiB) -8 to -29 %.
+_ONE_TILE_PER_THREAD_MIN_K = 6144
+_ONE_TILE_PER_THREAD_MIN_A_BYTES = 3 << 19
+
+
+def _one_tile_per_thread_panel(n: int, threads: int) -> int | None:
+    """The widest panel, up to 512 columns, that gives each of ``threads`` an
+    even share of whole-row tiles of ``n`` columns (at most 1/8 above even), if
+    one wider than ``_VNNI_PANEL`` does.
+
+    Every tile of few rows reads all of A's K for those rows, and an A beyond
+    L2 streams from L3 again for each tile a thread runs. EMR (one node, glibc),
+    128x32768x32768, GEMM alone, per call: 64 columns (8 tiles per thread) 11.0-
+    11.6 ms and 7.7-8.6 GiB of L2 misses, 512 (one tile) 8.6-8.8 ms and 3.5-3.9
+    GiB; DRAM reads are about 1.8 GiB in both. Calls run in two modes with the
+    same bytes, the slow one at a lower mesh clock and package power: at 64
+    columns 22-40 % of calls, about 20 % slower (2.0-2.2 vs 1.7-1.8 GHz, 391-409
+    vs 304-312 W); at 512 columns 15-25 %, about 15 % slower (2.15 vs 1.7-1.8
+    GHz, 387 vs 327-340 W). A package power limit would explain the modes, an
+    inference: the limit itself was not read."""
+    if threads < 1:  # an invalid OMP_NUM_THREADS: the cost rule's business
+        return None
+    for panel in (512, 256, 128):
+        panels = -(-n // panel)
+        if panels >= threads and -(-panels // threads) * panel * threads * 8 <= n * 9:
+            return panel
+    return None
+
+
 def vnni_panel(m: int, n: int, k: int | None = None) -> int:
     """Columns of :func:`pack_b_vnni_t` panels for ``m`` rows: the widest (up to
     256) that still gives every thread a tile of at least ``_MIN_SHARED_ROWS``
     rows, or one of all rows. Wider panels reuse each A row over more columns
     (1024x8192x8192: 64 columns 3118 us, 256: 2458). Given ``k``, the widest of
     those whose K runs as one chunk (:func:`_single_k_chunk`) comes first
-    (16384x4096x4096: 128 columns in one chunk 8.8-9.0 ms, 256 in chunks 9.8)."""
+    (16384x4096x4096: 128 columns in one chunk 8.8-9.0 ms, 256 in chunks 9.8).
+    Few rows with a large K and at least 1.5 MiB of A: one tile per thread
+    (:func:`_one_tile_per_thread_panel`)."""
     threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
     if m < _MIN_SHARED_ROWS:
+        # 2 bytes per element: these panels are bf16 VNNI by construction.
+        if (
+            k is not None
+            and k >= _ONE_TILE_PER_THREAD_MIN_K
+            and m * k * 2 >= _ONE_TILE_PER_THREAD_MIN_A_BYTES
+        ):
+            panel = _one_tile_per_thread_panel(n, threads)
+            if panel is not None:
+                return panel
         # One row tile does not give every thread a tile, so the threads split
         # the rows too. Each tile reads all K of its rows of A and of its panel,
         # so its operand bytes grow with rows + columns; rows count twice, as A
