@@ -8,8 +8,11 @@ run unpadded.
 :func:`matmul_prepacked_b` with a weight packed once by :func:`pack_b_vnni_t`
 skips the per-call pack: AMX reads both operands in place.
 
-Other cases (f32) pack both operands into the blocked (mmt4d-style)
-layout and run :func:`_matmul_blocked_kernel`:
+f32 GEMMs of whole tiles run :func:`_matmul_f32_fused_pack`: each output tile
+packs the A and B chunks it needs per K step into 32x32 blocks in private
+buffers and accumulates in blocks. Other f32 shapes (and f32 with a bias,
+scale or shift) pack both operands into the blocked (mmt4d-style) layout by
+separate kernels and run :func:`_matmul_blocked_kernel`:
 
     A = [M/BM, K/BK, BM, BK]
     B = [N/BN, K/BK, BK, BN]
@@ -1163,6 +1166,153 @@ def _matmul_split_k(a: Tensor, b: Tensor, splits: int) -> Tensor:
     return _SPLIT_K_SUM(partials, a.dtype)
 
 
+def _f32_chunk_dot(
+    a: Tensor,
+    b: Tensor,
+    tile_m: object,
+    tile_n: object,
+    tile_k: object,
+    trans_a: bool,
+    trans_b: bool,
+) -> Tensor:
+    """``a @ b`` of f32 ``[M, K]`` and ``[K, N]`` (``a`` ``[K, M]`` with
+    ``trans_a``, ``b`` ``[N, K]`` with ``trans_b``) on one tile and K chunk,
+    each operand packed into 32x32 blocks: ``[TM/32, TK/32, 32, 32]`` and
+    ``[TN/32, TK/32, 32, 32]``, the blocked layout of :func:`pack_a_blocked`
+    and :func:`pack_b_blocked`. The packs land in private buffers."""
+    bm, bn, bk = (
+        tile_m.block_size // 32,
+        tile_n.block_size // 32,
+        tile_k.block_size // 32,
+    )
+    if trans_a:
+        a4 = a[tile_k, tile_m].reshape(bk, 32, bm, 32).permute(2, 0, 3, 1)
+    else:
+        a4 = a[tile_m, tile_k].reshape(bm, 32, bk, 32).permute(0, 2, 1, 3)
+    if trans_b:
+        b4 = b[tile_n, tile_k].reshape(bn, 32, bk, 32).permute(0, 2, 3, 1)
+    else:
+        b4 = b[tile_k, tile_n].reshape(bk, 32, bn, 32).permute(2, 0, 1, 3)
+    return torch.einsum("akmc,bkcn->abmn", a4, b4)
+
+
+def _matmul_f32_fused_pack(
+    a: Tensor,
+    b: Tensor,
+    epilogue: Callable[[Tensor], Tensor],
+    trans_a: hl.constexpr,
+    trans_b: hl.constexpr,
+) -> Tensor:
+    """``epilogue(a @ b)`` of f32 row-major ``[M, K]`` and ``[K, N]`` (``[K, M]``
+    with ``trans_a``, ``[N, K]`` with ``trans_b``), all extents whole tiles and
+    K chunks (:func:`_f32_fused_tiles`).
+
+    Each tile packs the A and B chunks it needs per K step into 32x32 blocks in
+    private buffers (:func:`_f32_chunk_dot`) and accumulates in blocks
+    ``[TM/32, TN/32, 32, 32]``, whose last two dims get the 8x32 FMA register
+    tile; the accumulator is stored straight into row-major C. Separate pack
+    kernels cost more: their output blocks are read by many cores, so
+    rewriting those lines on the next call invalidates copies in other cores'
+    caches (4096^3 on EMR: 2.2 ms per 64 MiB operand after a GEMM, 0.1 ms
+    without one).
+    """
+    if trans_a:
+        k, m = a.shape
+    else:
+        m, k = a.shape
+    n = b.shape[0] if trans_b else b.shape[1]
+    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    for tile_m, tile_n in hl.tile([m, n]):
+        acc = hl.zeros(
+            [tile_m.block_size // 32, tile_n.block_size // 32, 32, 32],
+            dtype=torch.float32,
+        )
+        for tile_k in hl.tile(k):
+            acc = acc + _f32_chunk_dot(a, b, tile_m, tile_n, tile_k, trans_a, trans_b)
+        y = epilogue(acc).permute(0, 2, 1, 3)
+        out[tile_m, tile_n] = y.reshape(tile_m.block_size, tile_n.block_size).to(
+            a.dtype
+        )
+    return out
+
+
+# Tiles of :func:`_matmul_f32_fused_pack` (EMR, 64 threads, 4096^3 / 2048x4096x8192,
+# kernel ms): 256x256 tiles reuse each packed A and B element 256 times per
+# 8x32 register tile pass (128x128: 19.8 / -, 256x256: 18.2 / 18.0, 512x256:
+# 18.7); a 128-deep K chunk keeps a block column of the packed B chunk
+# (128 x 32 x 4 B = 16 KiB) in L1 across the tile's row blocks (64: 19.2,
+# 256: 19.5, 512: 25.7 ms at 4096^3).
+_F32_TILE = 256
+_F32_MIN_TILE = 64
+_F32_K_CHUNK = 128
+_F32_FUSED_KERNELS: dict[tuple[int, ...], helion.Kernel] = {}
+
+
+def _f32_fused_tiles(m: int, n: int, k: int) -> tuple[int, int, int] | None:
+    """Tiles (rows, columns, K chunk) of :func:`_matmul_f32_fused_pack`, or
+    ``None`` unless the extents are whole tiles and chunks (the kernel has no
+    partial tiles; other shapes take the blocked path). Starts from
+    ``_F32_TILE`` squares and halves the longer side, down to
+    ``_F32_MIN_TILE``, while there are fewer tiles than threads."""
+    tile_k = next((c for c in (_F32_K_CHUNK, 64, 32) if k % c == 0), None)
+    if tile_k is None:
+        return None
+
+    def side(extent: int) -> int | None:
+        return next(
+            (t for t in (_F32_TILE, 128, _F32_MIN_TILE) if extent % t == 0), None
+        )
+
+    tile_m, tile_n = side(m), side(n)
+    if tile_m is None or tile_n is None:
+        return None
+    threads = _omp_threads()
+    while (m // tile_m) * (n // tile_n) < threads:
+        if tile_m >= tile_n and tile_m > _F32_MIN_TILE:
+            tile_m //= 2
+        elif tile_n > _F32_MIN_TILE:
+            tile_n //= 2
+        else:
+            break
+    return tile_m, tile_n, tile_k
+
+
+def _matmul_f32_fused(
+    a: Tensor,
+    b: Tensor,
+    trans_a: bool,
+    trans_b: bool,
+    epilogue: Callable[[Tensor], Tensor],
+) -> Tensor | None:
+    """:func:`_matmul_f32_fused_pack` of ``a`` and ``b``, or ``None`` if their
+    shape does not fit it. Bound kernels are cached like the bf16 ones."""
+    m = int(a.shape[1]) if trans_a else int(a.shape[0])
+    n = int(b.shape[0]) if trans_b else int(b.shape[1])
+    k = int(a.shape[0]) if trans_a else int(a.shape[1])
+    key = ("f32", m, n, k, trans_a, trans_b, _omp_threads(), epilogue)
+    if (cached := _FUSED_PACK_BOUND.get(key)) is None:
+        tiles = _f32_fused_tiles(m, n, k)
+        if tiles is None:
+            return None
+        if tiles not in _F32_FUSED_KERNELS:
+            _F32_FUSED_KERNELS[tiles] = helion.kernel(
+                _matmul_f32_fused_pack,
+                backend="mlir",
+                static_shapes=True,
+                config=helion.Config(block_sizes=list(tiles)),
+            )
+        a, b = a.contiguous(), b.contiguous()
+        consts = (hl.constexpr(trans_a), hl.constexpr(trans_b))
+        bound = _F32_FUSED_KERNELS[tiles].bind((a, b, epilogue, *consts))
+        cached = _FUSED_PACK_BOUND[key] = (bound, consts)
+        if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
+            _FUSED_PACK_BOUND.popitem(last=False)
+    else:
+        _FUSED_PACK_BOUND.move_to_end(key)
+    bound, consts = cached
+    return bound(a.contiguous(), b.contiguous(), epilogue, *consts)
+
+
 def matmul(
     a: Tensor,
     b: Tensor,
@@ -1181,7 +1331,9 @@ def matmul(
     is packed per output tile, A read in place (with ``trans_a``, packed per
     tile too), partial edge tiles handle any shape, and operands smaller than
     one tile are zero-padded to one; ``block_sizes`` (tile rows, columns, K
-    chunk) overrides its tile choice. Otherwise both
+    chunk) overrides its tile choice. f32 without bias, scale or shift runs
+    :func:`_matmul_f32_fused_pack` when M, N and K are whole tiles and K
+    chunks (:func:`_f32_fused_tiles`; ``block_sizes`` is ignored), else both
     operands are packed into 32x32 blocks by separate kernels, zero-padded to
     block multiples (:func:`_matmul_blocked_kernel`). ``bias``, ``scale`` and
     ``shift`` are ``[N]`` (``scale``/``shift`` also ``[1]``), broadcast over
@@ -1254,6 +1406,10 @@ def matmul(
     splits = _split_k(m, n, k, trans_a, trans_b, bias, scale, shift, epilogue)
     if splits:
         return _matmul_split_k(a, b, splits)
+    if bias is None and scale is None and shift is None:
+        fused = _matmul_f32_fused(a, b, trans_a, trans_b, epilogue)
+        if fused is not None:
+            return fused
     a4 = (
         pack_a_blocked_t(a, m_pad=m_pad, k_pad=k_pad)
         if trans_a
