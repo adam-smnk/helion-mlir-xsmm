@@ -7,7 +7,7 @@ dialect only registers the ops defined before it is loaded."""
 from .align_operand_rows import align_operand_rows
 from .carry_loop_inits import carry_loop_inits
 from .dialect import HelionTransformDialect
-from .drop_accumulator_read_unit_dims import drop_accumulator_read_unit_dims
+from .drop_contraction_read_unit_dims import drop_contraction_read_unit_dims
 from .first_touch import OVERWRITTEN_ATTR_NAME
 from .first_touch import first_touch_outputs
 from .first_touch import mark_overwritten_args
@@ -44,6 +44,7 @@ from .tile_sizes import tile_sizes
 from .unmask_contractions import unmask_contractions
 from .vectorize_pads import vectorize_pads
 from .version_padded_operands import version_padded_operands
+from .widen_misread_amx_operands import widen_misread_amx_operands
 from .widen_transposes import widen_transposes
 from .xegpu_elementwise import InferXeGPUElementwiseLayoutOp
 from .xegpu_elementwise import infer_xegpu_elementwise_layout
@@ -60,7 +61,7 @@ __all__ = [
     "InferXeGPUElementwiseLayoutOp",
     "align_operand_rows",
     "carry_loop_inits",
-    "drop_accumulator_read_unit_dims",
+    "drop_contraction_read_unit_dims",
     "first_touch_outputs",
     "fit_subviews_to_reads",
     "fold_full_insert_slices",
@@ -99,5 +100,6 @@ __all__ = [
     "unmask_contractions",
     "vectorize_pads",
     "version_padded_operands",
+    "widen_misread_amx_operands",
     "widen_transposes",
 ]

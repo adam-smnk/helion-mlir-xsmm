@@ -10,7 +10,7 @@ Upstream's AMX rewrite loads only minor-identity accumulator reads in place;
 for others it takes the read's memref as the register tile (``1 x N``), so it
 stored the result tiles past a ``1 x N`` stack buffer (segfault) or indexed past
 its results (``SmallVector::operator[]`` assertion), whenever the first loop
-ran two or more iterations. ``drop_accumulator_read_unit_dims`` (first step of
+ran two or more iterations. ``drop_contraction_read_unit_dims`` (first step of
 ``amx_move_offsets``) moves such reads onto a rank-reducing view without the
 unit dims, which ``move_offsets_to_subview`` and ``fit_subviews_to_reads`` then
 fit to the register tile, as for any other accumulator.
@@ -43,7 +43,7 @@ from helion_mlir_backend import generate_mlir
 from helion_mlir_backend._compiler import helion_transforms
 from helion_mlir_backend._compiler.mlir_transforms import HelionTransformDialect
 from helion_mlir_backend._compiler.mlir_transforms import (
-    drop_accumulator_read_unit_dims,
+    drop_contraction_read_unit_dims,
 )
 
 if TYPE_CHECKING:
@@ -253,7 +253,7 @@ def test_second_k_loop_accumulates_in_place(name: str) -> None:
     assert "x86.amx.tile_zero" not in after
 
 
-# --- drop_accumulator_read_unit_dims --------------------------------------------
+# --- drop_contraction_read_unit_dims --------------------------------------------
 
 _MK = "affine_map<(m, n, k) -> (m, k)>"
 _KN = "affine_map<(m, n, k) -> (k, n)>"
@@ -354,7 +354,7 @@ def test_drop_unit_dims_of_second_k_loop_reads() -> None:
     """The kernel's form: reads of a ``32x1x64`` buffer skipping its unit dim
     become minor-identity reads of a ``32x64`` view, at the same rows and
     columns."""
-    text = _apply(drop_accumulator_read_unit_dims, _k_loop())
+    text = _apply(drop_contraction_read_unit_dims, _k_loop())
     assert (
         "memref.subview %arg0[0, 0, 0] [32, 1, 64] [1, 1, 1] : memref<32x1x64xf32> "
         "to memref<32x64xf32, strided<[64, 1]>>" in text
@@ -378,7 +378,7 @@ def test_drop_unit_dims_runtime_index_dynamic_layout() -> None:
     a dynamic leading dim keeps its runtime size; strides stay."""
     buffer = "memref<?x1x64xf32, strided<[128, 64, 1], offset: ?>>"
     text = _apply(
-        drop_accumulator_read_unit_dims,
+        drop_contraction_read_unit_dims,
         _k_loop(buffer, index=lambda r, c: f"%c{r}, %k, {c}"),
     )
     assert "memref.dim %arg0, %c0" in text
@@ -394,7 +394,7 @@ def test_drop_unit_dims_keeps_leading_dims() -> None:
     dims between the vector's dims go, several at once."""
     buffer = "memref<4x32x1x1x64xf32>"
     text = _apply(
-        drop_accumulator_read_unit_dims,
+        drop_contraction_read_unit_dims,
         _k_loop(
             buffer,
             index=lambda r, c: f"%c1, %c{r}, %c0, %c0, {c}",
@@ -446,8 +446,6 @@ _IN_BOUNDS = f"{{{{in_bounds = [true, true], permutation_map = {_SKIP_D1}}}}}"
 @pytest.mark.parametrize(
     "source",
     [
-        # Contraction operands: AMX tile loads read them in place as they are.
-        _k_loop(use="rhs"),
         # Permuted dims (transposed).
         _k_loop(permutation="affine_map<(d0, d1, d2) -> (d2, d0)>"),
         # A skipped dim that is not unit.
@@ -464,7 +462,6 @@ _IN_BOUNDS = f"{{{{in_bounds = [true, true], permutation_map = {_SKIP_D1}}}}}"
         _k_loop("tensor<32x1x64xf32>"),
     ],
     ids=[
-        "operand",
         "transposed",
         "non_unit_dim",
         "dynamic_dim",
@@ -473,7 +470,79 @@ _IN_BOUNDS = f"{{{{in_bounds = [true, true], permutation_map = {_SKIP_D1}}}}}"
     ],
 )
 def test_drop_unit_dims_leaves_others(source: str) -> None:
-    assert _apply(drop_accumulator_read_unit_dims, source) == _parsed(source)
+    assert _apply(drop_contraction_read_unit_dims, source) == _parsed(source)
+
+
+def test_drop_any_static_dim_of_operand_reads() -> None:
+    """Operand reads drop a skipped dim of any static size (a projection at
+    the read's index): an ``a[m, s, k]`` chunk at a runtime ``s`` of a
+    ``32x8x64`` buffer becomes a read of a ``32x64`` view at ``s``."""
+    text = _apply(
+        drop_contraction_read_unit_dims,
+        _k_loop(
+            "memref<32x8x64xf32>",
+            index=lambda r, c: f"%c{r}, %k, {c}",
+            use="rhs",
+        ),
+    )
+    assert (
+        "memref.subview %arg0[0, %arg2, 0] [32, 1, 64] [1, 1, 1] : "
+        "memref<32x8x64xf32> to memref<32x64xf32, strided<[512, 1], offset: ?>>" in text
+    )
+    assert all("permutation_map" not in read for read in _reads(text))
+
+
+def test_drop_any_static_dim_constant_index_in_range() -> None:
+    """A constant index inside the skipped dim (7 of 8) is the view's static
+    offset."""
+    text = _apply(
+        drop_contraction_read_unit_dims,
+        _k_loop(
+            "memref<32x8x64xf32>",
+            index=lambda r, c: f"%c{r}, %c7, {c}",
+            use="rhs",
+        ).replace(
+            "%c16 = arith.constant 16 : index",
+            "%c16 = arith.constant 16 : index\n  %c7 = arith.constant 7 : index",
+        ),
+    )
+    assert "[0, 7, 0] [32, 1, 64] [1, 1, 1]" in text
+    assert "strided<[512, 1], offset: 448>" in text
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        # Accumulators drop unit dims only (their subviews are register tiles).
+        _k_loop("memref<32x8x64xf32>", index=lambda r, c: f"%c{r}, %k, {c}"),
+        # A dynamic skipped dim.
+        _k_loop("memref<32x?x64xf32>", use="rhs"),
+        # A constant index past the skipped dim (8 of 8).
+        _k_loop(
+            "memref<32x8x64xf32>",
+            index=lambda r, c: f"%c{r}, %c8, {c}",
+            use="rhs",
+        ).replace(
+            "%c16 = arith.constant 16 : index",
+            "%c16 = arith.constant 16 : index\n  %c8 = arith.constant 8 : index",
+        ),
+        # A permuted (transposing) operand read.
+        _k_loop(
+            "memref<64x8x32xf32>",
+            index=lambda r, c: f"{c}, %c0, %c{r}",
+            permutation="affine_map<(d0, d1, d2) -> (d2, d0)>",
+            use="rhs",
+        ),
+    ],
+    ids=[
+        "acc_non_unit",
+        "operand_dynamic",
+        "operand_index_past_end",
+        "operand_permuted",
+    ],
+)
+def test_drop_any_static_dim_leaves_others(source: str) -> None:
+    assert _apply(drop_contraction_read_unit_dims, source) == _parsed(source)
 
 
 _FOURTH = "%i3 = vector.transfer_read %buf[%c16, %c0, %n16], %pad"
@@ -505,7 +574,7 @@ def test_drop_unit_dims_leaves_other_reads(last: str, callee: bool) -> None:
         source = source.replace(
             "func.func @f", "func.func private @g(vector<16x16xf32>)\nfunc.func @f"
         )
-    reads = _reads(_apply(drop_accumulator_read_unit_dims, source))
+    reads = _reads(_apply(drop_contraction_read_unit_dims, source))
     assert all("permutation_map" not in read for read in reads[:3])
     control = "%c16, %c0" not in reads[3]
     assert control == ("%m" not in last and not callee)
@@ -574,7 +643,7 @@ def test_drop_unit_dims_view_offset(buffer: str, index: str, view: str) -> None:
     source = _one_acc_read(
         buffer, f"[%c1, {index}, %c3], %pad {_SKIP_READ} : {buffer}, vector<16x16xf32>"
     )
-    text = _apply(drop_accumulator_read_unit_dims, source)
+    text = _apply(drop_contraction_read_unit_dims, source)
     assert f"{buffer} to {view}" in text
     assert "permutation_map" not in _reads(text)[0]
 
@@ -607,7 +676,7 @@ _AFFINE = "memref<32x1x64xf32, affine_map<(d0, d1, d2) -> (d2, d1, d0)>>"
     ids=["affine_layout", "constant_index_1", "broadcast"],
 )
 def test_drop_unit_dims_leaves_other_layouts(source: str) -> None:
-    assert _apply(drop_accumulator_read_unit_dims, source) == _parsed(source)
+    assert _apply(drop_contraction_read_unit_dims, source) == _parsed(source)
 
 
 _PLAIN = (
@@ -656,30 +725,64 @@ _LHS_MAPS = (
             "  }\n"
             "  return %o#1 : vector<16x16xf32>"
         ),
-        # The LHS and the accumulator of one contraction.
+        # A contraction operand through another op (a negation).
         _func(
             f"  {_PLAIN}\n"
-            f"  %y = vector.contract {{{_LHS_MAPS}}} %r, %z, %r : vector<16x16xf32>, "
+            "  %e = arith.negf %r : vector<16x16xf32>\n"
+            f"  %y = vector.contract {{{_LHS_MAPS}}} %e, %z, %z : vector<16x16xf32>, "
             "vector<16x16xf32> into vector<16x16xf32>\n"
             "  return %y : vector<16x16xf32>"
         ),
     ],
-    ids=["vector_mask", "iter_arg_yielded", "lhs_and_accumulator"],
+    ids=["vector_mask", "iter_arg_yielded", "operand_through_other_op"],
 )
 def test_drop_unit_dims_leaves_other_uses(source: str) -> None:
-    assert _apply(drop_accumulator_read_unit_dims, source) == _parsed(source)
+    assert _apply(drop_contraction_read_unit_dims, source) == _parsed(source)
 
 
-def test_drop_unit_dims_other_uses_control() -> None:
-    """The ``_func`` cases' plain form (one accumulator read) is rewritten."""
-    source = _func(
+@pytest.mark.parametrize(
+    "body",
+    [
+        # One accumulator read.
         f"  {_PLAIN}\n  {_contract('%y', '%a', '%b', '%r')}\n"
-        "  return %y : vector<16x16xf32>"
-    )
+        "  return %y : vector<16x16xf32>",
+        # The LHS and the accumulator of one contraction.
+        f"  {_PLAIN}\n"
+        f"  %y = vector.contract {{{_LHS_MAPS}}} %r, %z, %r : vector<16x16xf32>, "
+        "vector<16x16xf32> into vector<16x16xf32>\n"
+        "  return %y : vector<16x16xf32>",
+        # The LHS of one contraction and the RHS of another.
+        f"  {_PLAIN}\n"
+        f"  %y = vector.contract {{{_LHS_MAPS}}} %r, %z, %z : vector<16x16xf32>, "
+        "vector<16x16xf32> into vector<16x16xf32>\n"
+        f"  %w = vector.contract {{{_LHS_MAPS}}} %z, %r, %y : vector<16x16xf32>, "
+        "vector<16x16xf32> into vector<16x16xf32>\n"
+        "  return %w : vector<16x16xf32>",
+    ],
+    ids=["accumulator", "lhs_and_accumulator", "lhs_and_rhs"],
+)
+def test_drop_unit_dims_other_uses_control(body: str) -> None:
+    """The ``_func`` cases' plain forms (contraction uses only) are
+    rewritten."""
     assert (
         "permutation_map"
-        not in _reads(_apply(drop_accumulator_read_unit_dims, source))[0]
+        not in _reads(_apply(drop_contraction_read_unit_dims, _func(body)))[0]
     )
+
+
+def test_drop_unit_dims_of_operand_reads() -> None:
+    """Contraction operand reads skipping a unit dim become minor-identity
+    reads of a ``32x64`` view, at the same rows and columns, as accumulator
+    reads do (upstream's AMX rewrite loads operand rows along the memref's
+    two inner dims, ignoring the map)."""
+    text = _apply(drop_contraction_read_unit_dims, _k_loop(use="rhs"))
+    assert (
+        "memref.subview %arg0[0, 0, 0] [32, 1, 64] [1, 1, 1] : memref<32x1x64xf32> "
+        "to memref<32x64xf32, strided<[64, 1]>>" in text
+    )
+    reads = _reads(text)
+    assert len(reads) == 4
+    assert all("permutation_map" not in read for read in reads)
 
 
 # The kernel's second K loop as ``amx_move_offsets`` gets it (case
@@ -774,7 +877,7 @@ def _amx_rewrite(source: str, *, fix: bool) -> str:
         with schedule_boilerplate() as (schedule, named_seq):
             funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
             if fix:
-                drop_accumulator_read_unit_dims(funcs)
+                drop_contraction_read_unit_dims(funcs)
             move_offsets_to_subview(funcs)
             transform.apply_cse(funcs)
             fit_subviews_to_reads(funcs)
