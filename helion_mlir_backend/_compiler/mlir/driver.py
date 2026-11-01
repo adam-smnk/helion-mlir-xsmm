@@ -132,8 +132,9 @@ def call_entry(
 
     The entry's target checks each tensor (e.g. its device) and prepares and
     finishes the call. Tensors are passed contiguous (a copy for strided ones,
-    copied back for inouts). An input that overlaps an inout is cloned so the
-    ``restrict`` arguments hold; overlapping inouts are rejected. Runtime scalars
+    copied back for inouts) and with their data aligned to the target's
+    ``buffer_alignment`` (a copy likewise). An input that overlaps an inout is
+    cloned so the ``restrict`` arguments hold; overlapping inouts are rejected. Runtime scalars
     are passed by value. ``sizes`` (each argument's size expressions) lets runtime
     sizes the kernel assumes equal be checked. Calls that need none of this
     (:meth:`CompiledEntry.call_in_place`) skip it: per-call host time is a large
@@ -166,14 +167,17 @@ def call_entry(
                 reason="each written tensor must be its own buffer",
             )
     staged = [
-        # A negative or conjugate view's storage holds the values unnegated
-        # (unconjugated): the kernel gets a materialized copy (written back
-        # for inouts), which never aliases an inout.
-        tensor.resolve_conj().resolve_neg().contiguous()
-        if tensor.is_neg() or tensor.is_conj()
-        else tensor.clone(memory_format=torch.contiguous_format)
-        if role == "in" and _overlaps_any(tensor, inout_spans)
-        else tensor.contiguous()
+        _aligned(
+            # A negative or conjugate view's storage holds the values unnegated
+            # (unconjugated): the kernel gets a materialized copy (written back
+            # for inouts), which never aliases an inout.
+            tensor.resolve_conj().resolve_neg().contiguous()
+            if tensor.is_neg() or tensor.is_conj()
+            else tensor.clone(memory_format=torch.contiguous_format)
+            if role == "in" and _overlaps_any(tensor, inout_spans)
+            else tensor.contiguous(),
+            target.buffer_alignment,
+        )
         for tensor, role in zip(tensors, roles, strict=True)
     ]
     buffers = iter(staged)
@@ -188,6 +192,20 @@ def call_entry(
         if role == "inout" and copy is not tensor:
             tensor.copy_(copy)
     return inouts
+
+
+def _aligned(tensor: torch.Tensor, alignment: int) -> torch.Tensor:
+    """``tensor``, or a copy of it whose data starts at a multiple of
+    ``alignment`` bytes (the caching allocators return aligned blocks)."""
+    if alignment <= 1 or not tensor.numel() or tensor.data_ptr() % alignment == 0:
+        return tensor
+    copy = tensor.clone(memory_format=torch.contiguous_format)
+    if copy.data_ptr() % alignment:
+        raise UnsupportedOperationError(
+            f"cannot pass a {alignment}-byte aligned copy of a tensor",
+            reason=f"the allocator returned data at {copy.data_ptr():#x}",
+        )
+    return copy
 
 
 def _checked_tensor(target: MLIRTarget, arg: EntryArg, value: object) -> torch.Tensor:

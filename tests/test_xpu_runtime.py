@@ -21,6 +21,7 @@ masking on XPU), with at least two workgroups per tiled dim and a K loop.
 from __future__ import annotations
 
 import itertools
+import math
 import re
 import string
 from typing import TYPE_CHECKING
@@ -121,7 +122,9 @@ _MATMUL_MNK = {
     "17_Matmul_with_transposed_B": (512, 512, 256),
     "18_Matmul_with_transposed_both": (512, 512, 256),
 }
-_ELEMENTWISE_SHAPE = (256, 512)
+_ELEMENTWISE_SHAPE = (16, 16384)
+"""Two column tiles of ``ELEMENTWISE_BLOCKS`` (one row, 8192 columns) per row,
+16 rows: both grid dims (the columns first) have more than one tile."""
 _REDUCTION_SHAPE = (128, 256)
 _ELEMENTWISE_REFERENCES: dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "19_ReLU": kb.relu,
@@ -208,6 +211,17 @@ device they are wrong (22_Tanh: zeros) or not separable from wrong forms
 (30_Softsign's abs of bf16 values)."""
 
 
+def _poison_output(shape: tuple[int, ...], dtype: torch.dtype) -> int:
+    """NaN-fill and free a block of the output's size: the caching allocator
+    hands it to the next allocation of that size (the kernel's output), so an
+    element the kernel does not write stays NaN (``_check`` rejects it).
+    Returns the block's address, for the caller to check the output got it."""
+    poison = torch.full(shape, float("nan"), dtype=dtype, device=DEVICE)
+    address = poison.data_ptr()
+    del poison
+    return address
+
+
 @pytest.mark.parametrize("name", list(_ELEMENTWISE_REFERENCES))
 def test_kernelbench_elementwise(name: str) -> None:
     problem = {p.name: p for p in kb.PROBLEMS}[name]
@@ -218,7 +232,97 @@ def test_kernelbench_elementwise(name: str) -> None:
         with pytest.raises(UnsupportedOperationError, match=_GUARDED_ELEMENTWISE[name]):
             problem.kernel(x)
         return
-    _check(problem.kernel(x), _ELEMENTWISE_REFERENCES[name](x), bound)
+    poisoned = _poison_output(x.shape, x.dtype)
+    out = problem.kernel(x)
+    assert out.data_ptr() == poisoned
+    _check(out, _ELEMENTWISE_REFERENCES[name](x), bound)
+
+
+def _relu_to_f32(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.relu(x[tile].to(torch.float32))
+    return out
+
+
+def _relu_to_bf16(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty(x.shape, dtype=torch.bfloat16, device=x.device)
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.relu(x[tile].to(torch.float32)).to(torch.bfloat16)
+    return out
+
+
+@pytest.mark.parametrize(
+    ("dtype", "out_dtype"),
+    [(F32, F32), (BF16, F32), (F32, BF16)],
+    ids=["f32", "bf16-to-f32", "f32-to-bf16"],
+)
+def test_one_row_elementwise_tiles(dtype: torch.dtype, out_dtype: torch.dtype) -> None:
+    """One-row tiles (``ELEMENTWISE_BLOCKS``) of other element types: 1D
+    gathers and scatters of 16 bytes of the widest element per work item, the
+    same chunk for the loads and the stores (4: a bf16 load chunk of 8 under
+    f32 stores of 4 would be miscompiled by upstream), columns first."""
+    x = _randn(*_ELEMENTWISE_SHAPE, dtype=dtype) * 3
+    poisoned = _poison_output(x.shape, out_dtype)
+    fn = _relu_to_f32 if out_dtype == F32 else _relu_to_bf16
+    out = _kernel(fn, kb.ELEMENTWISE_BLOCKS)(x)
+    assert out.dtype == out_dtype
+    assert out.data_ptr() == poisoned
+    _check(out, torch.relu(x.float()), 0.0)
+
+
+def _relu_1d(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.relu(x[tile])
+    return out
+
+
+def _relu_2d(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.relu(x[tile])
+    return out
+
+
+def _relu_in_place_2d(x: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(x.shape):
+        x[tile] = torch.relu(x[tile])
+    return x
+
+
+@pytest.mark.parametrize(
+    ("fn", "block_sizes", "shape"),
+    [
+        (_relu_1d, [8192], (16 * 16384,)),
+        (_relu_2d, kb.ELEMENTWISE_BLOCKS, _ELEMENTWISE_SHAPE),
+        (_relu_2d, [128, 256], (256, 512)),
+    ],
+    ids=["1d", "one-row", "2d"],
+)
+def test_misaligned_views_are_passed_aligned(
+    fn: Callable[..., torch.Tensor], block_sizes: list[int], shape: tuple[int, ...]
+) -> None:
+    """A bf16 view 2 bytes past an allocation (``buf[1:]``): the target passes
+    a 64-byte aligned copy (``XpuTarget.buffer_alignment``). Regression: the
+    1D gathers and scatters of 8 elements per work item (vector loads of ABI
+    alignment 16) computed 75 % of the outputs wrong, and the 2D block loads
+    (64-byte aligned base) too."""
+    buf = _randn(math.prod(shape) + 1)
+    x = buf[1:].view(shape)
+    assert x.data_ptr() % 64 == 2
+    _check(_kernel(fn, block_sizes)(x), torch.relu(x), 0.0)
+
+
+def test_misaligned_inout_is_staged_and_copied_back() -> None:
+    """An in-place kernel on a misaligned view: the aligned copy it writes is
+    copied back into the view; the elements around it keep their values."""
+    buf = _randn(math.prod(_ELEMENTWISE_SHAPE) + 2)
+    expected = buf.clone()
+    expected[1:-1] = torch.relu(expected[1:-1])
+    x = buf[1:-1].view(_ELEMENTWISE_SHAPE)
+    _kernel(_relu_in_place_2d, kb.ELEMENTWISE_BLOCKS)(x)
+    _check(buf, expected, 0.0)
 
 
 _MATH_DTYPES = {"bf16": BF16, "f16": F16, "f32": F32}

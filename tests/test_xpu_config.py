@@ -857,10 +857,41 @@ def test_gemm_rejects_elementwise_load_tiles() -> None:
 
 
 @pytest.mark.isolated
-def test_1d_elementwise_parameters_are_inferred_only() -> None:
+def test_1d_elementwise_load_tile() -> None:
+    """A 1D elementwise kernel takes a load tile ``[16 x chunk]`` (the chunk of
+    its loads and stores; inferred: 16 bytes of f32, 4), nothing else."""
     args = [xpu_tensor(1 << 20)]
-    with pytest.raises(XeGPUConfigError, match=r"1D elementwise kernels take no"):
-        _lower(silu_1d, args, [1024], xegpu_load_tiles=[[16, 16]])
+    text = _lower(silu_1d, args, [1024], xegpu_load_tiles=[[32]])
+    layout = "sg_layout = [1], sg_data = [1024], inst_data = [32]"
+    assert _op_layouts(text, "xegpu.load") == {layout}
+    assert _op_layouts(text, "xegpu.store") == {layout}
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("xegpu", "match"),
+    [
+        (
+            {"xegpu_load_tiles": [[16, 16]]},
+            r"load tile of a 1D elementwise kernel is \[n\]",
+        ),
+        (
+            {"xegpu_sg_tiles": [[1, 512]]},
+            r"1D elementwise kernels take only a load tile",
+        ),
+        (
+            {"xegpu_load_tiles": [[128]]},
+            r"load tile \[128\]: this kernel's 1D tiles take",
+        ),
+        ({"xegpu_load_tiles": [[48]]}, r"load tile \[48\]"),
+    ],
+    ids=["2d-load-tile", "sg-tile", "too-wide", "not-16-x-pow2"],
+)
+def test_invalid_1d_elementwise_parameters(
+    xegpu: dict[str, object], match: str
+) -> None:
+    with pytest.raises(XeGPUConfigError, match=match):
+        _lower(silu_1d, [xpu_tensor(1 << 20)], [1024], **xegpu)
 
 
 @pytest.mark.parametrize(

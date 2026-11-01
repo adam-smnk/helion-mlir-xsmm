@@ -237,6 +237,19 @@ class XpuTarget(MLIRTarget):
     config_keys = XEGPU_CONFIG_KEYS
     stop_points = XPU_STOP_POINTS
 
+    buffer_alignment = 64
+    """Tensor data is passed 64-byte aligned (misaligned views, e.g.
+    ``x[1:]``, as aligned copies; ``call_entry``). The kernels need it: a 2D
+    block load or store takes a 64-byte aligned surface base address (Xe2
+    ``uArch/IntelGpuXe2.h``; violated, the access is undefined: wrong data,
+    no error), and the gathers and scatters of several elements per work item
+    of 1D tiles become LLVM vector loads and stores without an alignment, so
+    the vector type's ABI alignment (16 bytes for ``vector<8xbf16>``) is
+    assumed. Measured on the Arc B50 (2026-10-31): a bf16 relu on a view 2
+    bytes off computed 75 % of its outputs wrong in 1D and one-row tiles and
+    also with 2D 128x256 tiles; torch's caching allocator returns aligned
+    blocks, so only views pay for the copy."""
+
     def __init__(self) -> None:
         self._device_index = 0
         """The device the Level Zero runtime launches on (its default: 0)."""

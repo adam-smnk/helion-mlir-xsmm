@@ -135,6 +135,11 @@ class MLIRTarget(abc.ABC):
         :meth:`finish_call`, skips those checks and hooks (default: never)."""
         return False
 
+    buffer_alignment: int = 1
+    """The byte alignment the compiled kernels assume for the data of every
+    tensor argument; ``call_entry`` passes a staged copy of a tensor whose data
+    is not aligned (copied back for inouts). Default: no assumption."""
+
     def prepare_call(self, buffers: Sequence[torch.Tensor]) -> None:
         """Before an entry call: make ``buffers`` ready for the kernel (default:
         nothing to do)."""

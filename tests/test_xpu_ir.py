@@ -504,7 +504,8 @@ def test_elementwise_kernel_lowers_to_xegpu(dtype: torch.dtype) -> None:
         f"#xegpu.layout<{tile}, inst_data = [8, 16]>"
     ]
     assert "known_block_size = array<i32: 128, 1, 1>" in text
-    assert "known_grid_size = array<i32: 128, 16, 1>" in text
+    # Columns first (map_elementwise_grid): 16 column tiles in x, 128 rows.
+    assert "known_grid_size = array<i32: 16, 128, 1>" in text
     _check_xevm(lowered, "relu", 1)
 
 
@@ -535,7 +536,7 @@ def test_elementwise_several_inputs_and_outputs() -> None:
     text, lowered = lower_xpu_stages(two_in_two_out, args)
     assert len(_layouts(text, "xegpu.load_nd")) == 2
     assert len(_layouts(text, "xegpu.store_nd")) == 2
-    assert "known_grid_size = array<i32: 16, 8, 1>" in text
+    assert "known_grid_size = array<i32: 8, 16, 1>" in text
     _check_xevm(lowered, "two_in_two_out", 1)
     assert _bf16_natives(lowered) == []
 
@@ -557,11 +558,41 @@ def test_elementwise_broadcast_row() -> None:
 def test_elementwise_1d_tiles_gather_and_scatter() -> None:
     args = [xpu_tensor(1 << 20)]
     text, lowered = lower_xpu_stages(sigmoid_1d, args)
-    layout = "#xegpu.layout<sg_layout = [2], sg_data = [1024], inst_data = [16]>"
+    # Contiguous f32 elements: 4 (16 bytes) per work item and instruction.
+    layout = "#xegpu.layout<sg_layout = [2], sg_data = [1024], inst_data = [64]>"
     assert _layouts(text, "xegpu.load") == [layout]
     assert _layouts(text, "xegpu.store") == [layout]
     assert "known_block_size = array<i32: 32, 1, 1>" in text
     _check_xevm(lowered, "sigmoid_1d", 1)
+
+
+@_kernel(helion.Config(block_sizes=[1, 64]))
+def add_column_index(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.shape):
+        out[tm, tn] = x[tm, tn] + tn.index.to(torch.float32)[None, :]
+    return out
+
+
+@pytest.mark.isolated
+@pytest.mark.skipif(not bindings_emit_spirv(), reason="needs the SPIR-V target")
+def test_one_row_tile_with_an_index_vector_compiles() -> None:
+    """Regression (review of the chunked 1D tiles), the exact reproducer:
+    ``tn.index`` folds to an arange constant; with 4 elements per work item it
+    became per-work-item ``vector<64xi64>`` constants read with dynamic
+    ``extractelement``, and LLVM's SPIR-V backend crashed (``Index <
+    this->size()``) at ``binary``."""
+    binary = lower_xpu(add_column_index, [xpu_tensor(16, 16384)], "binary")
+    assert "gpu.binary" in binary
+
+
+@pytest.mark.isolated
+def test_one_row_tile_with_an_index_vector_keeps_one_element() -> None:
+    """Only kernels whose vectors are the tiles, their offsets and elementwise
+    math take several elements per work item; ``tn.index``'s arange keeps one."""
+    text = lower_xpu(add_column_index, [xpu_tensor(16, 16384)], "xegpu-wg")
+    layout = "#xegpu.layout<sg_layout = [1], sg_data = [64], inst_data = [16]>"
+    assert set(_layouts(text, "xegpu.load") + _layouts(text, "xegpu.store")) == {layout}
 
 
 @pytest.mark.isolated
@@ -655,7 +686,7 @@ _RANK3 = {
         [(4, 256, 512)],
         torch.bfloat16,
         "xegpu.load_nd",
-        (4, 2, 2),
+        (2, 2, 4),
     ),
     "relu_4d": (
         relu_nd,

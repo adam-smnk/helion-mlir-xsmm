@@ -69,8 +69,9 @@ LOAD_TILES = "xegpu_load_tiles"
 PREFETCH_TILES = "xegpu_prefetch_tiles"
 PREFETCH_DEPTHS = "xegpu_prefetch_depths"
 _ARITY = {SG_TILES: 2, LOAD_TILES: 4, PREFETCH_TILES: 4, PREFETCH_DEPTHS: 2}
-_ELEMENTWISE_ARITY = {LOAD_TILES: 2}
-"""Entries of a different length for elementwise and reduction kernels."""
+_ELEMENTWISE_ARITY = {LOAD_TILES: (2, 1)}
+"""Other entry lengths: ``[m, n]`` load tiles of 2D elementwise and reduction
+kernels, ``[n]`` of 1D elementwise kernels."""
 XEGPU_CONFIG_KEYS = frozenset(_ARITY)
 """The config keys of the XPU target's lowering."""
 _FIELDS = {
@@ -116,8 +117,8 @@ class KernelParams:
 
     def block_load_tile(self) -> tuple[int, ...] | None:
         """The forced load tile of an elementwise or reduction kernel (a
-        2-entry load tile)."""
-        if self.load_tiles is not None and len(self.load_tiles) == 2:
+        2-entry load tile, or a 1-entry one of a 1D elementwise kernel)."""
+        if self.load_tiles is not None and len(self.load_tiles) in (1, 2):
             return self.load_tiles
         return None
 
@@ -153,7 +154,7 @@ def _entry(key: str, index: int, item: object) -> tuple[int, ...] | None:
     if item is None:
         return None
     arity = _ARITY[key]
-    arities = {arity, _ELEMENTWISE_ARITY.get(key, arity)}
+    arities = {arity, *_ELEMENTWISE_ARITY.get(key, ())}
     if (
         not isinstance(item, (list, tuple))
         or len(item) not in arities
@@ -163,7 +164,7 @@ def _entry(key: str, index: int, item: object) -> tuple[int, ...] | None:
         )
     ):
         elementwise = (
-            f" ({_ELEMENTWISE_ARITY[key]} for an elementwise or reduction kernel)"
+            " (2 for an elementwise or reduction kernel, 1 for a 1D elementwise kernel)"
             if key in _ELEMENTWISE_ARITY
             else ""
         )
@@ -273,6 +274,7 @@ class ElementwiseShape:
         self,
         sg_tile: Sequence[int] | None = None,
         load_tile: Sequence[int] | None = None,
+        contiguous: bool = False,
     ) -> ElementwiseLayout:
         """The kernel's XeGPU layout (``ValueError`` if none fits)."""
         if self.wg_tile is None:
@@ -283,6 +285,7 @@ class ElementwiseShape:
             self.store_bits,
             sg_tile=sg_tile,
             load_tile=load_tile,
+            contiguous=contiguous,
         )
 
     def __str__(self) -> str:
@@ -879,8 +882,20 @@ def _check_elementwise(kernel: KernelParams, shape: ElementwiseShape) -> None:
             f"{', '.join(gemm_only)} apply to GEMM kernels only (elementwise kernels "
             "have no K loop to prefetch in)"
         )
-    if kernel.load_tiles is not None and len(kernel.load_tiles) != 2:
-        raise ValueError("the load tile of an elementwise kernel is [m, n]")
-    if shape.wg_tile is not None and len(shape.wg_tile) == 1:
-        raise ValueError("1D elementwise kernels take no parameters (inferred only)")
-    shape.layout(sg_tile=kernel.sg_tile, load_tile=kernel.block_load_tile())
+    one_d = shape.wg_tile is not None and len(shape.wg_tile) == 1
+    if one_d and kernel.sg_tile is not None:
+        raise ValueError(
+            "1D elementwise kernels take only a load tile [16 x chunk] (the "
+            "subgroup tile is inferred)"
+        )
+    if kernel.load_tiles is not None and len(kernel.load_tiles) != (1 if one_d else 2):
+        raise ValueError(
+            "the load tile of a 1D elementwise kernel is [n]"
+            if one_d
+            else "the load tile of an elementwise kernel is [m, n]"
+        )
+    # Whether a 1D kernel's tiles are contiguous shows only in the XeGPU IR:
+    # a chunked tile is checked against that when it is anchored.
+    shape.layout(
+        sg_tile=kernel.sg_tile, load_tile=kernel.block_load_tile(), contiguous=True
+    )

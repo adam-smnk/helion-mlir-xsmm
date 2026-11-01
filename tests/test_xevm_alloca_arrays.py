@@ -10,7 +10,7 @@ import torch
 
 from tests.harness import lower_xpu
 from tests.harness import xpu_tensor
-from tests.kernelbench_xpu import PROBLEMS
+from tests.kernelbench_xpu import RANK3_PROBLEMS
 
 from helion_mlir_backend._compiler.mlir_transforms.xevm_alloca_arrays import (
     alloca_arrays,
@@ -125,12 +125,13 @@ def test_non_xevm_gpu_modules_are_untouched() -> None:
 
 @pytest.mark.isolated
 def test_elementwise_block_read_buffers_are_rewritten() -> None:
-    """19_ReLU at ``xevm``: the 2D block reads' destination allocas (in the
+    """19_ReLU_NCHW (2D 128x256 tiles; 19_ReLU's one-row tiles have no 2D
+    block reads) at ``xevm``: the 2D block reads' destination allocas (in the
     kernel's entry block) are counted allocas; after the rewrite none is left
     and the module verifies."""
-    problem = next(p for p in PROBLEMS if p.name == "19_ReLU")
+    problem = next(p for p in RANK3_PROBLEMS if p.name == "19_ReLU_NCHW")
     text = lower_xpu(
-        problem.kernel, [xpu_tensor(256, 512, dtype=torch.bfloat16)], "xevm"
+        problem.kernel, [xpu_tensor(1, 2, 256, 256, dtype=torch.bfloat16)], "xevm"
     )
     kernel = text[text.index("gpu.module") :]
     assert "intel_sub_group_2d_block_read" in kernel

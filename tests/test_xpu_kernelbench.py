@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from tests.harness import lower_xpu_stages
 from tests.harness import xpu_tensor
 from tests.kernelbench_xpu import ATTENTION_BLOCKS
+from tests.kernelbench_xpu import ELEMENTWISE_BLOCKS
 from tests.kernelbench_xpu import LEVEL2_PROBLEMS
 from tests.kernelbench_xpu import PROBLEMS
 from tests.kernelbench_xpu import RANK3_PROBLEMS
@@ -74,15 +75,29 @@ def _check_matmul(text: str) -> None:
 
 def _check_elementwise(text: str) -> None:
     assert "xegpu.dpas" not in text and "vector.multi_reduction" not in text
+    if "xegpu.load_nd" not in text:
+        _check_elementwise_1d(text)
+        return
     loads = _anchor_layouts(text, "xegpu.load_nd")
     stores = _anchor_layouts(text, "xegpu.store_nd")
     assert len(loads) == len(stores) == 1
-    # Inferred for a 128x256 bf16 tile: 32 subgroups of 32x32, 16x16 block
-    # loads (16 columns, at most 16 elements per work item), 8x16 block stores.
+    # Inferred for a 128x256 bf16 tile (19_ReLU_NCHW): 32 subgroups of 32x32,
+    # 16x16 block loads (16 columns, at most 16 elements per work item), 8x16
+    # block stores.
     tile = "sg_layout = [4, 8], sg_data = [32, 32]"
     assert loads == [f"{tile}, inst_data = [16, 16]"]
     assert stores == [f"{tile}, inst_data = [8, 16]"]
     assert "known_block_size = array<i32: 512, 1, 1>" in text
+
+
+def _check_elementwise_1d(text: str) -> None:
+    # ELEMENTWISE_BLOCKS [1, 8192]: the unit row folds to a 1D tile of 8192
+    # contiguous bf16, 8 subgroups of 1024, gathered and scattered 8 elements
+    # (16 bytes) per work item: inst_data 16 x 8.
+    layout = "sg_layout = [8], sg_data = [1024], inst_data = [128]"
+    assert _anchor_layouts(text, "xegpu.load") == [layout]
+    assert _anchor_layouts(text, "xegpu.store") == [layout]
+    assert "known_block_size = array<i32: 128, 1, 1>" in text
 
 
 def _check_reduction(text: str) -> None:
@@ -187,9 +202,12 @@ def test_kernelbench_problem_lowers_for_xpu(name: str) -> None:
     text, lowered = lower_xpu_stages(problem.kernel, _args(problem))
     _check_launch(text, problem.grid)
     _CHECKS[problem.kind](text)
-    # Every tile is 2D, also of rank-3+ problems (unit leading dims folded).
+    # Every tile is 2D, also of rank-3+ problems (unit leading dims folded);
+    # the one-row elementwise tiles are 1D (gathers and scatters: no tensor
+    # descriptors).
     ranks = {dims.count("x") for dims in _TENSOR_DESC.findall(text)}
-    assert ranks == {2}, ranks
+    one_row = problem.kind == "elementwise" and problem.block_sizes[-2] == 1
+    assert ranks == (set() if one_row else {2}), ranks
     assert "xegpu." not in lowered
     assert "llvm.func spir_funccc" in lowered
     assert re.search(r"gpu\.launch_func <%\w+ : !llvm\.ptr>", lowered)
@@ -280,6 +298,33 @@ def test_gemm_hand_picked_config(name: str) -> None:
     )
     assert reads == pin["block_reads"]
     assert "known_block_size = array<i32: 512, 1, 1>" in text
+
+
+@pytest.mark.isolated
+def test_elementwise_hand_picked_config() -> None:
+    """19_ReLU (as all of 19-32) runs ``ELEMENTWISE_BLOCKS``: one-row tiles of
+    8192 columns, the column tiles first in the grid (48 of them per row, x),
+    and per work item 16-byte loads and stores of 8 bf16 (the 2D tiles they
+    replace stored 32-byte rows of 16 bf16)."""
+    problem = _ALL["19_ReLU"]
+    assert problem.block_sizes == ELEMENTWISE_BLOCKS == [1, 8192]
+    text, lowered = lower_xpu_stages(problem.kernel, _args(problem))
+    _check_launch(text, (48, 4096))
+    _check_elementwise_1d(text)
+    device = lowered[lowered.index("gpu.module") :]
+    assert (
+        len(re.findall(r"llvm\.load %\w+ : !llvm\.ptr<1> -> vector<8xbf16>", device))
+        == 8
+    )
+    assert (
+        len(
+            re.findall(
+                r"llvm\.store %\w+, %\w+ : vector<8xbf16>, !llvm\.ptr<1>", device
+            )
+        )
+        == 8
+    )
+    assert "intel_sub_group_2d_block" not in device
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])

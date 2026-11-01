@@ -19,11 +19,11 @@ chosen per shape:
   (9_Tall_skinny; the K loop must stay, DPAS K is 16). Transposed operands
   (16-18: A stored ``[K, M]``, B ``[N, K]``, as the specs give them) are loaded
   as transposed 16x16 tiles.
-- Elementwise (bf16, 4096x393216): ``[rows, cols]`` workgroup tiles of 128x256
-  (lighthouse kernel_bench's elementwise default), computed in f32 like
-  PyTorch's bf16 kernels; inferred subgroup tiles of 32x32 (32 subgroups), 16x16
-  bf16 block loads (16 columns, at most 16 elements per work item: wider loads
-  ran wrong or did not compile on hardware), 8x16 block stores.
+- Elementwise (bf16, 4096x393216): one-row workgroup tiles of 8192 columns
+  (:data:`ELEMENTWISE_BLOCKS`, measured on the B50), computed in f32 like
+  PyTorch's bf16 kernels: a 1D tile of contiguous elements, 8 subgroups of
+  1024, gathers and scatters of 8 neighbouring bf16 (16 bytes) per work item;
+  the grid runs the column tiles first.
 - Row reductions (f32): ``[rows, column chunk]`` block sizes, 64 rows per
   workgroup (lighthouse's reduction class: 8 subgroups of 8 rows) and 64-column
   chunks; multi-pass over the chunks like AI-bench's CPU kernels.
@@ -598,7 +598,8 @@ class Problem:
     dtype: torch.dtype
     block_sizes: list[int]
     grid: tuple[int, ...]
-    """The workgroup grid: the output size over the workgroup tile."""
+    """The workgroup grid: the output size over the workgroup tile, grid x
+    first (elementwise kernels: the innermost dim first)."""
     scalars: tuple[float, ...] = ()
     """``hl.constexpr`` arguments after the tensors (a model's scalar inits)."""
     xegpu: dict[str, object] = field(default_factory=dict, compare=False)
@@ -684,8 +685,47 @@ config)``. Keep in sync with ``GEMM_STANDARD`` in AI-bench's
   to ``torch.matmul``.
 """
 
-_ELEMENTWISE_BLOCKS = [128, 256]
+ELEMENTWISE_BLOCKS = [1, 8192]
+"""Elementwise block sizes ``[rows, cols]`` of the bf16 4096x393216 problems
+(19-32) on the Arc B50, measured 2026-10-31. Keep in sync with
+``ELEMENTWISE_BLOCKS`` in AI-bench's
+``backends/utils/helion_mlir_xpu_utils/elementwise.py``.
+
+These kernels move bytes (2 per element read, 2 written) and the bound is the
+DRAM: the read+write copy ceiling of the card is 198 GB/s, torch reaches it.
+What decides the bandwidth:
+
+- The 16-bit store width. A 2D block store of bf16 writes rows of 16
+  elements, 32 bytes: half a 64-byte cache line (XeVM ``blockstore2d`` takes
+  ``tile_width`` 16 for 16-bit elements). With 2D tiles that is the limit
+  (f32 loads + bf16 8x16 stores 167 GB/s; bf16 loads + f32 stores 230; f32
+  both ways 197). A one-row tile folds to a 1D tile of contiguous elements,
+  which the target loads and stores with gathers and scatters of 8 bf16 per
+  work item (``inst_data = [128]``, ``lane_data = [8]``): 16 bytes per work item,
+  256 contiguous bytes per subgroup instruction, as torch's vectorized
+  kernels do. 196 GB/s (99 %); one element per work item gave 165.
+- Rows per workgroup. Rows are 768 KiB apart; a tile of R rows touches R DRAM
+  pages at once (with the column-fastest grid, 2D tiles: 2 rows 172 GB/s, 8
+  rows 149, 128 rows 115). One row is the minimum.
+- The grid order (backend: ``map_elementwise_grid``): column tiles first, so
+  the workgroups resident at a time stream one contiguous range of a row
+  (1-row tiles of 4096 and 16384 columns: 196 GB/s columns-first, 116 and
+  170 rows-first).
+- 8192 columns: 8 subgroups of 1024 elements (64 GRFs of f32 math, a small
+  part of the large register file), 16 KB read and 16 KB written per
+  workgroup, 48 x 4096 = 196608 workgroups. 1024 to 32768 columns measured
+  the same for relu (195.7-196.4 GB/s); 8192 divides the spec's 393216
+  columns and any multiple of 8192 (8192x8192 too).
+- 29_Softplus stays below the ceiling for another reason, a gap of the math
+  lowering: its f32 ``log1p`` becomes a scalar ``__spirv_ocl_log1pf`` call per
+  element, and the kernel runs at about 147 GB/s (at a power-limited clock,
+  for every tile width tried, 1024-16384 columns) where torch's softplus
+  reaches 191 GB/s.
+"""
 _ELEMENTWISE_SHAPE = (4096, 393216)
+_NCHW_BLOCKS = [1, 1, 128, 256]
+"""2D tiles with leading unit dims (the NCHW form of 19, an IR test of 2D
+elementwise tiles): 32 subgroups of 32x32, 16x16 block loads, 8x16 stores."""
 _REDUCTION_BLOCKS = [64, 64]
 ATTENTION_BLOCKS = [1, 1, 128, 64]
 """Flash-attention block sizes ``[batch, head, query rows, K/V rows]``, picked
@@ -749,12 +789,13 @@ def _gemm(
 
 
 def _unary(name: str, fn: Callable[..., object]) -> Problem:
+    # The grid runs the column tiles first (x), the rows second.
     grid = tuple(
         size // block
-        for size, block in zip(_ELEMENTWISE_SHAPE, _ELEMENTWISE_BLOCKS, strict=True)
-    )
+        for size, block in zip(_ELEMENTWISE_SHAPE, ELEMENTWISE_BLOCKS, strict=True)
+    )[::-1]
     shapes = (_ELEMENTWISE_SHAPE,)
-    return Problem(name, "elementwise", fn, shapes, BF16, _ELEMENTWISE_BLOCKS, grid)
+    return Problem(name, "elementwise", fn, shapes, BF16, ELEMENTWISE_BLOCKS, grid)
 
 
 def _rows(name: str, fn: Callable[..., object], shape: tuple[int, int]) -> Problem:
@@ -838,17 +879,17 @@ RANK3_PROBLEMS: tuple[Problem, ...] = (
         (16, 4, 3),
     ),
     # 19_ReLU over an NCHW activation (no 4D level 1 spec): 16x64 images of
-    # 256x256, the 2D kernels' 128x256 tiles. W = 256 is one tile, so the grid
-    # is 3D (a launch has three grid dims; a fourth becomes a loop in each
-    # workgroup).
+    # 256x256, 2D 128x256 tiles (_NCHW_BLOCKS). W = 256 is one tile, so the
+    # grid is 3D (a launch has three grid dims; a fourth becomes a loop in each
+    # workgroup), innermost first: H tiles, C, N.
     Problem(
         "19_ReLU_NCHW",
         "elementwise",
         _relu,
         ((16, 64, 256, 256),),
         BF16,
-        [1, 1, *_ELEMENTWISE_BLOCKS],
-        (16, 64, 2),
+        _NCHW_BLOCKS,
+        (2, 64, 16),
     ),
     # 23_Softmax over the attention scores of 97_ScaledDotProductAttention's
     # mlir-gpu-bench shapes (B=32, H=32, S=512: [32, 32, 512, 512], f32): the 2D

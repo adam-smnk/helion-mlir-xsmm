@@ -105,7 +105,8 @@ class CompiledEntry:
     def call_in_place(self, values: Sequence[object]) -> list[torch.Tensor] | None:
         """Call the entry and return its inout tensors if every argument is a
         tensor that it can take as is -- the static shape and dtype, contiguous
-        strides, no negative or conjugate bit,
+        strides, no negative or conjugate bit, data aligned to
+        :attr:`MLIRTarget.buffer_alignment`,
         :meth:`MLIRTarget.passes_in_place` and a target without call
         hooks (:meth:`MLIRTarget.prepare_call`), no inout sharing memory
         with another argument -- else return ``None`` without calling it: the
@@ -124,6 +125,7 @@ class CompiledEntry:
         ):
             return None
         passes = self.target.passes_in_place
+        alignment = self.target.buffer_alignment
         for value, shape, strides, dtype in zip(
             values, static.shapes, static.strides, static.dtypes, strict=True
         ):
@@ -135,6 +137,7 @@ class CompiledEntry:
                 and not value.is_neg()
                 and not value.is_conj()
                 and passes(value)
+                and (alignment == 1 or value.data_ptr() % alignment == 0)
             ):
                 return None
         pointers = [value.data_ptr() for value in values]  # type: ignore[union-attr]

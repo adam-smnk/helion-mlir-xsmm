@@ -225,6 +225,9 @@ def outline_kernels(entry: str, kernels: Sequence[KernelParams]) -> ir.Module:
     higher-rank buffers move onto a view of the buffer with the tile's rank
     (``rank_reduce_transfers``), where lighthouse's analyses read the matrix the
     tile belongs to (e.g. one batch of a batched matmul's operands).
+    Elementwise kernels' grid loops are mapped innermost dim first
+    (``map_elementwise_grid``: grid x = the column tiles); the others keep
+    ``gpu-map-parallel-loops``' outermost-first order.
     """
     ht.HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
@@ -244,6 +247,7 @@ def outline_kernels(entry: str, kernels: Sequence[KernelParams]) -> ir.Module:
             forall = _only(_kernel_ops(func, "scf.forall", index))
             parallel = loop.loop_forall_to_parallel([anytype], forall)
             transform.annotate(parallel, KERNEL_ATTR, param=_i64_param(index))
+            ht.map_elementwise_grid(parallel)
         func = convert_to_gpu_launch(module, payload_func=func)
         for index, kernel in enumerate(kernels):
             func = _set_threads(func, index, kernel)
