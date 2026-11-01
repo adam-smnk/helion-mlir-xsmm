@@ -21,27 +21,55 @@ import helion_mlir_backend  # noqa: F401
 _TILE_ELEMENTS = 1 << 16
 
 
-def _softmax_kernel(x: Tensor) -> Tensor:
+def _softmax_kernel(x: Tensor, whole: hl.constexpr) -> Tensor:
     """Softmax over the last dim of ``[M, N]`` in passes over column chunks:
     row maxima, sums of exponentials, then the normalized output. Whole-row
     ops instead get the row reduction fused into, and recomputed by, every
-    chunk of the store."""
+    chunk of the store.
+
+    The ``whole`` columns of whole chunks reduce lane by lane across chunks,
+    one reduction per row at the end. A partial last chunk reduces over its
+    own columns, so its padding is masked out (``_mask_to``): lane-wise, the
+    padded lanes' zeros would enter the maximum and add ``exp(-max)`` per
+    lane to the sum."""
     m, n = x.shape
     hl.specialize(n)
     block_n = hl.register_block_size(n)
     out = torch.empty_like(x)
     for tile_m in hl.tile(m):
         top = hl.full([tile_m, block_n], float("-inf"), dtype=torch.float32)
-        for tile_n in hl.tile(n, block_size=block_n):
+        for tile_n in hl.tile(whole, block_size=block_n):
             top = torch.maximum(top, x[tile_m, tile_n].to(torch.float32))
         row_top = torch.amax(top, dim=-1, keepdim=True)
+        if whole < n:
+            for tile_n in hl.tile(whole, n, block_size=block_n):
+                tail = torch.amax(x[tile_m, tile_n].to(torch.float32), -1, True)
+                row_top = torch.maximum(row_top, tail)
         total = hl.zeros([tile_m, block_n], dtype=torch.float32)
-        for tile_n in hl.tile(n, block_size=block_n):
+        for tile_n in hl.tile(whole, block_size=block_n):
             total = total + torch.exp(x[tile_m, tile_n].to(torch.float32) - row_top)
-        inv = 1.0 / total.sum(-1, keepdim=True)
+        row_total = total.sum(-1, keepdim=True)
+        if whole < n:
+            for tile_n in hl.tile(whole, n, block_size=block_n):
+                e = torch.exp(x[tile_m, tile_n].to(torch.float32) - row_top)
+                row_total = row_total + e.sum(-1, keepdim=True)
+        inv = 1.0 / row_total
         for tile_n in hl.tile(n, block_size=block_n):
             e = torch.exp(x[tile_m, tile_n].to(torch.float32) - row_top)
             out[tile_m, tile_n] = (e * inv).to(x.dtype)
+    return out
+
+
+def _softmax_one_kernel(x: Tensor) -> Tensor:
+    """Softmax of one-column rows ``[M, 1]``: ``x - x + 1``, so 1, and NaN
+    where ``x`` is NaN or infinite, as ``exp(x - max) / sum`` gives. The
+    chunked kernel does not compile for one column."""
+    m, n = x.shape
+    hl.specialize(n)
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        v = x[tile_m, :].to(torch.float32)
+        out[tile_m, :] = (v - v + 1.0).to(x.dtype)
     return out
 
 
@@ -102,9 +130,13 @@ def softmax(x: Tensor) -> Tensor:
     if x.dim() != 2:
         raise ValueError(f"softmax() expects a 2-D tensor, got {tuple(x.shape)}")
     m, n = map(int, x.shape)
+    if n == 1:
+        return _kernel(_softmax_one_kernel, [_row_tile(m, 1)])(x.contiguous())
     block_n = min(n, 128)
+    whole = hl.constexpr(n // block_n * block_n)
     # The column block is registered first.
-    return _kernel(_softmax_kernel, [block_n, _row_tile(m, block_n)])(x.contiguous())
+    kernel = _kernel(_softmax_kernel, [block_n, _row_tile(m, block_n)])
+    return kernel(x.contiguous(), whole)
 
 
 def group_norm(

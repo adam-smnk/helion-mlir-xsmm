@@ -133,6 +133,28 @@ def test_small_m_vnni_panel(monkeypatch: pytest.MonkeyPatch) -> None:
     assert mm.vnni_panel(1024, 8192) == 256
 
 
+def test_linear_panel_override() -> None:
+    """``panel`` sets the bf16 weight's VNNI panel width (the output tile's),
+    is part of the cache key, and leaves the result within bf16 rounding of
+    the default panels' (AI-bench L2/66 uses 256 at 128x16384x16384)."""
+    torch.manual_seed(0)
+    layer = torch.nn.Linear(512, 512).to(torch.bfloat16)
+    x = torch.rand(64, 512).to(torch.bfloat16)
+    default, cache = linear(x, layer)
+    wide, wide_cache = linear(x, layer, cache=cache, panel=256)
+    assert wide_cache is not cache
+    assert int(wide_cache.packed_weight.shape[2]) == 256
+    assert int(cache.packed_weight.shape[2]) != 256
+    _, again = linear(x, layer, cache=wide_cache, panel=256)
+    assert again.packed_weight is wide_cache.packed_weight
+    ref = torch.nn.functional.linear(
+        x.float(), layer.weight.float(), layer.bias.float()
+    )
+    for out in (default, wide):
+        error = ((out.float() - ref).abs().max() / ref.abs().max()).item()
+        assert error < 1e-2
+
+
 @pytest.mark.parametrize("post_bias", [False, True])
 def test_linear_affine_reuses_its_call(
     monkeypatch: pytest.MonkeyPatch, post_bias: bool

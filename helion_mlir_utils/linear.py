@@ -72,11 +72,14 @@ def _combine_biases(biases: tuple[Tensor, ...], x: Tensor) -> Tensor | None:
     return bias
 
 
-def _pack_weight(weight: Tensor, rows: int) -> Tensor:
+def _pack_weight(weight: Tensor, rows: int, panel: int | None = None) -> Tensor:
     """``[N, K]`` weight packed for :func:`matmul_prepacked_b` of ``rows`` rows:
-    AMX's VNNI panels for bf16 with an even K, else 32x32 blocks."""
+    AMX's VNNI panels for bf16 with an even K (``panel`` columns wide, else
+    :func:`vnni_panel`'s choice), else 32x32 blocks."""
     if weight.dtype == torch.bfloat16 and not weight.shape[1] % 2:
-        return pack_b_vnni_t(weight, vnni_panel(rows, int(weight.shape[0])))
+        if panel is None:
+            panel = vnni_panel(rows, int(weight.shape[0]))
+        return pack_b_vnni_t(weight, panel)
     return pack_b_blocked_t(weight)
 
 
@@ -86,10 +89,18 @@ def linear(
     epilogue: Callable[[Tensor], Tensor] = identity_epilogue,
     cache: LinearCache | None = None,
     biases: tuple[Tensor, ...] | None = None,
+    panel: int | None = None,
 ) -> tuple[Tensor, LinearCache | None]:
     """Run a linear layer, by default with its constant weight packed once and
     reused until the source parameters, input dtype, or device change;
     ``HELION_MLIR_CACHE_PREPACKED_WEIGHTS=0`` packs it on every call.
+    ``panel`` overrides the columns of a bf16 weight's VNNI panels, which set
+    the output tile's width (a multiple of 32; default :func:`vnni_panel`).
+
+    The cache, and the prepared call in it, is keyed by the parameters' data
+    pointers and ``_version``: in-place ops and ``load_state_dict`` are
+    seen, but a change through ``.data`` (``p.data.mul_(2)``) changes
+    neither, so the packed weight goes stale; pass ``cache=None`` after one.
     """
     if biases is None:
         bias = layer.bias  # (a module attribute lookup: once per call)
@@ -115,13 +126,14 @@ def linear(
         x.dtype,
         x.device,
         x.shape[0],
+        panel,
     )
     if cache is None or cache.key != key:
         weight = layer.weight.detach().to(dtype=x.dtype, device=x.device)
         bias = _combine_biases(source_biases, x)
         cache = LinearCache(
             key,
-            _pack_weight(weight, int(x.shape[0])),
+            _pack_weight(weight, int(x.shape[0]), panel),
             bias,
             int(layer.out_features),
         )
@@ -148,7 +160,8 @@ def linear_affine(
     cache: AffineLinearCache | None = None,
 ) -> tuple[Tensor, AffineLinearCache | None]:
     """Run ``epilogue((linear(x)) * post_scale + post_bias)``; ``post_scale`` and
-    ``post_bias`` are ``[1]`` or ``[out_features]``. Cached like :func:`linear`."""
+    ``post_bias`` are ``[1]`` or ``[out_features]``. Cached like :func:`linear`
+    (changes through ``.data`` are not seen either)."""
     use_cache = cache_prepacked_weights()
     if x.dtype == torch.bfloat16 and not use_cache:
         bias = None if layer.bias is None else layer.bias.to(dtype=x.dtype)
