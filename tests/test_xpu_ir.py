@@ -23,6 +23,7 @@ from tests.harness import lower_xpu
 from tests.harness import lower_xpu_stages
 from tests.harness import xpu_tensor
 from tests.kernelbench_xpu import attention
+from tests.test_nan_minmax import clamp_scaled
 
 from helion_mlir_backend import compile_mlir
 from helion_mlir_backend import generate_mlir
@@ -206,6 +207,62 @@ def sigmoid_1d(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tile in hl.tile(x.size(0)):
         out[tile] = torch.sigmoid(x[tile])
+    return out
+
+
+def tile_mul1(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``a * 1.0`` folds away: a tile copy (regression, see
+    :func:`test_tile_copies_lower`)."""
+    for tile in hl.tile(a.shape):
+        out[tile] = a[tile] * 1.0
+    return out
+
+
+def tile_copy(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(a.shape):
+        out[tile] = a[tile]
+    return out
+
+
+def tile_same_dtype(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(a.shape):
+        out[tile] = a[tile].to(a.dtype)
+    return out
+
+
+def tile_add0(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``a + 0.0`` does not fold (``-0.0 + 0.0`` is ``+0.0``): an elementwise op."""
+    for tile in hl.tile(a.shape):
+        out[tile] = a[tile] + 0.0
+    return out
+
+
+TILE_COPIES = {
+    "mul1": tile_mul1,
+    "copy": tile_copy,
+    "same_dtype": tile_same_dtype,
+    "add0": tile_add0,
+}
+TILE_COPY_SHAPES = {"2d": ((64, 256), [32, 256]), "1d": ((8192,), [256])}
+"""Shape and block sizes: the regression's 64x256 in [32, 256] tiles; 1D tiles."""
+
+
+def tile_copy_kernel(name: str, shape: str) -> helion.Kernel:
+    return helion.kernel(
+        TILE_COPIES[name],
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=TILE_COPY_SHAPES[shape][1]),
+    )
+
+
+@_kernel(helion.Config(block_sizes=[64]))
+def row_amax(x: torch.Tensor) -> torch.Tensor:
+    """Row maxima of whole rows (regression: NaN rows gave the largest number)."""
+    m, _ = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m, :].amax(-1)
     return out
 
 
@@ -624,6 +681,52 @@ def test_row_reduction_results(name: str, layout: str) -> None:
 
 
 @pytest.mark.isolated
+@pytest.mark.parametrize("shape", list(TILE_COPY_SHAPES))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("name", list(TILE_COPIES))
+def test_tile_copies_lower(name: str, dtype: torch.dtype, shape: str) -> None:
+    """Regression (bf16 ``mul1`` 2d: the exact kernel and config): a kernel that
+    stores the tiles it loads, unchanged, had no linalg op left, so lighthouse's
+    cleanup found no payload function ("extract_handle: invalid index 0 for
+    target of length 0"). The copy is a ``linalg.copy`` (materialize_tile_copies)
+    and lowers like an elementwise kernel: one load and one store per tile."""
+    size = TILE_COPY_SHAPES[shape][0]
+    args = [xpu_tensor(*size, dtype=dtype), xpu_tensor(*size, dtype=dtype)]
+    text, lowered = lower_xpu_stages(tile_copy_kernel(name, shape), args)
+    loads = len(_layouts(text, "xegpu.load_nd")) + len(_layouts(text, "xegpu.load"))
+    stores = len(_layouts(text, "xegpu.store_nd")) + len(_layouts(text, "xegpu.store"))
+    assert (loads, stores) == (1, 1), text
+    assert "memref.copy" not in text
+    _check_xevm(lowered, TILE_COPIES[name].__name__, 1)
+
+
+@pytest.mark.isolated
+def test_maximum_reductions_propagate_nan() -> None:
+    """Regression: lighthouse's vectorization turns ``maximumf`` reductions into
+    ``maxnumf`` ones (NaN-ignoring: a row with NaN gave its largest number);
+    they are ``maximumf`` again (``nan-maxima``), lowered to
+    ``llvm.intr.maximum``. Minima were never changed."""
+    text, lowered = lower_xpu_stages(
+        row_amax, [xpu_tensor(256, 512, dtype=torch.bfloat16)]
+    )
+    assert "vector.multi_reduction <maximumf>" in text
+    assert "maxnumf" not in text
+    assert "llvm.intr.maximum" in lowered
+    assert "llvm.intr.maxnum" not in lowered
+
+
+@pytest.mark.isolated
+def test_clamp_uses_ordered_comparisons() -> None:
+    """torch-mlir's clamp selects the bound for a NaN input (``cmpf ult``); the
+    helper compares ordered (``nan_minmax``), down to XeGPU."""
+    args = [xpu_tensor(64, 256, dtype=torch.bfloat16)] * 2
+    text, _ = lower_xpu_stages(clamp_scaled, args)
+    assert re.search(r"arith\.cmpf olt, [^\n]*vector<32x256xf32>", text)
+    assert re.search(r"arith\.cmpf ogt, [^\n]*vector<32x256xf32>", text)
+    assert "cmpf ult" not in text and "cmpf ugt" not in text
+
+
+@pytest.mark.isolated
 def test_cpu_tensors_lower_for_a_named_xpu_target() -> None:
     """Codegen is target-neutral: the IR of CPU (or meta) tensors lowers for the
     XPU when the target is named; running it needs XPU tensors."""
@@ -657,6 +760,7 @@ def test_stage_dumps(monkeypatch: pytest.MonkeyPatch) -> None:
         "prepare",
         "cleanup",
         "vectorized",
+        "nan-maxima",
         "bufferized",
         "host-legalized",
         "gpu-outlining",

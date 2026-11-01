@@ -34,6 +34,7 @@ import torch
 import torch.nn.functional as F
 
 from tests import kernelbench_xpu as kb
+from tests import test_nan_minmax as nan_kernels
 from tests import test_xevm_bf16_extensions as bf16_kernels
 from tests import test_xpu_ir as ir_kernels
 from tests import xpu_math_kernels as mk
@@ -42,6 +43,7 @@ from tests.test_xpu_kernelbench import _reference as level2_reference
 from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler import execution
 from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
+from helion_mlir_backend._compiler.targets import xpu as xpu_target
 from helion_mlir_backend._compiler.targets.xpu import XpuTarget
 
 if TYPE_CHECKING:
@@ -780,6 +782,155 @@ def test_elementwise_kernels() -> None:
     _check(ir_kernels.sigmoid_1d(v), torch.sigmoid(v))
     scaled = ir_kernels.scale_shift(x, 0.5, 3)
     _check(scaled, x * 0.5 + 3)
+
+
+@pytest.mark.parametrize("shape", list(ir_kernels.TILE_COPY_SHAPES))
+@pytest.mark.parametrize("dtype", [BF16, F16, F32], ids=["bf16", "f16", "f32"])
+@pytest.mark.parametrize("name", list(ir_kernels.TILE_COPIES))
+def test_tile_copies(name: str, dtype: torch.dtype, shape: str) -> None:
+    """Kernels storing their tiles unchanged (regression: bf16 ``a * 1.0`` in
+    [32, 256] tiles did not lower), and ``a + 0.0`` next to them, into
+    NaN-poisoned outputs: bit for bit, NaN, infinities and signed zeros
+    included."""
+    size = ir_kernels.TILE_COPY_SHAPES[shape][0]
+    x = _randn(*size, dtype=dtype)
+    flat = x.view(-1)
+    flat[:4] = float("nan")
+    flat[4:6] = float("inf")
+    flat[6:8] = -0.0
+    out = ir_kernels.tile_copy_kernel(name, shape)(x, torch.full_like(x, math.nan))
+    nan_kernels.assert_same_values(out, x + 0.0 if name == "add0" else x)
+
+
+def test_clamp_propagates_nan() -> None:
+    """Regression (exact kernel and config): -1.0 at NaN inputs."""
+    x = nan_kernels.nan_inputs(64, 256, dtype=BF16, device=DEVICE)
+    out = nan_kernels.clamp_scaled(x, torch.full_like(x, math.nan))
+    nan_kernels.assert_same_values(out, torch.clamp(x * 1.5, -1.0, 1.0))
+
+
+@pytest.mark.parametrize("dtype", [BF16, F32], ids=["bf16", "f32"])
+def test_clamp_family_propagates_nan(dtype: torch.dtype) -> None:
+    x = nan_kernels.nan_inputs(64, 512, dtype=dtype, device=DEVICE)
+    outs = nan_kernels.clamp_family(x)
+    for out, ref in zip(outs, nan_kernels.clamp_family_reference(x), strict=True):
+        nan_kernels.assert_same_values(out, ref)
+
+
+@pytest.mark.parametrize("dtype", [BF16, F32], ids=["bf16", "f32"])
+def test_binary_minmax_propagates_nan(dtype: torch.dtype) -> None:
+    x = nan_kernels.nan_inputs(64, 512, dtype=dtype, device=DEVICE)
+    y = nan_kernels.nan_inputs(64, 512, dtype=dtype, device=DEVICE, seed=1)
+    y[0, :16] = 1.0  # NaN in x only (row 0), in y only (row 3)
+    y[3, :16] = float("nan")
+    outs = nan_kernels.binary_minmax(x, y)
+    for out, ref in zip(outs, nan_kernels.binary_minmax_reference(x, y), strict=True):
+        nan_kernels.assert_same_values(out, ref)
+
+
+@pytest.mark.parametrize("dtype", [BF16, F16, F32], ids=["bf16", "f16", "f32"])
+def test_row_maxima_propagate_nan(dtype: torch.dtype) -> None:
+    """Regression: a bf16 row ``amax`` ([64] tiles) of a row with NaN gave the
+    row's largest number (lighthouse's ``maxnumf`` reductions). Rows with NaN
+    first, inside and last, an all ``-inf`` row and one with ``inf``; also the
+    tiled running maximum (``torch.maximum`` in a loop, then ``amax``)."""
+    x = _randn(256, 512, dtype=dtype)
+    x[0, :16] = float("nan")
+    x[1, 3] = float("nan")
+    x[2, 511] = float("nan")
+    x[3] = -float("inf")
+    x[4, 7] = float("inf")
+    nan_kernels.assert_same_values(ir_kernels.row_amax(x), x.amax(-1))
+    nan_kernels.assert_same_values(ir_kernels.row_maxima(x), x.amax(-1, keepdim=True))
+
+
+def test_attention_row_maxima_after_other_kernels() -> None:
+    """Regression: 97's flash attention (its config, B=H=2) with lighthouse's
+    ``maxnumf`` row maxima gave rows of inf/NaN (row 4 of every 16) in calls
+    right after some torch kernels (here: ``_check``'s reductions). IGC's vector
+    min/max (see ``IGC_OPTIONS``) read their stale registers, so this needs those
+    kernels to leave a huge value there; ``test_xpu_igc_workarounds`` has
+    deterministic ones."""
+    problem = next(p for p in kb.RANK3_PROBLEMS if p.name.startswith("97"))
+    kernel = _kernel(problem.fn, problem.block_sizes)
+    batch, heads, seq, dim = 2, 2, 512, 64
+    generator = torch.Generator().manual_seed(0)
+    for big in (30.0, 60.0, 90.0) * 2:
+        q = torch.ones(batch, heads, seq, dim, dtype=BF16, device=DEVICE)
+        k = (torch.randn(batch, heads, seq, dim, generator=generator) * 0.1).to(BF16)
+        v = torch.randn(batch, heads, seq, dim, generator=generator).to(BF16)
+        for t in range(seq // 64):
+            k[:, :, t * 64 + (t * 7) % 64, :] = big / dim
+        k, v = k.to(DEVICE), v.to(DEVICE)
+        out = kernel(q, k, v)
+        ref = F.scaled_dot_product_attention(q.float(), k.float(), v.float())
+        _check(out, ref, 2**-6)
+        assert torch.equal(kernel(q, k, v), out)
+
+
+def test_device_row_maxima_get_nsz(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The binary's row maxima take the cheap form (``xevm_nsz_minmax``)."""
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")  # lower in-process
+    counts: list[int] = []
+    flag = xpu_target.nsz_minmax
+
+    def record(module: object) -> int:
+        counts.append(flag(module))
+        return counts[-1]
+
+    monkeypatch.setattr(xpu_target, "nsz_minmax", record)
+    x = _randn(256, 512, dtype=F32)
+    nan_kernels.assert_same_values(ir_kernels.row_amax(x), x.amax(-1))
+    assert counts and counts[0] > 0
+
+
+def _nan_rows(*shape: int) -> torch.Tensor:
+    """Normal values; NaN first, inside and last in rows 0-2, a NaN next to
+    an inf in row 3, a row of -inf (row 4) and an inf (row 5)."""
+    x = _randn(*shape, dtype=F32) * 8
+    x[0, 0] = x[1, shape[1] // 2 + 3] = x[2, -1] = float("nan")
+    x[3, 5], x[3, 6] = float("nan"), float("inf")
+    x[4] = -float("inf")
+    x[5, 7] = float("inf")
+    return x
+
+
+def _same_nan_pattern(out: torch.Tensor, ref: torch.Tensor) -> None:
+    assert torch.equal(torch.isnan(out), torch.isnan(ref))
+    finite = torch.isfinite(ref)
+    assert torch.equal(torch.isfinite(out), finite)
+    _check(out[finite], ref[finite])
+
+
+@pytest.mark.parametrize("name", list(kb.ROW_REDUCTIONS))
+def test_row_reductions_propagate_nan(name: str) -> None:
+    """The three-kernel row reductions with NaN and infinities in rows: the
+    same NaN (and non-finite) pattern as torch, the rest as close."""
+    x = _nan_rows(*_ROW_REDUCTION_SHAPE)
+    _same_nan_pattern(kb.row_reduction(name, x), _row_reference(name, x))
+
+
+@pytest.mark.parametrize("name", list(_REDUCTION_REFERENCES))
+def test_reductions_propagate_nan(name: str) -> None:
+    problem = {p.name: p for p in kb.PROBLEMS}[name]
+    x = _nan_rows(*_REDUCTION_SHAPE)
+    _same_nan_pattern(problem.kernel(x), _REDUCTION_REFERENCES[name](x))
+
+
+@pytest.mark.parametrize("dtype", [BF16, F16, F32], ids=["bf16", "f16", "f32"])
+def test_reductions_of_mixed_zeros_give_a_zero(dtype: torch.dtype) -> None:
+    """``nsz`` (``xevm_nsz_minmax``) gives up the sign of a zero over rows of mixed
+    zeros, nothing else: the same values as torch, a NaN row stays NaN."""
+    x = _randn(256, 512, dtype=dtype)
+    x[6] = 0.0
+    x[7] = -0.0
+    x[8, ::2], x[8, 1::2] = 0.0, -0.0
+    x[9, ::2], x[9, 1::2] = -0.0, 0.0
+    x[10, 3] = float("nan")
+    out, ref = ir_kernels.row_amax(x).cpu(), x.amax(-1).cpu()
+    assert torch.equal(torch.isnan(out), torch.isnan(ref))
+    keep = ~torch.isnan(ref)
+    assert torch.equal(out[keep], ref[keep])  # == does not see the zero's sign
 
 
 @pytest.mark.parametrize("dtype", [F32, BF16, F16], ids=["f32", "bf16", "f16"])

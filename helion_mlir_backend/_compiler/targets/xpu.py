@@ -20,9 +20,11 @@ Only the IR stages run without an XPU-capable LLVM build: ``xegpu-wg`` (annotate
 XeGPU) and ``xevm`` (LLVM/XeVM without device binaries). Binaries need the SPIR-V
 target, execution the Level Zero runtime (``libmlir_levelzero_runtime.so``). The
 ``binary`` stop point lowers to ``xevm``, then rewrites the XeVM modules'
-counted allocas (``xevm_alloca_arrays``, a SPIR-V backend workaround) and the
-bf16 extensions that bf16 results are computed from (``xevm_bf16_extensions``,
-an IGC workaround), and emits the binaries: the ``xevm`` stop point's IR precedes
+counted allocas (``xevm_alloca_arrays``, a SPIR-V backend workaround), flags
+minima and maxima (``xevm_nsz_minmax``, cheaper in SPIR-V), keeps IGC from
+saturating clamps to [0, 1] (``xevm_unit_clamps``, an IGC workaround), rewrites
+the bf16 extensions that bf16 results are computed from
+(``xevm_bf16_extensions``, an IGC workaround), and emits the binaries: the ``xevm`` stop point's IR precedes
 those rewrites.
 """
 
@@ -56,6 +58,8 @@ from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
+from ..mlir_transforms.xevm_nsz_minmax import nsz_minmax
+from ..mlir_transforms.xevm_unit_clamps import unit_clamps_without_sat
 from .base import MLIRTarget
 from .xpu_checks import check_xegpu_capabilities
 from .xpu_params import XEGPU_CONFIG_KEYS
@@ -152,10 +156,14 @@ def _stages(
     context = ir.Context.current
     schedules = [
         # "prepare" ran before the capability checks (XpuTarget.lowering).
-        ("cleanup", xegpu.cleanup_schedule()),
+        # The entry by name: lighthouse otherwise finds it by a linalg.generic
+        # or matmul, which a tile copy (a linalg.copy) does not have.
+        ("cleanup", xegpu.cleanup_schedule(entry)),
         # No wg_tiling_schedule: Helion's grid loops are the workgroup tiles.
-        ("vectorized", xegpu.vectorize_schedule()),
-        ("bufferized", xegpu.bufferize_schedule()),
+        ("vectorized", xegpu.vectorize_schedule(entry)),
+        # Undoes lighthouse's maxnumf reductions: see nan_propagating_maxima.
+        ("nan-maxima", xpu_transforms.nan_propagating_maxima()),
+        ("bufferized", xegpu.bufferize_schedule(entry)),
         ("host-legalized", xpu_transforms.legalize_host_ops()),
         # Lighthouse's outline_gpu_func and annotate_layouts schedules, per kernel.
         ("gpu-outlining", xpu_transforms.outline_kernels(entry, kernels, columns)),
@@ -175,11 +183,14 @@ def _stages(
     index = next(i for i, (name, _) in enumerate(stages) if name == "xegpu-wg")
     stages[index] = ("xegpu-wg", _CheckBlockSurfaces(stages[index][1]))
     if stop_at == "binary":
-        # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays
-        # and xevm_bf16_extensions.
+        # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays,
+        # xevm_nsz_minmax, xevm_unit_clamps and xevm_bf16_extensions.
         stages.extend(
             [
                 ("xevm-allocas", _AllocaArrays()),
+                ("xevm-nsz-minmax", _NszMinMax()),
+                # Before the extensions: it looks through them.
+                ("xevm-unit-clamps", _UnitClamps()),
                 ("xevm-bf16-extensions", _Bf16Extensions()),
                 ("binary", _ToBinary()),
             ]
@@ -194,7 +205,7 @@ class _ToBinary(Stage):
     def apply(self, module: ir.Module) -> ir.Module:
         PassManager.parse(
             "builtin.module(gpu-module-to-binary{format=fatbin "
-            f'opts="{xpu_transforms.IGC_OPTIONS}"}})',
+            f"opts={{{xpu_transforms.IGC_OPTIONS}}}}})",
             module.context,
         ).run(module.operation)
         return module
@@ -228,6 +239,24 @@ class _AllocaArrays(Stage):
 
     def apply(self, module: ir.Module) -> ir.Module:
         alloca_arrays(module)
+        return module
+
+
+class _NszMinMax(Stage):
+    """Device minima and maxima without the order of -0 and +0, much cheaper
+    in SPIR-V (:mod:`xevm_nsz_minmax`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        nsz_minmax(module)
+        return module
+
+
+class _UnitClamps(Stage):
+    """Compares with 1 that keep IGC from forming a saturation of a clamp to
+    [0, 1], which gets NaN, -0 and bf16 wrong (:mod:`xevm_unit_clamps`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        unit_clamps_without_sat(module)
         return module
 
 

@@ -26,6 +26,7 @@ from .mark_operand_packs import mark_operand_packs
 from .match_scalar_contractions import match_scalar_contractions
 from .materialize_copies import materialize_copies
 from .materialize_operand_pads import materialize_operand_pads
+from .materialize_tile_copies import materialize_tile_copies
 from .move_offsets_to_subview import move_offsets_to_subview
 from .normalize_amx_contractions import normalize_amx_contractions
 from .outer_transpose_tile import outer_transpose_tile
@@ -83,6 +84,7 @@ __all__ = [
     "match_scalar_contractions",
     "materialize_copies",
     "materialize_operand_pads",
+    "materialize_tile_copies",
     "move_offsets_to_subview",
     "normalize_amx_contractions",
     "outer_transpose_tile",

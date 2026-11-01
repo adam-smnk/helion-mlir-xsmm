@@ -21,6 +21,8 @@ import torch.fx
 from torch.fx.passes.shape_prop import TensorMetadata
 
 from ..support import UnsupportedOperationError
+from .nan_minmax import NAN_PROPAGATING_OPS
+from .nan_minmax import propagate_nan
 from .samples import substitute
 
 if TYPE_CHECKING:
@@ -70,14 +72,17 @@ class HelperCache:
 
     def lower(self, requests: list[tuple[HelperRequest, torch.fx.Node]]) -> None:
         """Lower ``requests`` (with the node each came from) into the cache."""
+        batch = [request for request, _ in requests]
         try:
-            self._add(_run_torch_mlir([request for request, _ in requests]))
-            return
+            helpers = _run_torch_mlir(batch)
         except Exception:
             pass
+        else:
+            self._add(helpers, batch)
+            return
         for request, node in requests:
             try:
-                self._add(_run_torch_mlir([request]))
+                helpers = _run_torch_mlir([request])
             except Exception as error:
                 message = str(error).strip().splitlines()
                 with located(node):
@@ -89,13 +94,18 @@ class HelperCache:
                             f"{message[0] if message else type(error).__name__}"
                         ),
                     ) from error
+            self._add(helpers, [request])
 
-    def _add(self, helpers: ir.Module) -> None:
+    def _add(self, helpers: ir.Module, requests: list[HelperRequest]) -> None:
         self._modules.append(helpers)
         for operation in helpers.body.operations:
             if "sym_name" in operation.attributes:
                 name = ir.StringAttr(operation.attributes["sym_name"]).value
                 self._functions[name] = operation
+        # torch-mlir's minima and maxima drop NaN: see nan_minmax.
+        for request in requests:
+            if request.target.overloadpacket in NAN_PROPAGATING_OPS:
+                propagate_nan(self._functions[request.name])
 
 
 CACHE = HelperCache()
