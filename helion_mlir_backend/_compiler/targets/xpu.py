@@ -53,6 +53,7 @@ from ..mlir.support.errors import UnsupportedTargetError
 from ..mlir_transforms.keep_row_dims import keep_row_dims
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
+from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
 from .base import MLIRTarget
@@ -169,6 +170,10 @@ def _stages(
         (name, s if isinstance(s, Stage) else TransformStage(s, context))
         for name, s in schedules
     ]
+    # The annotated kernels' 2D block surfaces are checked against the
+    # hardware limits (xegpu_block_surfaces), as part of the stage.
+    index = next(i for i, (name, _) in enumerate(stages) if name == "xegpu-wg")
+    stages[index] = ("xegpu-wg", _CheckBlockSurfaces(stages[index][1]))
     if stop_at == "binary":
         # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays
         # and xevm_bf16_extensions.
@@ -201,6 +206,19 @@ class _KeepRowDims(Stage):
 
     def apply(self, module: ir.Module) -> ir.Module:
         keep_row_dims(module)
+        return module
+
+
+class _CheckBlockSurfaces(Stage):
+    """``stage``, then a failure on 2D block descriptors of surfaces beyond the
+    hardware limits (silently wrong rows, :mod:`xegpu_block_surfaces`)."""
+
+    def __init__(self, stage: Stage) -> None:
+        self.stage = stage
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        module = self.stage.apply(module)
+        check_block_surfaces(module)
         return module
 
 

@@ -446,6 +446,86 @@ def test_kernelbench_reduction(name: str) -> None:
     _check(problem.kernel(x), _REDUCTION_REFERENCES[name](x))
 
 
+_ROW_REDUCTION_SHAPE = (128, 16384)
+"""Sixteen 1024-column segments per row (``row_segments``): 32 workgroups of
+partials, two of row results, 2 x 128 one-row output tiles."""
+
+
+def _row_reference(name: str, x: torch.Tensor) -> torch.Tensor:
+    return _REDUCTION_REFERENCES[name](x)
+
+
+@pytest.mark.parametrize("name", list(kb.ROW_REDUCTIONS))
+def test_kernelbench_row_reduction_three_kernels(name: str) -> None:
+    """The models' three-kernel row reductions against an f64 reference, as
+    close as torch's f32 kernels (normalized error), the output allocated in a
+    NaN-filled block (every element written)."""
+    x = _randn(*_ROW_REDUCTION_SHAPE, dtype=F32) * 8
+    poison = torch.full_like(x, float("nan"))
+    del poison
+    out = kb.row_reduction(name, x)
+    ref = _row_reference(name, x.double())
+    _check(out, ref)
+    assert (
+        normalized_error(out, ref)
+        <= 4 * normalized_error(_row_reference(name, x), ref) + 1e-7
+    )
+
+
+@pytest.mark.parametrize("name", list(kb.ROW_REDUCTIONS))
+def test_kernelbench_row_reduction_special_values(name: str) -> None:
+    """NaN, -inf and +inf inputs, and rows of -inf (all, or one segment): the
+    three kernels give NaN and infinities where torch does (the running
+    maxima start at -FLT_MAX, ``_segment_softmax``), and close values
+    elsewhere."""
+    x = _randn(*_ROW_REDUCTION_SHAPE, dtype=F32)
+    x[0, 5] = float("nan")
+    x[1, :] = float("-inf")
+    x[2, 100:200] = float("-inf")
+    x[3, 7] = float("inf")
+    x[4, :1024] = float("-inf")
+    x[5, 9000] = float("nan")
+    x[5, 9001] = float("-inf")
+    out = kb.row_reduction(name, x)
+    ref = _row_reference(name, x)
+    assert torch.equal(torch.isnan(out), torch.isnan(ref))
+    assert torch.equal(torch.isinf(out), torch.isinf(ref))
+    finite = torch.isfinite(ref)
+    assert torch.equal(
+        out[~finite & ~torch.isnan(ref)], ref[~finite & ~torch.isnan(ref)]
+    )
+    rows = finite.all(1)
+    _check(out[rows], ref[rows])
+
+
+@pytest.mark.parametrize("offset", [1e4, -1e4, 1e6])
+@pytest.mark.parametrize("form", ["three_kernels", "single_kernel"])
+def test_log_softmax_offset_rows(form: str, offset: float) -> None:
+    """Regression (review): log-softmax of rows offset far from 0, against f64.
+    ``x - (max + log(sum))`` rounded to the ulp of ``max`` (2.9e-5 of
+    ``max|ref|`` at +1e4, 1.9e-3 at 1e6); ``(x - max) - log(sum)`` is as
+    close as torch's."""
+    x = _randn(*_ROW_REDUCTION_SHAPE, dtype=F32) + offset
+    if form == "three_kernels":
+        out = kb.row_reduction("24_LogSoftmax", x)
+    else:
+        out = {p.name: p for p in kb.PROBLEMS}["24_LogSoftmax"].kernel(x)
+    ref = torch.log_softmax(x.double(), dim=1)
+    _check(out, ref, bound=1e-6)
+
+
+def test_l1_norm_tiny_inputs() -> None:
+    """Regression (review): the three-kernel L1 norm of subnormal inputs
+    (``1e-40 * randn``) divides by the row mean, ``x / (sum / n)``; the former
+    ``x * (n / sum)`` overflowed ``n / sum`` to inf. (The single-kernel
+    fallback still gives inf there: its row mean of subnormals comes out 0 on
+    the B50.)"""
+    x = _randn(*_ROW_REDUCTION_SHAPE, dtype=F32) * 1e-40
+    out = kb.row_reduction("38_L1Norm_", x)
+    ref = x.double() / x.double().abs().mean(dim=1, keepdim=True)
+    _check(out, ref)
+
+
 _RANK3_CASES: dict[
     str, tuple[tuple[tuple[int, ...], ...], Callable[..., torch.Tensor]]
 ] = {

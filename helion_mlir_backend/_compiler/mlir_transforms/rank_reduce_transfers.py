@@ -142,7 +142,8 @@ def _rank_reduce(op: ir.Operation) -> bool:
     vector = op.results[0] if position == 0 else operands[0]
     vector_rank = ir.VectorType(vector.type).rank
     permutation = ir.AffineMapAttr(op.attributes["permutation_map"]).value
-    if rank - vector_rank <= 0:
+    if vector_rank == 0 or rank - vector_rank <= 0:
+        # A 0-D transfer (one element, e.g. a row's scalar) has no matrix view.
         return False
     kept = _kept_dims(permutation, rank, vector_rank)
     if kept is None:

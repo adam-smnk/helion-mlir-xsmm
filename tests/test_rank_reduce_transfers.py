@@ -101,6 +101,22 @@ func.func @f(%buf: memref<256x32x1024xbf16>, %s: index, %k: index)
     assert "vector.transfer_read %collapse_shape[%c0, %arg2]" in text
 
 
+def test_rank_reduce_transfers_leaves_0d_reads() -> None:
+    """Regression (the row reductions' output kernels, ``x * scale[tile_m, :]``
+    of a ``[M, 1]`` row column on one-row tiles): a 0-D read of one element
+    drops every dim and has no matrix view; it is left alone (it raised an
+    ``IndexError`` building the collapse groups)."""
+    source = """
+func.func @f(%buf: memref<4096x1xf32>, %m: index) -> vector<f32> {
+  %c0 = arith.constant 0 : index
+  %pad = arith.constant 0.0 : f32
+  %r = vector.transfer_read %buf[%m, %c0], %pad : memref<4096x1xf32>, vector<f32>
+  return %r : vector<f32>
+}
+"""
+    assert _apply(source) == _parsed(source)
+
+
 def test_rank_reduce_transfers_leaves_transposing_maps() -> None:
     """A map that drops a dim and transposes the others is left alone."""
     source = """

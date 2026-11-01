@@ -23,6 +23,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.harness import lower_xpu
 from tests.harness import lower_xpu_stages
 from tests.harness import xpu_tensor
 from tests.kernelbench_xpu import ATTENTION_BLOCKS
@@ -32,11 +33,15 @@ from tests.kernelbench_xpu import GEMM_SPLIT_K
 from tests.kernelbench_xpu import LEVEL2_PROBLEMS
 from tests.kernelbench_xpu import PROBLEMS
 from tests.kernelbench_xpu import RANK3_PROBLEMS
+from tests.kernelbench_xpu import ROW_REDUCTIONS
 from tests.kernelbench_xpu import Problem
 from tests.kernelbench_xpu import _matmul
 from tests.kernelbench_xpu import _matmul_split_k
+from tests.kernelbench_xpu import _segment_square_sums
 from tests.kernelbench_xpu import _sum_splits
 from tests.kernelbench_xpu import attention
+from tests.kernelbench_xpu import row_reduction_kernels
+from tests.kernelbench_xpu import row_segments
 from tests.kernelbench_xpu import split_k_views
 
 from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
@@ -405,6 +410,94 @@ def test_sum_splits_lowers() -> None:
     _check_launch(text, (32,))
     assert "memref.collapse_shape" in text
     assert "xegpu." not in lowered
+
+
+_ROW_SHAPES = {
+    "23_Softmax": (4096, 393216),
+    "24_LogSoftmax": (4096, 393216),
+    "38_L1Norm_": (32768, 65536),
+    "39_L2Norm_": (32768, 65536),
+}
+"""The ``mlir-gpu-bench`` shapes of the row reductions."""
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("name", list(ROW_REDUCTIONS))
+def test_row_reduction_three_kernels_lower(name: str) -> None:
+    """The models' three kernels of each row reduction (``ROW_REDUCTIONS``) at
+    the spec shape: partials of 2048-column segments in lighthouse's
+    reduction layout (8x16 block reads over the ``[M * S, 2048]`` view, a
+    workgroup per 64 segments), the row results over ``[M, S]``, and the output
+    on one-row tiles of 8192 columns (1D gathers and scatters, the column
+    tiles first; regression: its ``[M, 1]`` row column, a 0-D read per
+    workgroup, crashed ``rank_reduce_transfers``)."""
+    m, n = _ROW_SHAPES[name]
+    segments = row_segments((m, n))
+    assert segments == n // 2048
+    fns, blocks = row_reduction_kernels(name, (m, n))
+    kernels = [_gemm_kernel(fn, list(b)) for fn, b in zip(fns, blocks, strict=True)]
+    view = xpu_tensor(m * segments, n // segments, dtype=torch.float32)
+    text, lowered = lower_xpu_stages(kernels[0], [view])
+    _check_launch(text, (m * segments // 64,))
+    tile = "sg_layout = [8, 1], sg_data = [8, 64], inst_data = [8, 16]"
+    assert set(_anchor_layouts(text, "xegpu.load_nd")) == {tile}
+    assert "intel_sub_group_2d_block_read_32b_8r16x1c" in lowered
+    assert "xegpu." not in lowered
+    parts = [xpu_tensor(m, segments, dtype=torch.float32)]
+    if "Softmax" in name:
+        parts *= 2
+    extra = [n] if name == "38_L1Norm_" else []
+    text, lowered = lower_xpu_stages(kernels[1], [*parts, *extra])
+    _check_launch(text, (m // 64,))
+    assert "vector.multi_reduction" in text
+    assert "xegpu." not in lowered
+    x = xpu_tensor(m, n, dtype=torch.float32)
+    column = xpu_tensor(m, 1, dtype=torch.float32)
+    columns = [column, column] if "Softmax" in name else [column]
+    text, lowered = lower_xpu_stages(kernels[2], [x, *columns, x])
+    _check_launch(text, (n // 8192, m))
+    layout = "sg_layout = [8], sg_data = [1024], inst_data = [16]"
+    assert _anchor_layouts(text, "xegpu.load") == [layout]
+    assert _anchor_layouts(text, "xegpu.store") == [layout]
+    device = lowered[lowered.index("gpu.module") :]
+    assert "intel_sub_group_2d_block" not in device
+    assert "xegpu." not in lowered
+
+
+@pytest.mark.parametrize(
+    ("shape", "segments"),
+    [
+        ((4096, 393216), 192),
+        ((32768, 65536), 32),
+        ((64, 4096), 16),  # 256-column segments
+        ((128, 1024), None),  # 8 segments of 128: too few block columns
+        ((16, 65536), 32),  # two workgroups of 8 rows for the row results
+        ((8, 65536), None),  # one: fails to lower, the single kernels instead
+        ((100, 65536), None),  # rows not a multiple of 8
+        ((1 << 21, 32768), None),  # 2^25 or more segment rows
+    ],
+)
+def test_row_segments(shape: tuple[int, int], segments: int | None) -> None:
+    assert row_segments(shape) == segments
+
+
+@pytest.mark.parametrize(
+    ("rows", "fails"),
+    [(1 << 24, False), (25165824, True)],
+    ids=["2^24_rows", "1.5x2^24_rows"],
+)
+def test_block_surface_rows_limit(rows: int, fails: bool) -> None:
+    """Regression: 2D block reads of a surface of more than 2^24 rows wrap the
+    payload's 24-bit height on hardware (B50: a row sum of ``25165824 x 64``
+    f32 read rows from 2^23 on as zeros, no error); such kernels are refused
+    (``xegpu_block_surfaces``) and 2^24 rows still lower."""
+    kernel = _gemm_kernel(_segment_square_sums, [64, 64])
+    args = [xpu_tensor(rows, 64, dtype=torch.float32)]
+    if not fails:
+        lower_xpu(kernel, args)
+        return
+    with pytest.raises(UnsupportedOperationError, match="2D block surface"):
+        lower_xpu(kernel, args)
 
 
 @pytest.mark.isolated

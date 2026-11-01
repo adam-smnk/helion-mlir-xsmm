@@ -27,7 +27,10 @@ chosen per shape:
   the grid runs the column tiles first.
 - Row reductions (f32): ``[rows, column chunk]`` block sizes, 64 rows per
   workgroup (lighthouse's reduction class: 8 subgroups of 8 rows) and 64-column
-  chunks; multi-pass over the chunks like AI-bench's CPU kernels.
+  chunks; multi-pass over the chunks like AI-bench's CPU kernels. The models
+  run them as three kernels instead (:data:`ROW_REDUCTIONS`,
+  :data:`ROW_SEGMENT_COLS`): partials over contiguous row segments, the row
+  results, an elementwise output kernel of one-row tiles.
 - Rank 3 and 4 (batched matmuls, NCHW activations, a softmax over the last dim
   of ``[B, H, S, D]``, attention): block size 1 on the leading (batch, channel,
   head) dims, the 2D kernels' tiles on the last two. The pipeline folds unit
@@ -322,7 +325,9 @@ def _softmax(x: torch.Tensor) -> torch.Tensor:
 
 
 def _log_softmax(x: torch.Tensor) -> torch.Tensor:
-    """Row log-softmax: ``x - max - log(sum(exp(x - max)))``, in three passes."""
+    """Row log-softmax: ``(x - max) - log(sum(exp(x - max)))``, in three
+    passes. ``x - max`` first: ``x - (max + log(sum))`` rounds to the ulp of
+    ``max``."""
     m, n = x.shape
     block_n = hl.register_block_size(n)
     out = torch.empty_like(x)
@@ -334,14 +339,16 @@ def _log_softmax(x: torch.Tensor) -> torch.Tensor:
         total = hl.zeros([tile_m, block_n], dtype=torch.float32)
         for tile_n in hl.tile(n, block_size=block_n):
             total = total + torch.exp(x[tile_m, tile_n] - row_top)
-        shift = row_top + torch.log(total.sum(-1, keepdim=True))
+        log_total = torch.log(total.sum(-1, keepdim=True))
         for tile_n in hl.tile(n, block_size=block_n):
-            out[tile_m, tile_n] = x[tile_m, tile_n] - shift
+            out[tile_m, tile_n] = (x[tile_m, tile_n] - row_top) - log_total
     return out
 
 
 def _l1_norm(x: torch.Tensor) -> torch.Tensor:
-    """``x / mean(|x|, dim=1, keepdim=True)`` (KernelBench 38), in two passes."""
+    """``x / mean(|x|, dim=1, keepdim=True)`` (KernelBench 38), in two passes.
+    Subnormal inputs (``1e-40 * randn``) give inf: the row mean comes out 0
+    on the B50 (the three kernels compute it)."""
     m, n = x.shape
     block_n = hl.register_block_size(n)
     out = torch.empty_like(x)
@@ -349,9 +356,9 @@ def _l1_norm(x: torch.Tensor) -> torch.Tensor:
         acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
         for tile_n in hl.tile(n, block_size=block_n):
             acc = acc + torch.abs(x[tile_m, tile_n])
-        inv = n / acc.sum(-1, keepdim=True)
+        mean = acc.sum(-1, keepdim=True) / n
         for tile_n in hl.tile(n, block_size=block_n):
-            out[tile_m, tile_n] = x[tile_m, tile_n] * inv
+            out[tile_m, tile_n] = x[tile_m, tile_n] / mean
     return out
 
 
@@ -369,6 +376,280 @@ def _l2_norm(x: torch.Tensor) -> torch.Tensor:
         for tile_n in hl.tile(n, block_size=block_n):
             out[tile_m, tile_n] = x[tile_m, tile_n] * inv
     return out
+
+
+# --- Row reductions in three kernels (ROW_SEGMENT_COLS) ------------------------
+# 1. Per-segment partials of x.view(M * S, N / S).
+
+
+def _segment_abs_sums(x: torch.Tensor) -> torch.Tensor:
+    """``sum(|x|)`` of each row of ``x`` (a segment), as an f32 column."""
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m, 1], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            acc = acc + torch.abs(x[tile_m, tile_n])
+        out[tile_m, :] = acc.sum(-1, keepdim=True)
+    return out
+
+
+def _segment_square_sums(x: torch.Tensor) -> torch.Tensor:
+    """``sum(x * x)`` of each row of ``x`` (a segment), as an f32 column."""
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m, 1], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            v = x[tile_m, tile_n]
+            acc = acc + v * v
+        out[tile_m, :] = acc.sum(-1, keepdim=True)
+    return out
+
+
+def _segment_softmax(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """The maximum ``t`` of each row of ``x`` (a segment) and its
+    ``sum(exp(x - t))``, as f32 columns, in one pass.
+
+    Each element of the carried tile keeps a running maximum ``top`` and sum
+    ``total`` of ``exp(v - top)`` over its column chunks (an online softmax): a
+    larger ``v`` rescales the sum by ``e = exp(top - v)`` and adds 1, any other
+    adds ``e = exp(v - top)``; ``e = exp(-|v - top|)`` either way, one ``exp``
+    per element. ``top`` starts at -FLT_MAX, not -inf, so ``v - top`` is never
+    ``-inf - -inf``: -inf elements add ``exp(-inf) = 0``, a row of -inf ends
+    with the sum 0 (NaN outputs, as torch's). A NaN makes its sum NaN (the
+    comparison is false), and the row's results NaN. The row's maximum
+    rescales the per-element sums once; the ``where`` (sums are never
+    negative; NaN passes) keeps the product and the sum a reduction rather
+    than a contraction."""
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    tops = torch.empty([m, 1], dtype=torch.float32, device=x.device)
+    sums = torch.empty([m, 1], dtype=torch.float32, device=x.device)
+    for tile_m in hl.tile(m):
+        top = hl.full([tile_m, block_n], -3.4028234663852886e38, dtype=torch.float32)
+        total = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            v = x[tile_m, tile_n]
+            e = torch.exp(-torch.abs(v - top))
+            total = torch.where(v > top, total * e + 1.0, total + e)
+            top = torch.maximum(top, v)
+        row_top = torch.amax(top, dim=-1, keepdim=True)
+        scaled = torch.where(
+            total < 0.0,
+            hl.zeros([tile_m, block_n], dtype=torch.float32),
+            total * torch.exp(top - row_top),
+        )
+        tops[tile_m, :] = row_top
+        sums[tile_m, :] = torch.sum(scaled, dim=-1, keepdim=True)
+    return tops, sums
+
+
+# 2. Row results from the [M, S] partials.
+
+
+def _means(parts: torch.Tensor, n: hl.constexpr) -> torch.Tensor:
+    """``sum / n`` of each row of the partial sums ``parts`` (the output
+    divides by it: ``n / sum`` overflows for tiny inputs, e.g. ``1e-40 *
+    randn``)."""
+    m, s = parts.shape
+    block_s = hl.register_block_size(s)
+    out = torch.empty([m, 1], dtype=torch.float32, device=parts.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_s], dtype=torch.float32)
+        for tile_s in hl.tile(s, block_size=block_s):
+            acc = acc + parts[tile_m, tile_s]
+        out[tile_m, :] = acc.sum(-1, keepdim=True) / n
+    return out
+
+
+def _inverse_norms(parts: torch.Tensor) -> torch.Tensor:
+    """``rsqrt(sum)`` of each row of the partial sums of squares ``parts``."""
+    m, s = parts.shape
+    block_s = hl.register_block_size(s)
+    out = torch.empty([m, 1], dtype=torch.float32, device=parts.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_s], dtype=torch.float32)
+        for tile_s in hl.tile(s, block_size=block_s):
+            acc = acc + parts[tile_m, tile_s]
+        out[tile_m, :] = torch.rsqrt(acc.sum(-1, keepdim=True))
+    return out
+
+
+def _softmax_rows(
+    tops: torch.Tensor, sums: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The row maximum ``t`` and ``1 / sum(sums * exp(tops - t))`` of segment
+    maxima and sums ``[M, S]`` (see :func:`_segment_softmax`)."""
+    m, s = tops.shape
+    block_s = hl.register_block_size(s)
+    row_tops = torch.empty([m, 1], dtype=torch.float32, device=tops.device)
+    inverses = torch.empty([m, 1], dtype=torch.float32, device=tops.device)
+    for tile_m in hl.tile(m):
+        top = hl.full([tile_m, block_s], float("-inf"), dtype=torch.float32)
+        for tile_s in hl.tile(s, block_size=block_s):
+            top = torch.maximum(top, tops[tile_m, tile_s])
+        row_top = torch.amax(top, dim=-1, keepdim=True)
+        total = hl.zeros([tile_m, block_s], dtype=torch.float32)
+        for tile_s in hl.tile(s, block_size=block_s):
+            part = sums[tile_m, tile_s]
+            total = total + torch.where(
+                part < 0.0,
+                hl.zeros([tile_m, block_s], dtype=torch.float32),
+                part * torch.exp(tops[tile_m, tile_s] - row_top),
+            )
+        row_tops[tile_m, :] = row_top
+        inverses[tile_m, :] = 1.0 / total.sum(-1, keepdim=True)
+    return row_tops, inverses
+
+
+def _log_softmax_rows(
+    tops: torch.Tensor, sums: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The row maximum ``t`` and ``log(sum(sums * exp(tops - t)))`` of
+    segment maxima and sums ``[M, S]``, two columns: the output subtracts them
+    one at a time (:func:`_log_softmax_out`)."""
+    m, s = tops.shape
+    block_s = hl.register_block_size(s)
+    row_tops = torch.empty([m, 1], dtype=torch.float32, device=tops.device)
+    log_sums = torch.empty([m, 1], dtype=torch.float32, device=tops.device)
+    for tile_m in hl.tile(m):
+        top = hl.full([tile_m, block_s], float("-inf"), dtype=torch.float32)
+        for tile_s in hl.tile(s, block_size=block_s):
+            top = torch.maximum(top, tops[tile_m, tile_s])
+        row_top = torch.amax(top, dim=-1, keepdim=True)
+        total = hl.zeros([tile_m, block_s], dtype=torch.float32)
+        for tile_s in hl.tile(s, block_size=block_s):
+            part = sums[tile_m, tile_s]
+            total = total + torch.where(
+                part < 0.0,
+                hl.zeros([tile_m, block_s], dtype=torch.float32),
+                part * torch.exp(tops[tile_m, tile_s] - row_top),
+            )
+        row_tops[tile_m, :] = row_top
+        log_sums[tile_m, :] = torch.log(total.sum(-1, keepdim=True))
+    return row_tops, log_sums
+
+
+# 3. The output: elementwise one-row tiles into a preallocated ``out``.
+
+
+def _scale_rows(
+    x: torch.Tensor, scale: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """``out = x * scale`` of a row scale ``[M, 1]``."""
+    m, n = x.shape
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = x[tile_m, tile_n] * scale[tile_m, :]
+    return out
+
+
+def _divide_rows(
+    x: torch.Tensor, divisor: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """``out = x / divisor`` of a row divisor ``[M, 1]``."""
+    m, n = x.shape
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = x[tile_m, tile_n] / divisor[tile_m, :]
+    return out
+
+
+def _log_softmax_out(
+    x: torch.Tensor, tops: torch.Tensor, log_sums: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """``out = (x - tops) - log_sums`` of row columns ``[M, 1]``: ``x - tops``
+    first, exact near the maximum (``x - (tops + log_sums)`` rounds to the ulp
+    of ``tops``)."""
+    m, n = x.shape
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = (x[tile_m, tile_n] - tops[tile_m, :]) - log_sums[
+            tile_m, :
+        ]
+    return out
+
+
+def _softmax_out(
+    x: torch.Tensor, tops: torch.Tensor, inverses: torch.Tensor, out: torch.Tensor
+) -> torch.Tensor:
+    """``out = exp(x - tops) * inverses`` of row columns ``[M, 1]``."""
+    m, n = x.shape
+    for tile_m, tile_n in hl.tile([m, n]):
+        out[tile_m, tile_n] = (
+            torch.exp(x[tile_m, tile_n] - tops[tile_m, :]) * (inverses[tile_m, :])
+        )
+    return out
+
+
+def row_segments(shape: tuple[int, ...]) -> int | None:
+    """The number of row segments ``S`` of the three-kernel row reductions of
+    an f32 ``[M, N]`` input (the first of :data:`ROW_SEGMENT_COLS` dividing
+    ``N`` into a multiple of 16 segments), or ``None`` (the single kernels):
+    no such segments, ``M`` not a multiple of 8, fewer than 16 rows (a
+    one-workgroup row results kernel fails to lower) or more than 2^24
+    segment rows (a 2D block surface). Mirrors AI-bench's ``row_segments``."""
+    m, n = shape
+    if m % 8 or m < 16:
+        return None
+    for cols in ROW_SEGMENT_COLS:
+        if n % cols == 0 and (n // cols) % 16 == 0 and m * (n // cols) <= 1 << 24:
+            return n // cols
+    return None
+
+
+def rows_block(rows: int) -> int:
+    """Workgroup rows of a reduction over ``rows``: the largest of 64 to 8
+    dividing them into at least two workgroups, or 8."""
+    return next((b for b in (64, 32, 16, 8) if rows % b == 0 and rows // b >= 2), 8)
+
+
+ROW_REDUCTIONS = {
+    "23_Softmax": (_segment_softmax, _softmax_rows, _softmax_out),
+    "24_LogSoftmax": (_segment_softmax, _log_softmax_rows, _log_softmax_out),
+    "38_L1Norm_": (_segment_abs_sums, _means, _divide_rows),
+    "39_L2Norm_": (_segment_square_sums, _inverse_norms, _scale_rows),
+}
+"""The three kernels of each row reduction (partials, row results, output);
+``_means`` takes ``N`` too."""
+
+
+def row_reduction_kernels(
+    name: str, shape: tuple[int, int]
+) -> tuple[tuple[object, ...], tuple[list[int], ...]]:
+    """The three kernels of the row reduction ``name`` (:data:`ROW_REDUCTIONS`)
+    for an f32 input of ``shape`` with segments (:func:`row_segments`), and
+    their block sizes: ``[64, rows]`` over the ``[M * S, N / S]`` view,
+    ``[S block, rows]`` over ``[M, S]``, and the one-row output tiles."""
+    segments = row_segments(shape)
+    assert segments is not None, shape
+    m, n = shape
+    block_s = next(b for b in (64, 32, 16) if segments % b == 0)
+    blocks = (
+        [64, rows_block(m * segments)],
+        [block_s, rows_block(m)],
+        [1, next(b for b in range(min(8192, n), 0, -16) if n % b == 0)],
+    )
+    return ROW_REDUCTIONS[name], blocks
+
+
+def row_reduction(name: str, x: torch.Tensor) -> torch.Tensor:
+    """The row reduction ``name`` of an f32 ``[M, N]`` ``x`` in its three
+    kernels, as AI-bench's models run it: the output allocated first, the
+    partials of the contiguous segment view, the row results, the output."""
+    fns, blocks = row_reduction_kernels(name, tuple(x.shape))
+    partials, rows, apply = (
+        _kernel(list(b))(fn) for fn, b in zip(fns, blocks, strict=True)
+    )
+    m, n = x.shape
+    segments = row_segments(tuple(x.shape))
+    out = torch.empty_like(x)
+    parts = partials(x.view(m * segments, n // segments))
+    parts = parts if isinstance(parts, tuple) else (parts,)
+    extra = (n,) if name == "38_L1Norm_" else ()
+    results = rows(*(p.view(m, segments) for p in parts), *extra)
+    results = results if isinstance(results, tuple) else (results,)
+    return apply(x, *results, out)
 
 
 # --- Rank 3 and 4 ----------------------------------------------------------------
@@ -810,6 +1091,27 @@ _NCHW_BLOCKS = [1, 1, 128, 256]
 """2D tiles with leading unit dims (the NCHW form of 19, an IR test of 2D
 elementwise tiles): 32 subgroups of 32x32, 16x16 block loads, 8x16 stores."""
 _REDUCTION_BLOCKS = [64, 64]
+ROW_SEGMENT_COLS = (2048, 1024, 512, 256, 128)
+"""Row segment lengths of the three-kernel f32 row reductions (23, 24, 38, 39:
+:data:`ROW_REDUCTIONS`, :func:`row_segments`), in order of preference,
+measured on the Arc B50 2026-11-01. Keep in sync with ``ROW_SEGMENT_COLS`` in
+AI-bench's ``backends/utils/helion_mlir_xpu_utils/normalization.py`` (the
+full rationale).
+
+- The single kernels (``PROBLEMS``) store their output in 2D blocks of 8 rows
+  (rows 256 KiB-1.5 MiB apart: ~112 GB/s read+write, as the 2D elementwise
+  tiles). The output kernel takes the one-row tiles of the elementwise
+  problems instead (1D, columns first): 195 GB/s, the copy ceiling.
+- Their reductions read 8-row tiles of rows that far apart: 165-180 GB/s for
+  any tile shape. Contiguous segments of 128-2048 columns (a view
+  ``[M * S, N / S]``, no copy) read at 200-208 GB/s (222 GB/s ceiling).
+- Softmax and log-softmax take the segment maximum and sum in one pass (a
+  running maximum and sum per element, one ``exp`` each): two reads and a
+  write, where the single kernel reads three times.
+
+4096x393216 softmax 196 -> 98 ms (torch 130); 8192x65536 L2 norm 48.5 ->
+33.6 ms (torch 31.7).
+"""
 ATTENTION_BLOCKS = [1, 1, 128, 64]
 """Flash-attention block sizes ``[batch, head, query rows, K/V rows]``, picked
 from the hardware (Xe2, large register file) for a head dim of 64:
