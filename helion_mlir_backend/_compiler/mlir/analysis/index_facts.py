@@ -139,7 +139,11 @@ def index_facts(
             if (factor := constant(position)) is not None:
                 return _scale(args[1 - position], factor)
         return IndexFacts(args[0].multiple * args[1].multiple)
-    if name in ("arith.floordivsi", "arith.divsi") and (divisor := constant(1)):
+    if name == "tensor.dim":
+        return IndexFacts(low=0)
+    if name in ("arith.floordivsi", "arith.divsi", "arith.divui") and (
+        divisor := constant(1)
+    ):
         return _floordiv(args[0], divisor)
     if name == "arith.maxsi":
         return _max(args[0], args[1])

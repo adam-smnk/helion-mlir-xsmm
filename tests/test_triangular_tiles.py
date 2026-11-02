@@ -168,6 +168,293 @@ def test_a_loop_that_spans_nothing_runs_no_tile() -> None:
     )
 
 
+def test_a_loop_over_part_of_its_tile() -> None:
+    """The same kernel with a span, from the same review."""
+    x = torch.randn(32, 8)
+
+    def expected(a: torch.Tensor, _: object) -> torch.Tensor:
+        out = torch.zeros_like(a)
+        for begin in range(0, 32, 8):
+            out[begin : begin + 8] = a[begin : begin + 8].sum(0)
+        return out
+
+    check_kernel(_kernel(zero_span, 8, 4), expected, [x, hl.constexpr(8)])
+
+
+def behind_dynamic(x: torch.Tensor) -> torch.Tensor:
+    dim = hl.specialize(x.size(1))
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, dim], dtype=x.dtype)
+        for tn in hl.tile(tm.begin - 16, tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def three_levels(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(tm.end):
+            for tk in hl.tile(tn.begin - 8, tn.end):
+                acc = acc + x[tk, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def from_tile_id(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(tm.id * 16 - 16, tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def from_tile_id_small(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(tm.id - 1, tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def from_runtime(x: torch.Tensor, n: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(n, tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def from_runtime_scaled(x: torch.Tensor, n: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(n * 8, tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def from_host_offset(x: torch.Tensor, n: int) -> torch.Tensor:
+    offset = n - 8
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(offset, tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def store_from_runtime(x: torch.Tensor, n: int) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tm in hl.tile(x.size(0)):
+        for tn in hl.tile(n, tm.end):
+            out[tn, :] = x[tm, :].sum(0)[None, :]
+    return out
+
+
+def from_clamped_constexpr(x: torch.Tensor, n: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(max(n, 0), tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def from_tile_difference(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(tm.end - tm.begin, tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def from_tile_remainder(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(tm.begin - tm.begin // 16 * 16, tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def from_grid(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for i in hl.grid(-1, 1):
+            for tn in hl.tile(i * 8, tm.end):
+                acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def from_runtime_grid(x: torch.Tensor, n: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for i in hl.grid(n, n + 2):
+            for tn in hl.tile(i * 8, tm.end):
+                acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def from_grid_at_zero(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for i in hl.grid(0, 2):
+            for tn in hl.tile(i * 8, tm.end):
+                acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def top_level_grid(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for i in hl.grid(-2, 2):
+        for tn in hl.tile(i * 8, x.size(0)):
+            out[tn, :] = x[tn, :]
+    return out
+
+
+def _dynamic_kernel(fn: object, *block_sizes: int) -> object:
+    return helion.kernel(
+        fn, backend="mlir", static_shapes=False, config=_config(*block_sizes)
+    )
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("make", "fn", "blocks", "extra"),
+    [
+        (_dynamic_kernel, behind_dynamic, (16, 8), ()),
+        (_kernel, three_levels, (8, 4, 4), ()),
+        (_kernel, from_tile_id, (16, 8), ()),
+        (_kernel, from_tile_id_small, (16, 1), ()),
+        (_kernel, from_runtime, (16, 8), (-8,)),
+        (_kernel, from_runtime_scaled, (16, 8), (-1,)),
+        (_kernel, from_host_offset, (16, 8), (0,)),
+        (_kernel, store_from_runtime, (16, 8), (-8,)),
+        (_kernel, from_grid, (16, 8), ()),
+        (_kernel, from_runtime_grid, (16, 8), (-1,)),
+        (_kernel, top_level_grid, (8,), ()),
+        # A bound the facts cannot tell is in the tensor is refused too: a positive one.
+        (_kernel, from_runtime, (16, 8), (8,)),
+    ],
+    ids=[
+        "dynamic-shapes",
+        "three-levels",
+        "tile-id",
+        "tile-id-small",
+        "runtime",
+        "runtime-scaled",
+        "host-offset",
+        "store",
+        "grid",
+        "runtime-grid",
+        "top-level-grid",
+        "runtime-positive",
+    ],
+)
+def test_a_lower_bound_not_proven_in_the_tensor_is_refused(
+    make: object, fn: object, blocks: tuple[int, ...], extra: tuple[int, ...]
+) -> None:
+    """Regression: wrong rows with no error, and for the store a write before the
+    buffer (``malloc(): invalid size``). The refusal names the alternative."""
+    x = torch.randn(64, 8)
+    with pytest.raises(
+        UnsupportedOperationError, match=r"(?s)before the tensor.*max\("
+    ):
+        make(fn, *blocks)(x, *extra)
+
+
+def test_a_grid_from_zero_still_lowers() -> None:
+    x = torch.randn(64, 8)
+
+    def expected(a: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(a)
+        for begin in range(0, 64, 16):
+            out[begin : begin + 16] = sum(
+                a[i * 8 : begin + 16].sum(0) for i in range(2)
+            )
+        return out
+
+    check_kernel(_kernel(from_grid_at_zero, 16, 8), expected, [x], atol=1e-3)
+
+
+def scalar_runtime_index(x: torch.Tensor, n: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        out[tm, :] = x[n, :][None, :]
+    return out
+
+
+def test_a_runtime_negative_scalar_index_counts_from_the_end() -> None:
+    """From the review: all zeros at ``n = -4`` before positions were checked."""
+    x = torch.randn(64, 8) + 2.0
+    check_kernel(
+        _kernel(scalar_runtime_index, 16),
+        lambda a, _: a[60].expand(64, -1),
+        [x, -4],
+    )
+
+
+@pytest.mark.parametrize("n", [-8, 8, 0])
+def test_a_constexpr_bound_clamped_at_zero_lowers(n: int) -> None:
+    """The refusal's alternative, for a bound that is known when compiling."""
+    x = torch.randn(64, 8)
+    check_kernel(
+        _kernel(from_clamped_constexpr, 16, 8),
+        lambda a, _: _expected(a, 16, lambda _b, end: (min(max(n, 0), end), end)),
+        [x, hl.constexpr(n)],
+    )
+
+
+def from_clamped_runtime(x: torch.Tensor, n: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(max(n, 0), tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+@pytest.mark.isolated
+def test_a_clamped_runtime_bound_is_a_clear_error() -> None:
+    """Pinned: Helion's trace does not pass ``n`` to the kernel when only ``max(n, 0)``
+    uses it, so a runtime bound has no clamped form here."""
+    with pytest.raises(UnsupportedOperationError, match="tile expression"):
+        _kernel(from_clamped_runtime, 16, 8)(torch.randn(64, 8), 8)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    "fn", [from_tile_difference, from_tile_remainder], ids=["difference", "remainder"]
+)
+def test_bounds_the_facts_cannot_prove_stay_refused(fn: object) -> None:
+    """Pinned: these never go negative, but the facts do not see it (a false refusal,
+    accepted: refusing is safe). This test can change if the facts learn more."""
+    with pytest.raises(UnsupportedOperationError, match="before the tensor"):
+        _kernel(fn, 16, 8)(torch.randn(64, 8))
+
+
 def attention_like(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
     """A matmul per key tile up to the row tile's end."""
     out = torch.empty_like(q)
@@ -221,6 +508,23 @@ def test_xpu_refuses_a_lower_bound_that_may_be_negative() -> None:
     args = [xpu_tensor(512, 64, dtype=torch.bfloat16)] * 2
     with pytest.raises(UnsupportedOperationError, match="before the tensor"):
         lower_xpu(_kernel(behind_without_a_clamp, 128, 64), args)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("fn", "blocks"),
+    [(from_grid, (64, 32)), (from_runtime_grid, (64, 32)), (top_level_grid, (32,))],
+    ids=["grid", "runtime-grid", "top-level-grid"],
+)
+def test_xpu_refuses_a_grid_that_may_start_below_zero(
+    fn: object, blocks: tuple[int, ...]
+) -> None:
+    """Regression of the CPU's silent reads before the tensor, on the XPU path."""
+    args: list[object] = [xpu_tensor(256, 64, dtype=torch.float32)]
+    if fn is from_runtime_grid:
+        args.append(-1)
+    with pytest.raises(UnsupportedOperationError, match="before the tensor"):
+        lower_xpu(_kernel(fn, *blocks), args)
 
 
 # --- index_facts ---------------------------------------------------------------------

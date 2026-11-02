@@ -260,17 +260,20 @@ class BuildContext:
 
         def position(candidate: ir.Value) -> IndexFacts | None:
             for block_id, offset in self.block_id_to_iv.items():
-                if offset != candidate or self.geometry.is_grid(block_id):
+                if offset != candidate:
                     continue
+                if self.geometry.is_grid(block_id):
+                    # hl.grid may start below 0.
+                    first = self.block_id_to_bounds[block_id][0]
+                    return IndexFacts(low=self.index_facts(first).low)
                 begin, end = self.block_id_to_bounds[block_id]
                 size = self.geometry.tile_extent(block_id)
                 if not size:
                     return None
+                first = self.index_facts(begin)
                 if not isinstance(begin, int) or not isinstance(end, int):
-                    return (
-                        IndexFacts(size)
-                        if isinstance(begin, int) and not begin % size
-                        else None
+                    return IndexFacts(
+                        size if not first.multiple % size else 1, first.low, None
                     )
                 full = not (end - begin) % size
                 return IndexFacts(

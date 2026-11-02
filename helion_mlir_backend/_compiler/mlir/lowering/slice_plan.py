@@ -376,10 +376,16 @@ def tile_window(
     ):
         end = ctx.block_id_to_bounds[outer][1]
     low = ctx.index_facts(begin).low
-    if low is not None and low + bias < 0:
+    if low is None or low + bias < 0:
+        where = "" if low is None else f" at {low + bias}"
         raise UnsupportedOperationError(
             "tile index",
-            reason=f"the loop may start at {low + bias}, before the tensor start",
+            reason=f"the loop may start{where}, before the tensor start",
+            alternatives=[
+                "a lower bound of tile positions and constants clamped at 0: "
+                "max(tm.begin - 16, 0)",
+                "a runtime bound as hl.constexpr, clamped at 0",
+            ],
         )
     if bias < 0 and not (isinstance(begin, int) and begin + bias >= 0):
         raise UnsupportedOperationError(
