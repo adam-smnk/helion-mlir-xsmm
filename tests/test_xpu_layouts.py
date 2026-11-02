@@ -640,3 +640,57 @@ def test_transposed_load_takes_16_or_32_rows() -> None:
     module = _parse(body, "load_tiles = array<i64: 16, 32, 16, 32>")
     with pytest.raises(xl.LayoutError, match="a transposed load takes"):
         xl.annotate_layouts(module.operation, _func(module))
+
+
+def test_output_bound_kernel_takes_wide_subgroups() -> None:
+    """``M * N >= K * (M + N)``: fewer subgroups, each storing 8 rows of 128 bytes."""
+    body = _gemm_body(64, 128, 32).replace("%c1024 step", "%c32 step")
+    module = _parse(body)
+    kernel = xl.analyze(_func(module))
+    assert xl.output_bound(kernel)
+    axes = xl.axes_of(kernel)
+    assert xl.preferred_grid(axes, xl.legal_grids(axes)) == xl.Grid(8, 2)
+
+
+def test_operand_bound_kernel_takes_all_subgroups() -> None:
+    """Negative of the above: K dominates, so the grid fills the threads."""
+    module = _parse(_gemm_body(64, 128, 32))
+    kernel = xl.analyze(_func(module))
+    assert not xl.output_bound(kernel)
+    axes = xl.axes_of(kernel)
+    assert xl.preferred_grid(axes, xl.legal_grids(axes)).subgroups == 32
+
+
+def test_shared_operand_keeps_attention_loads() -> None:
+    """Rows-only kernel, B shared: A 16x16 and B 32x32 tiles, not the GEMM rule's."""
+    module = _parse(_reduction_after_gemm(256, 64, 32))
+    xl.annotate_layouts(module.operation, _func(module))
+    a_load, b_load = _anchors(module, "xegpu.load_nd")
+    assert "inst_data = [16, 16]" in a_load
+    assert "sg_layout = [1, 1], sg_data = [32, 64], inst_data = [32, 32]" in b_load
+
+
+def test_b_next_to_a_transposed_a_loads_16_columns() -> None:
+    a = _TDESC.format("32x256")
+    b = _TDESC.format("32x256")
+    c = _TDESC.format("256x256")
+    body = f"""
+      %z = arith.constant dense<0.0> : vector<256x256xf32>
+      %da = xegpu.create_nd_tdesc %a : memref<1024x1024xbf16> -> {a}
+      %db = xegpu.create_nd_tdesc %b : memref<1024x1024xbf16> -> {b}
+      %r = scf.for %i = %c0 to %c1024 step %c32 iter_args(%x = %z) -> (vector<256x256xf32>) {{
+        %la = xegpu.load_nd %da[%i, %c0] : {a} -> vector<32x256xbf16>
+        %ta = vector.transpose %la, [1, 0] : vector<32x256xbf16> to vector<256x32xbf16>
+        %lb = xegpu.load_nd %db[%i, %c0] : {b} -> vector<32x256xbf16>
+        %d = xegpu.dpas %ta, %lb, %x : vector<256x32xbf16>, vector<32x256xbf16>, vector<256x256xf32> -> vector<256x256xf32>
+        scf.yield %d : vector<256x256xf32>
+      }}
+      %t = arith.truncf %r : vector<256x256xf32> to vector<256x256xbf16>
+      %dc = xegpu.create_nd_tdesc %c : memref<1024x1024xbf16> -> {c}
+      xegpu.store_nd %t, %dc[%c0, %c0] : vector<256x256xbf16>, {c}
+    """
+    module = _parse(body)
+    xl.annotate_layouts(module.operation, _func(module))
+    a_load, b_load = _anchors(module, "xegpu.load_nd")
+    assert "inst_data = [16, 16], order = [0, 1]" in a_load
+    assert "sg_data = [32, 64], inst_data = [16, 16]" in b_load

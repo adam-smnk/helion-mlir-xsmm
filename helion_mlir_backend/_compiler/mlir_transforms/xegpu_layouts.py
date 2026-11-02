@@ -467,8 +467,37 @@ tile's rows from A's strided rows, and 64 of them stalled the memory pipe on the
 B50 at K = 8192 (SendStall 41 % against 6 %, L1 2)."""
 
 
+OUTPUT_BOUND_SG_TILE = (8, 64)
+"""What :func:`preferred_grid` looks for in a kernel whose output traffic dominates
+(:func:`output_bound`): each subgroup stores 8 rows of 128 bytes, even with fewer
+subgroups. Measured on the B50, 32768x32768x64 at 64x128, device time: 8x64 15395
+us; 8x128 16317; 16x32 17276; 8x32 18042; 16x16 21851."""
+
+
+def output_bound(kernel: KernelIR) -> bool:
+    """Whether the kernel writes at least as many output elements as it reads
+    operand elements, ``M * N >= K * (M + N)``: a DPAS's loop bound for K and the
+    stored buffer's last two dims for M and N, when all are static. The same test
+    picks a GEMM's grid order (``xpu_params.columns_first``)."""
+    if not kernel.dpas or not kernel.stores:
+        return False
+    source = kernel.stores[-1].source.type
+    if not isinstance(source, ir.MemRefType) or source.rank < 2:
+        return False
+    m, n = ir.MemRefType(source).shape[-2:]
+    loop = kernel.dpas[0].parent
+    if loop is None or loop.name != "scf.for":
+        return False
+    bound = _defining(loop.operands[1])
+    if bound is None or bound.name != "arith.constant":
+        return False
+    k = ir.IntegerAttr(bound.attributes["value"]).value
+    return min(m, n, k) > 0 and m * n >= k * (m + n)
+
+
 def preferred_grid(axes: Axes, grids: Sequence[Grid]) -> Grid:
-    """The rule's pick among legal ``grids``: tiles of whole DPAS depth (at least 8
+    """The rule's pick among legal ``grids``. A kernel bound by its output takes
+    :data:`OUTPUT_BOUND_SG_TILE` if legal. Else: tiles of whole DPAS depth (at least 8
     rows, where the kernel has that many); most subgroups whose accumulators leave
     registers for the operands (at most :data:`MAX_SG_ELEMENTS` elements); then the
     row count closest to :data:`TARGET_SG_ROWS`; then the most columns."""
@@ -477,6 +506,10 @@ def preferred_grid(axes: Axes, grids: Sequence[Grid]) -> Grid:
             f"no legal subgroup grid for a {axes.rows}x{axes.cols} tile: columns "
             f"must leave a multiple of {BLOCK_COLS} per subgroup"
         )
+    if output_bound(axes.kernel):
+        for grid in grids:
+            if axes.tile(grid) == OUTPUT_BOUND_SG_TILE:
+                return grid
     fitting = [
         grid
         for grid in grids
@@ -1006,8 +1039,18 @@ def _plan_operand_load(
         order = None
         if forced is not None:
             tile = forced
-        elif hints.source == "rule":
+        elif hints.source == "rule" and not _has_shared_operand(kernel, grid):
             tile = _rule_load(layout.sg_data)
+            if output_bound(kernel):
+                # Operands are little of the traffic, and DPAS-sized reads win: on
+                # L1 7, B50, device time, A, B tiles 8x16, 16x16 14277 us; 8x16,
+                # 16x32 14896; 8x32, 16x32 15388.
+                limit = DPAS_ROWS[0] if index == 0 else DPAS_COLS
+                tile = (min(tile[0], limit), DPAS_COLS)
+            elif any(_operand_order(dpas.operands[0]) for dpas in role.b):
+                # B next to a transposed A: on 16, B50, device time, B 16x16 2608
+                # us, 32x32 2561, 16x32 2833.
+                tile = (min(tile[0], DPAS_COLS), DPAS_COLS)
         elif index == 0:
             tile = _selector_a_load(layout.sg_data)
         else:
@@ -1015,6 +1058,17 @@ def _plan_operand_load(
     _check_block(tile, layout.sg_data, "load tile")
     plan.anchors.append((access.op, "layout", _layout_text(layout, tile, order)))
     _plan_prefetch(kernel, grid, hints, access, layout, index, selected, plan)
+
+
+def _has_shared_operand(kernel: KernelIR, grid: Grid) -> bool:
+    """Whether a DPAS operand is read whole by every subgroup (``[1, 1]``). Those
+    kernels keep lighthouse's attention loads (:func:`_selector_a_load`,
+    :func:`_selector_b_load`): on 97, B50, device time, Q, V tiles 16x16, 32x32 1820
+    us; 16x32, 16x32 1876; 16x32, 32x32 1929; 8x16, 32x32 1896."""
+    return any(
+        value_layout(kernel, grid, dpas.operands[1]).sg_layout == (1, 1)
+        for dpas in kernel.dpas
+    )
 
 
 def _operand_index(access: _Access, kernel: KernelIR) -> int | None:
