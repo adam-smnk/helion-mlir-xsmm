@@ -8,6 +8,7 @@ memref-ABI entry (runtime scalars by value), then finishes the host code and ret
 from __future__ import annotations
 
 import bisect
+from itertools import starmap
 import keyword
 from typing import TYPE_CHECKING
 
@@ -18,6 +19,7 @@ from .. import native
 from ..execution import compile_entry
 from ..targets import resolve_target
 from .analysis.signature import read_order
+from .analysis.signature import scalar_indices
 from .codegen import MLIRModuleBuilder
 from .host_code import build_host_function
 from .support import UnsupportedOperationError
@@ -86,8 +88,18 @@ def compile_kernel(
     mlir_target.configure(module, config)
     with env:
         order = read_order(hf, builder.context.signature, builder.context)
+        indices = scalar_indices(hf, builder.context.signature)
     entry = compile_entry(
-        module, hf.name, target=mlir_target, pipeline=pipeline, read_order=order
+        module,
+        hf.name,
+        target=mlir_target,
+        pipeline=pipeline,
+        read_order=order,
+        scalar_indices=indices,
+        scalar_exprs=tuple(
+            (scalar.expr, scalar.host_expr)
+            for scalar in builder.context.signature.scalars.values()
+        ),
     )
     host_globals = host_function.__globals__
     aliases = host_function._helion_mlir_aliases
@@ -347,6 +359,8 @@ def call_entry(
     (:meth:`CompiledEntry.call_in_place`) skip it: per-call host time is a large
     part of a small kernel's time.
     """
+    if entry.scalar_indices:
+        _check_scalar_indices(entry, values)
     if sizes is None and (inouts := entry.call_in_place(values)) is not None:
         return inouts
     target = entry.target
@@ -367,7 +381,7 @@ def call_entry(
     roles = [arg.role for arg in entry.args if arg.role != "scalar"]
     inouts = [t for t, role in zip(tensors, roles, strict=True) if role == "inout"]
     inout_spans = sorted(_byte_span(t) for t in inouts if t.numel())
-    if any(_spans_overlap(a, b) for a, b in zip(inout_spans, inout_spans[1:])):
+    if any(starmap(_spans_overlap, zip(inout_spans, inout_spans[1:]))):
         raise UnsupportedOperationError(
             "kernel writes two tensors that share memory",
             reason="each written tensor must be its own buffer",
@@ -413,6 +427,27 @@ def call_entry(
         if role == "inout" and copy is not tensor:
             tensor.copy_(copy)
     return inouts
+
+
+def _check_scalar_indices(entry: CompiledEntry, values: list[object]) -> None:
+    """Raise ``IndexError`` for an access at a runtime position out of its tensor's
+    bounds, as torch does: the kernels don't check, and a position out of bounds
+    stores outside the tensor. Negative positions count from the end (the lowering's
+    ``_from_the_end``). A reshaped alias of another argument takes its static size."""
+    by_name = dict(zip(entry.arg_names, values, strict=True))
+    for tensor, dim, size, position, operands in entry.index_checks:
+        if size is None:
+            size = by_name[tensor].shape[dim]
+        at = (
+            by_name[position]
+            if operands is None
+            else position(*map(by_name.get, operands))
+        )
+        if not -size <= at < size:
+            raise IndexError(
+                f"index {at} is out of bounds for dimension {dim} of '{tensor}' "
+                f"with size {size}"
+            )
 
 
 def _reads_earlier_writes(

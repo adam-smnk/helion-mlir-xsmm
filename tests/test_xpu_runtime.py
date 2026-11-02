@@ -2281,3 +2281,20 @@ def test_call_right_after_a_large_copy_to_the_device() -> None:
         out = kernel(y.to("xpu"))
         torch.xpu.synchronize()
         assert torch.equal(out.cpu(), y + 1.0)
+
+
+@pytest.mark.parametrize("pos", [63, -1, -64])
+def test_runtime_position_load_matches_torch(pos: int) -> None:
+    from tests.test_runtime_index_bounds import get_row
+
+    cache = torch.randn(8, 64, 16)
+    out = _kernel(get_row, [1, 16])(cache.to("xpu"), pos)
+    torch.xpu.synchronize()
+    assert torch.equal(out.cpu(), cache[:, pos])
+
+
+def test_runtime_position_out_of_bounds_raises() -> None:
+    from tests.test_runtime_index_bounds import get_row
+
+    with pytest.raises(IndexError, match="out of bounds"):
+        _kernel(get_row, [1, 16])(torch.randn(8, 64, 16).to("xpu"), 64)

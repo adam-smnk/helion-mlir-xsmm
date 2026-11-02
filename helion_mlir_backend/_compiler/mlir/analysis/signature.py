@@ -240,6 +240,102 @@ def _indexed_by(store: torch.fx.Node, block_ids: list[int], ctx: BuildContext) -
     return False
 
 
+@dataclass(frozen=True)
+class ScalarIndex:
+    """A tensor access at a position given by runtime scalars."""
+
+    tensor: str
+    dim: int
+    expr: object
+    """The position, a ``sympy`` expression of the scalars' ``expr``."""
+    size: int | None
+    """The accessed dim's size, if static; a reshaped alias of another tensor has no
+    argument of its own to read it from at the call."""
+
+
+def runtime_index_expr(
+    signature: KernelSignature, node: object, ctx: BuildContext | None = None
+) -> object | None:
+    """The expression of an index node computed from runtime integer scalars alone
+    (their symbols, or a host-computed scalar like ``i = p + 1`` plus a constant), a
+    position the host can check; else ``None``. A tile's position plus a scalar is
+    refused: no check is written for its range."""
+    if not isinstance(node, torch.fx.Node):
+        return None
+    value = node.meta.get("val")
+    if not isinstance(value, torch.SymInt):
+        return None
+    expr = value.node.expr
+    symbols = expr.free_symbols
+    if not symbols:
+        return None
+    known = {s.expr for s in signature.scalars.values() if s.expr is not None}
+    if expr in known or symbols <= known or any((expr - k).is_number for k in known):
+        return expr
+    if known and any(k.free_symbols & symbols for k in known):
+        raise UnsupportedOperationError(
+            "a tensor index adding a tile position and a runtime scalar",
+            reason=f"the position {expr} isn't checked against the tensor's bounds",
+            alternatives=["a runtime scalar alone, or a tile position alone"],
+        )
+    return None
+
+
+def scalar_indices(
+    hf: HostFunction, signature: KernelSignature
+) -> tuple[ScalarIndex, ...]:
+    """Every access at a runtime position, masked or guarded too: a call checks them
+    whether or not they would run."""
+    found: list[ScalarIndex] = []
+
+    def visit(graph_id: int) -> None:
+        for node in hf.device_ir.graphs[graph_id].graph.nodes:
+            name = accessed_tensor(node)
+            if name is not None:
+                indices = (index for index in node.args[1] if index is not None)
+                for dim, index in enumerate(indices):
+                    if (expr := runtime_index_expr(signature, index)) is not None:
+                        access = ScalarIndex(name, dim, expr, _static_size(node, dim))
+                        found.append(access)
+                        _check_alias_size(signature, access)
+            for subgraph_id in subgraph_ids(node):
+                visit(subgraph_id)
+
+    for root_id in hf.device_ir.root_ids:
+        visit(root_id)
+    return tuple(dict.fromkeys(found))
+
+
+def _static_size(node: torch.fx.Node, dim: int) -> int | None:
+    """Dim ``dim`` of the tensor a load or store ``node`` accesses, if static."""
+    value = (
+        node.args[0].meta.get("val")
+        if isinstance(node.args[0], torch.fx.Node)
+        else None
+    )
+    if value is None or dim >= value.dim():
+        return None
+    size = value.shape[dim]
+    if isinstance(size, torch.SymInt):
+        return None if size.node.expr.free_symbols else int(size.node.expr)
+    return int(size)
+
+
+def _check_alias_size(signature: KernelSignature, access: ScalarIndex) -> None:
+    """Refuse a runtime position into a tensor the call can't size: a reshaped alias
+    of another tensor, of a runtime shape, has no argument, and a position out of
+    bounds would store outside it."""
+    if access.size is None and access.tensor not in signature.refs:
+        raise UnsupportedOperationError(
+            "a runtime position into a reshaped view of a runtime shape",
+            reason=(
+                f"'{access.tensor}' shares its elements with another argument and "
+                "the call has no size to check the position against"
+            ),
+            alternatives=["static shapes", "a position on the tensor itself"],
+        )
+
+
 def _program_order(hf: HostFunction, graph_id: int) -> Iterator[torch.fx.Node]:
     """The graph's nodes, with each subgraph's nodes at its loop, if or while node."""
     for node in hf.device_ir.graphs[graph_id].graph.nodes:

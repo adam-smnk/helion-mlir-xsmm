@@ -17,12 +17,14 @@ from collections import OrderedDict
 from contextlib import contextmanager
 import ctypes
 from dataclasses import dataclass
+import functools
 import gc
 import hashlib
 import io
 import logging
 import math
 import multiprocessing
+import operator
 import os
 import pickle
 import signal
@@ -33,6 +35,7 @@ import warnings
 
 import mlir.ir as ir
 from mlir.passmanager import PassManager
+import sympy
 import torch
 
 from helion_mlir_backend._compiler import native
@@ -54,11 +57,14 @@ if TYPE_CHECKING:
     from lighthouse.execution.runner import Runner
 
     from .mlir.analysis.signature import ReadOrder
+    from .mlir.analysis.signature import ScalarIndex
     from helion_mlir_backend._compiler.targets.base import Lowering
 
 log = logging.getLogger(__name__)
 
-_JIT_CACHE: OrderedDict[tuple[str, str, str, bool, str], CompiledEntry] = OrderedDict()
+_JIT_CACHE: OrderedDict[tuple[str, str, str, bool, str, str], CompiledEntry] = (
+    OrderedDict()
+)
 _JIT_CACHE_SIZE = 128
 
 
@@ -92,6 +98,18 @@ class EntryArg:
     dtype: torch.dtype
 
 
+_LAMBDIFY = [
+    {
+        "FloorDiv": operator.floordiv,
+        "CleanDiv": operator.floordiv,
+        "PythonMod": operator.mod,
+        "Mod": operator.mod,
+    },
+    "math",
+]
+"""What a runtime position's ``sympy`` expression may use."""
+
+
 @dataclass(frozen=True)
 class CompiledEntry:
     name: str
@@ -101,12 +119,41 @@ class CompiledEntry:
     """The target compiled for: its checks and hooks apply to every call."""
     read_order: ReadOrder | None = None
     """What its reads see (``None``: no host code known, inputs as at the call)."""
+    scalar_indices: tuple[ScalarIndex, ...] = ()
+    """Its accesses at runtime positions, which each call checks."""
+    scalar_exprs: tuple[tuple[object, str], ...] = ()
+    """Each runtime scalar's ``expr`` and argument name, for those positions."""
 
     def __post_init__(self) -> None:
         # The ctypes callable of the packed C interface, looked up once.
         object.__setattr__(self, "_func", self.runner.engine.lookup(self.name))
         object.__setattr__(self, "_static", _StaticCall.build(self.args))
         object.__setattr__(self, "_native", self._native_call())
+        object.__setattr__(self, "arg_names", tuple(arg.name for arg in self.args))
+        object.__setattr__(self, "index_checks", self._index_checks())
+
+    def _index_checks(self) -> tuple[tuple, ...]:
+        """Per access at a runtime position, without repeats: ``(tensor, dim, size, ...)``
+        with the position as the name of the scalar argument it is, or as a function
+        of the named ones: compiled once, so a call pays no ``sympy``."""
+        names = {expr: name for expr, name in self.scalar_exprs if expr is not None}
+        checks: dict[tuple, tuple] = {}
+        for access in self.scalar_indices:
+            if access.expr in names:
+                position, operands = names[access.expr], None
+            elif access.expr.free_symbols <= names.keys():
+                symbols = sorted(access.expr.free_symbols, key=str)
+                position = sympy.lambdify(symbols, access.expr, modules=_LAMBDIFY)
+                operands = tuple(names[symbol] for symbol in symbols)
+            else:  # a host-computed scalar plus a constant
+                base = next(k for k in names if (access.expr - k).is_number)
+                position = functools.partial(operator.add, int(access.expr - base))
+                operands = (names[base],)
+            key = (access.tensor, access.dim, str(access.expr))
+            checks.setdefault(
+                key, (access.tensor, access.dim, access.size, position, operands)
+            )
+        return tuple(checks.values())
 
     def _native_call(self) -> object | None:
         """The native ``EntryCall`` of a static entry on a target with native
@@ -362,6 +409,8 @@ def compile_entry(
     target: MLIRTarget | None = None,
     pipeline: str | None = None,
     read_order: ReadOrder | None = None,
+    scalar_indices: tuple[ScalarIndex, ...] = (),
+    scalar_exprs: tuple[tuple[object, str], ...] = (),
 ) -> CompiledEntry:
     """Inline, lower and JIT-compile ``entry`` (consumes ``module``) for ``target``
     (default: :func:`resolve_target` for the CPU), or reuse the entry compiled from
@@ -371,6 +420,7 @@ def compile_entry(
     if target is None:
         target = resolve_target()
     pipeline = target.resolve_pipeline(pipeline)
+    indices = (scalar_indices, scalar_exprs)
     debug = DebugOptions.from_env()
     stop_at = target.default_stop_at()
     if (
@@ -381,7 +431,7 @@ def compile_entry(
         or not target.is_full(stop_at)
     ):
         return _compile_entry(
-            module, entry, target, pipeline, stop_at, debug, read_order
+            module, entry, target, pipeline, stop_at, debug, read_order, indices
         )
     # The native switch is part of the key: entries compiled with it on carry
     # native call paths.
@@ -391,12 +441,13 @@ def compile_entry(
         pipeline,
         native.enabled(),
         repr(read_order),
+        repr(indices),
     )
     if (compiled := _JIT_CACHE.get(key)) is not None:
         _JIT_CACHE.move_to_end(key)
         return compiled
     compiled = _compile_entry(
-        module, entry, target, pipeline, stop_at, debug, read_order
+        module, entry, target, pipeline, stop_at, debug, read_order, indices
     )
     _JIT_CACHE[key] = compiled
     if len(_JIT_CACHE) > _JIT_CACHE_SIZE:
@@ -438,6 +489,7 @@ def _compile_entry(
     stop_at: str | None,
     debug: DebugOptions,
     read_order: ReadOrder | None,
+    indices: tuple[tuple[ScalarIndex, ...], tuple[tuple[object, str], ...]],
 ) -> CompiledEntry:
     full = target.is_full(stop_at)
     target.validate_environment(None if full else stop_at)
@@ -447,7 +499,7 @@ def _compile_entry(
         raise LoweringStoppedError(target.name, stop_at)
     with _stage("JIT compilation"):
         runner = target.runner(lowered)
-    return CompiledEntry(entry, args, runner, target, read_order)
+    return CompiledEntry(entry, args, runner, target, read_order, *indices)
 
 
 def _inline_and_lower(

@@ -125,6 +125,7 @@ def plan_slice(
 
     Raises NodeLoweringError if a tile index cannot be resolved to a block id.
     """
+    from ..analysis.signature import runtime_index_expr
     from ..support.errors import NodeLoweringError
     from ..support.index_meta import resolve_index_descriptor
 
@@ -221,6 +222,12 @@ def plan_slice(
         if index is not None:
             # A position computed from runtime sizes, e.g. ``n - 1``.
             offset = ctx.cast_to_index(index)
+            if (
+                ctx.signature is not None
+                and runtime_index_expr(ctx.signature, index_node) is not None
+            ):
+                extent_value = ctx.as_index(ctx.sizes.extent(base, dimension, name))
+                offset = _from_the_end(ctx, offset, extent_value)
             dims.append(DimSlice("scalar", offset, 1, 1, reduces=True))
             continue
         if block_id is None:
@@ -245,9 +252,23 @@ def plan_slice(
     return SlicePlan(dims)
 
 
+def _from_the_end(ctx: BuildContext, offset: ir.Value, extent: ir.Value) -> ir.Value:
+    """A runtime position, counted from the end if negative, as a literal one is and
+    as torch does. The call refuses one out of bounds (``driver.call_entry``)."""
+    negative = arith_d.cmpi(arith_d.CmpIPredicate.slt, offset, ctx.index_const(0))
+    return arith_d.select(negative, arith_d.addi(offset, extent), offset)
+
+
 def _literal_scalar(ctx: BuildContext, index: int, extent: emit.Size) -> DimSlice:
     """A literal integer position; a negative one counts from the end, as in
     Python and Helion's Triton codegen (``x[-1]`` is the last element)."""
+    if isinstance(extent, int) and index >= extent:
+        from ..support.errors import UnsupportedOperationError
+
+        raise UnsupportedOperationError(
+            "subscript",
+            reason=f"index {index} is out of bounds of a dimension of {extent}",
+        )
     if index >= 0:
         offset = ctx.index_const(index)
     elif isinstance(extent, int):
