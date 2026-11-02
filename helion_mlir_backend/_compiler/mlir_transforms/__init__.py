@@ -54,6 +54,7 @@ from .xegpu_elementwise import InferXeGPUElementwiseLayoutOp
 from .xegpu_elementwise import infer_xegpu_elementwise_layout
 from .xegpu_elementwise import map_elementwise_grid
 from .xegpu_elementwise import map_grid_columns_first
+from . import xegpu_layouts
 from .xegpu_reduction import infer_xegpu_reduction_tiles
 from .xegpu_reduction import match_row_result_stores
 
@@ -78,6 +79,7 @@ __all__ = [
     "copy_attention_layouts",
     "infer_xegpu_elementwise_layout",
     "infer_xegpu_reduction_tiles",
+    "xegpu_layouts",
     "legalize_for_llvm",
     "legalize_host_ops",
     "loop_bounds",

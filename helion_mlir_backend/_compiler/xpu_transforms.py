@@ -352,6 +352,11 @@ def _set_threads(func: ir.Value, index: int, kernel: KernelParams) -> ir.Value:
     way its kernel class needs (lighthouse's alternatives, then elementwise
     kernels; scoped to the function: it must be isolated from above); returns
     the new ``func``."""
+    if kernel.layouts is not None:
+        # The layout stage sets the count it derives (xegpu_layouts.set_threads).
+        launch = _only(_kernel_ops(func, "gpu.launch", index))
+        xegpu.set_gpu_launch_threads(launch, threads=[NB_WORKITEMS, 1, 1])
+        return func
     force = list(kernel.sg_tile) if kernel.sg_tile is not None else None
     alternatives = lh_transform.alternatives(
         func, num_alternatives=5, result_types=[func.type]
@@ -405,10 +410,13 @@ def _elementwise_layout(
 def annotate_kernels(entry: str, kernels: Sequence[KernelParams]) -> ir.Module:
     """Schedule: lighthouse's ``annotate_layouts_schedule``, ``gpu.func`` by
     ``gpu.func`` (found by :func:`kernel_module_name`) with each kernel's
-    parameters, plus elementwise kernels (:func:`annotate_elementwise`)."""
+    parameters, plus elementwise kernels (:func:`annotate_elementwise`).
+    Kernels with IR-derived layouts are left to :func:`finish_ir_layouts`."""
     ht.HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
         for index, kernel in enumerate(kernels):
+            if kernel.layouts is not None:
+                continue
             gpu_module = _only(
                 match(
                     named_seq.bodyTarget,
@@ -422,6 +430,69 @@ def annotate_kernels(entry: str, kernels: Sequence[KernelParams]) -> ir.Module:
             _annotate_kernel(gpu_func, kernel)
         transform.yield_()
     return schedule
+
+
+def finish_ir_layouts(
+    entry: str, finished: Sequence[tuple[int, ht.xegpu_layouts.Plan]]
+) -> ir.Module:
+    """Schedule, after :func:`~ht.xegpu_layouts.annotate_layouts` of the kernels
+    ``finished`` (``(kernel index, plan)``): the plans' prefetches (upstream's
+    ``insert_prefetch``, then their anchors, as lighthouse's annotation) and the
+    clean-up; the entry's constants settle after the thread counts changed."""
+    with schedule_boilerplate() as (schedule, named_seq):
+        anytype = transform.AnyOpType.get()
+        for index, plan in finished:
+            gpu_module = _only(
+                match(
+                    named_seq.bodyTarget,
+                    ops={"gpu.module"},
+                    op_attrs={
+                        "sym_name": ir.StringAttr.get(kernel_module_name(entry, index))
+                    },
+                )
+            )
+            gpu_func = _only(match(gpu_module, ops={"gpu.func"}))
+            for number, (_, values) in enumerate(plan.prefetches):
+                load = _only(
+                    match(
+                        gpu_func,
+                        ops={"xegpu.load_nd"},
+                        op_attrs={ht.xegpu_layouts.PREFETCH_ATTR: _i64_attr(number)},
+                    )
+                )
+                depth, *rest = values
+                sg_layout, sg_data, inst_data = rest[:2], rest[2:4], rest[4:6]
+                desc = xegpu.insert_prefetch(load, nb_prefetch=depth)
+                prefetches = transform.get_consumers_of_result(anytype, desc, 0)
+                xegpu.set_anchor_layout(
+                    prefetches,
+                    sg_layout=sg_layout,
+                    sg_data=sg_data,
+                    inst_data=inst_data,
+                )
+            if plan.cleanup:
+                lh_transform.cleanup(gpu_func)
+            if plan.licm:
+                dpas = lh_transform.match_op(gpu_func, "xegpu.dpas")
+                loops = transform.get_parent_op(
+                    anytype, dpas, op_name="scf.for", deduplicate=True
+                )
+                transform.apply_licm(loops)
+                lh_transform.cleanup(gpu_func)
+        entry_func = _only(
+            match(
+                named_seq.bodyTarget,
+                ops={"func.func"},
+                op_attrs={"sym_name": ir.StringAttr.get(entry)},
+            )
+        )
+        lh_transform.cleanup(entry_func)
+        transform.yield_()
+    return schedule
+
+
+def _i64_attr(value: int) -> ir.IntegerAttr:
+    return ir.IntegerAttr.get(ir.IntegerType.get_signless(64), value)
 
 
 def _annotate_kernel(gpu_func: ir.Value, kernel: KernelParams) -> None:

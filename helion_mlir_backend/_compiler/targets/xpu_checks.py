@@ -26,6 +26,8 @@ The gates are conservative, by IR property (not by kernel):
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from mlir import ir
 from mlir.dialects import linalg
 
@@ -37,6 +39,9 @@ from .xpu_params import attention_shape
 from .xpu_params import is_sibling_gemms
 from .xpu_params import kernel_shape
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 _DPAS_OPERANDS = frozenset({"f16", "bf16"})
 _DPAS_ACCUMULATOR = "f32"
 _CPU = "target='cpu' (CPU tensors)"
@@ -45,18 +50,22 @@ _UNIT_LEADING_BLOCKS = (
 )
 
 
-def check_xegpu_capabilities(module: ir.Module, entry: str) -> list[ir.Operation]:
+def check_xegpu_capabilities(
+    module: ir.Module, entry: str, ir_layouts: Sequence[bool] = ()
+) -> list[ir.Operation]:
     """Raise :class:`UnsupportedOperationError` if ``entry`` of the inlined and
     prepared (unit tile dims folded) ``module`` is outside what the XeGPU
     pipeline compiles; returns its grid loops (top-level ``scf.forall``), one
-    GPU kernel each, in program order."""
+    GPU kernel each, in program order. ``ir_layouts[i]``: kernel ``i``'s layouts
+    are derived from its IR, which has no kernel classes: what they cannot lay
+    out is refused there, by IR property."""
     func = _function(module, entry)
     _check_static_arguments(func)
     loops = _grid_loops(func)
-    for loop in loops:
+    for index, loop in enumerate(loops):
         _check_full_tiles(loop)
         _check_tile_ranks(loop)
-        _check_kernel_class(loop)
+        _check_kernel_class(loop, index < len(ir_layouts) and ir_layouts[index])
         check_math(loop)
     return loops
 
@@ -329,7 +338,7 @@ def _element_type(value: ir.Value) -> str:
     return str(value_type)
 
 
-def _check_kernel_class(loop: ir.Operation) -> None:
+def _check_kernel_class(loop: ir.Operation, ir_layouts: bool = False) -> None:
     contractions: list[ir.OpView] = []
     reductions = 0
     for op in _walk(loop):
@@ -341,6 +350,10 @@ def _check_kernel_class(loop: ir.Operation) -> None:
         elif _is_reduction(view):
             _check_reduction(view)
             reductions += 1
+    if ir_layouts:
+        for contraction in contractions:
+            _check_contraction(contraction, loop)
+        return
     if not contractions and not reductions:
         _check_elementwise(loop)
         return

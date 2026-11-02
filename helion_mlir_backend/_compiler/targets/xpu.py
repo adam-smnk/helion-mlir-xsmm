@@ -51,11 +51,13 @@ from ..mlir.support.debug import DebugOptions
 from ..mlir.support.debug import xpu_stop_at
 from ..mlir.support.errors import UnsupportedOperationError
 from ..mlir.support.errors import UnsupportedTargetError
+from ..mlir.support.errors import XeGPUConfigError
 from ..mlir_transforms.keep_row_dims import keep_row_dims
 from ..mlir_transforms.xegpu_attention_loops import copy_attention_layouts
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
 from ..mlir_transforms.row_maxima import restore_nan_propagating_maxima
+from ..mlir_transforms import xegpu_layouts
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
@@ -197,7 +199,14 @@ def _stages(
     # The annotated kernels' 2D block surfaces are checked against the
     # hardware limits (xegpu_block_surfaces), as part of the stage.
     index = next(i for i, (name, _) in enumerate(stages) if name == "xegpu-wg")
-    stages[index] = ("xegpu-wg", _CheckBlockSurfaces(stages[index][1]))
+    stages[index] = (
+        "xegpu-wg",
+        _CheckBlockSurfaces(
+            _IRLayouts(stages[index][1], entry, kernels),
+            # The baseline leaves its DPAS to upstream's propagation on purpose.
+            check_dpas=not any(k.layout_source == "upstream" for k in kernels),
+        ),
+    )
     if stop_at != "xegpu-wg":
         # The reductions as lowered are checked (xevm_lane_reductions).
         index = next(i for i, (name, _) in enumerate(stages) if name == "xevm")
@@ -401,6 +410,102 @@ def _check_dpas_anchored(module: ir.Module) -> None:
         )
 
 
+class _IRLayouts(Stage):
+    """``stage`` (lighthouse's annotation), then the kernels whose layouts are
+    derived from the IR (:mod:`xegpu_layouts`), each with its config as hints on
+    its ``gpu.func``."""
+
+    def __init__(
+        self, stage: Stage, entry: str, kernels: Sequence[KernelParams]
+    ) -> None:
+        self.stage = stage
+        self.entry = entry
+        self.kernels = kernels
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        module = self.stage.apply(module)
+        funcs = {
+            index: _kernel_func(module, xpu_transforms.kernel_module_name(self.entry, index))
+            for index, kernel in enumerate(self.kernels)
+            if kernel.layouts is not None
+        }
+        if not funcs:
+            return module
+        finished: list[tuple[int, xegpu_layouts.Plan]] = []
+        for index, func in funcs.items():
+            kernel = self.kernels[index]
+            func.attributes[xegpu_layouts.HINTS_ATTR] = _layout_hints(kernel)
+            try:
+                plan = xegpu_layouts.annotate_layouts(module.operation, func)
+            except (xegpu_layouts.LayoutError, ValueError) as exc:
+                raise _layout_failure(index, kernel, exc) from exc
+            finished.append((index, plan))
+        stage = TransformStage(
+            xpu_transforms.finish_ir_layouts(self.entry, finished), module.context
+        )
+        module = stage.apply(module)
+        for index in funcs:
+            func = _kernel_func(
+                module, xpu_transforms.kernel_module_name(self.entry, index)
+            )
+            xegpu_layouts.clear_tags(func)
+        problems = xegpu_layouts.check_module(
+            module,
+            [
+                _symbol(
+                    _kernel_func(
+                        module, xpu_transforms.kernel_module_name(self.entry, index)
+                    ).parent.operation
+                )
+                for index in funcs
+                if self.kernels[index].layout_source != "upstream"
+            ],
+        )
+        if problems:
+            raise UnsupportedOperationError(
+                "a kernel without valid XeGPU layouts",
+                reason="; ".join(problems[:6]),
+                alternatives=['xegpu_layouts="lighthouse"', _CPU],
+            )
+        return module
+
+
+def _kernel_func(module: ir.Module, name: str) -> ir.Operation:
+    for op in module.body.operations:
+        if op.operation.name == "gpu.module" and _symbol(op.operation) == name:
+            for nested in op.operation.regions[0].blocks[0].operations:
+                if nested.operation.name == "gpu.func":
+                    return nested.operation
+    raise ValueError(f"no GPU kernel module named '{name}'")
+
+
+def _layout_hints(kernel: KernelParams) -> ir.Attribute:
+    hints: dict[str, ir.Attribute] = {
+        "source": ir.StringAttr.get(kernel.layout_source or "rule")
+    }
+    for key, value in (
+        ("sg_tile", kernel.sg_tile),
+        ("load_tiles", kernel.load_tiles),
+        ("prefetch_tiles", kernel.prefetch_tiles),
+        ("prefetch_depths", kernel.prefetch_depths),
+    ):
+        if value is not None:
+            hints[key] = ir.DenseI64ArrayAttr.get(list(value))
+    return ir.DictAttr.get(hints)
+
+
+def _layout_failure(index: int, kernel: KernelParams, exc: Exception) -> Exception:
+    forced = kernel.layout_forced()
+    if forced:
+        values = ", ".join(f"{key}[{index}]={list(v)}" for key, v in forced.items())
+        return XeGPUConfigError(f"{values}: invalid for GPU kernel {index}: {exc}")
+    return UnsupportedOperationError(
+        f"GPU kernel {index}: no XeGPU layout derived from its IR",
+        reason=str(exc),
+        alternatives=[_CPU],
+    )
+
+
 class _CheckBlockSurfaces(Stage):
     """``stage``, the anchors of an attention kernel's later K/V loops
     (:mod:`xegpu_attention_loops`), then a failure on 2D block descriptors of surfaces
@@ -588,8 +693,10 @@ class XpuTarget(MLIRTarget):
         BackendDriver(module, entry, result_to_args=False, benchmark=False)
         prepare = TransformStage(xpu_transforms.prepare_for_xegpu(), ir.Context.current)
         _apply_stage("prepare", prepare, module, dump)
-        loops = check_xegpu_capabilities(module, entry)
         params = take_params(module)
+        loops = check_xegpu_capabilities(
+            module, entry, [kernel.layouts is not None for kernel in params]
+        )
         shapes = [kernel_shape(loop) for loop in loops]
         check_params(params, shapes)
         i64 = ir.IntegerType.get_signless(64)
