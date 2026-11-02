@@ -593,3 +593,50 @@ def test_layout_warnings_fail_the_lowering() -> None:
     module = ir.Module.parse(_ROW_VECTOR_STORE)
     with pytest.raises(UnsupportedOperationError, match="lane layouts"):
         _LayoutWarningsAreErrors(Warns()).apply(module)
+
+
+def test_rule_load_tiles() -> None:
+    """The rule's operand loads, by subgroup tile: 16 rows of 32 columns where they
+    divide it, smaller otherwise."""
+    assert xl._rule_load((32, 32)) == (16, 32)
+    assert xl._rule_load((32, 64)) == (16, 32)
+    assert xl._rule_load((8, 32)) == (8, 32)
+    assert xl._rule_load((16, 16)) == (16, 16)
+    assert xl._rule_load((4, 16)) == (4, 16)
+
+
+def test_rule_anchors_its_load_tiles() -> None:
+    module = _parse(_gemm_body())
+    xl.annotate_layouts(module.operation, _func(module))
+    a_load, b_load = _anchors(module, "xegpu.load_nd")
+    assert "sg_data = [32, 32], inst_data = [16, 32]" in a_load
+    assert "sg_data = [32, 64], inst_data = [16, 32]" in b_load
+
+
+def test_transposed_load_takes_16_or_32_rows() -> None:
+    """Upstream's table: a transposed block read is 8 pairs wide, 16 or 32 rows."""
+    a = _TDESC.format("256x32")
+    b = _TDESC.format("256x32")
+    c = _TDESC.format("256x256")
+    body = f"""
+      %z = arith.constant dense<0.0> : vector<256x256xf32>
+      %da = xegpu.create_nd_tdesc %a : memref<1024x1024xbf16> -> {a}
+      %db = xegpu.create_nd_tdesc %b : memref<1024x1024xbf16> -> {b}
+      %r = scf.for %i = %c0 to %c1024 step %c32 iter_args(%x = %z) -> (vector<256x256xf32>) {{
+        %la = xegpu.load_nd %da[%c0, %i] : {a} -> vector<256x32xbf16>
+        %lb = xegpu.load_nd %db[%c0, %i] : {b} -> vector<256x32xbf16>
+        %tb = vector.transpose %lb, [1, 0] : vector<256x32xbf16> to vector<32x256xbf16>
+        %d = xegpu.dpas %la, %tb, %x : vector<256x32xbf16>, vector<32x256xbf16>, vector<256x256xf32> -> vector<256x256xf32>
+        scf.yield %d : vector<256x256xf32>
+      }}
+      %t = arith.truncf %r : vector<256x256xf32> to vector<256x256xbf16>
+      %dc = xegpu.create_nd_tdesc %c : memref<1024x1024xbf16> -> {c}
+      xegpu.store_nd %t, %dc[%c0, %c0] : vector<256x256xbf16>, {c}
+    """
+    module = _parse(body, "load_tiles = array<i64: 16, 32, 32, 16>")
+    xl.annotate_layouts(module.operation, _func(module))
+    (_, transposed) = _anchors(module, "xegpu.load_nd")
+    assert "inst_data = [32, 16], order = [0, 1]" in transposed
+    module = _parse(body, "load_tiles = array<i64: 16, 32, 16, 32>")
+    with pytest.raises(xl.LayoutError, match="a transposed load takes"):
+        xl.annotate_layouts(module.operation, _func(module))

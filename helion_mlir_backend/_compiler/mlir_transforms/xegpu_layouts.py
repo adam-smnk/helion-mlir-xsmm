@@ -81,7 +81,9 @@ LOAD_MAX_ROWS = 32
 LOAD_MAX_COLS = 32
 """A 2D block load of 16-bit elements: at most 32 rows of 64 bytes."""
 TRANSPOSED_LOAD = (16, 16)
-"""A transposed 2D block load (32-bit pairs: 8 wide)."""
+"""A transposed 2D block load of a DPAS's B (32-bit pairs: 8 wide)."""
+TRANSPOSED_LOADS = (TRANSPOSED_LOAD, (32, 16))
+"""``getBlockWidthHeightCount`` with transpose: 16 or 32 rows, 8 pairs wide."""
 PREFETCH_ROWS = (8, 32)
 PREFETCH_COLS = (16, 32)
 PREFETCH_INST = (8, 16)
@@ -120,10 +122,6 @@ def _walk(root: ir.Operation) -> list[ir.Operation]:
 
     root.walk(visit, ir.WalkOrder.PRE_ORDER)
     return ops
-
-
-def _is_tdesc(value: ir.Value) -> bool:
-    return str(value.type).startswith("!xegpu.tensor_desc")
 
 
 def _defining(value: ir.Value) -> ir.Operation | None:
@@ -618,18 +616,6 @@ class Hints:
         return cls(**values)
 
 
-@dataclass
-class _Selected:
-    """Parameters of one DPAS, from hints or a source."""
-
-    load_a: tuple[int, int] | None = None
-    load_b: tuple[int, int] | None = None
-    prefetch_a: tuple[int, int] | None = None
-    prefetch_b: tuple[int, int] | None = None
-    depth_a: int | None = None
-    depth_b: int | None = None
-
-
 def _selector(dpas: ir.Operation, sg_tile: Sequence[int] | None) -> dict | None:
     """Lighthouse's parameters for ``dpas``, or ``None`` where it has none."""
     acc_shape = _shape(dpas.results[0])
@@ -750,19 +736,30 @@ def _dpas_rows(sg_rows: int) -> int:
     return rows
 
 
-def _default_a_load(
-    data: Sequence[int], *, whole_blocks: bool = False
-) -> tuple[int, int]:
-    """A tile of a DPAS's A operand: as many rows as divide the subgroup tile, up
-    to 16 (lighthouse's attention form). ``whole_blocks``: up to 32 rows, 64 bytes
-    wide when K allows, so that a subgroup's K step is one block read."""
-    limit = LOAD_MAX_ROWS if whole_blocks else DPAS_COLS
-    rows = next((r for r in (32, 16, 8, 4, 2, 1) if r <= limit and data[0] % r == 0), 1)
-    cols = LOAD_MAX_COLS if whole_blocks and data[1] % LOAD_MAX_COLS == 0 else DPAS_COLS
-    return rows, cols
+def _largest_rows(size: int, limit: int) -> int:
+    return next(r for r in (32, 16, 8, 4, 2, 1) if r <= limit and size % r == 0)
 
 
-def _default_b_load(data: Sequence[int]) -> tuple[int, int]:
+RULE_LOAD = (16, LOAD_MAX_COLS)
+"""What the rule loads of a DPAS operand: 16 rows of 64 bytes, half a 2D block
+read's limit. Measured on the B50, device time, 3 processes each (A, B tile; hand
+is ``GEMM_SQUARE``, ``GEMM_STANDARD``): 4096^3 at 128x512: 32x32, 32x32 2921 us;
+hand 2762; 16x32, 16x32 2582. 2048x4096x8192 at 256x256: 32x32, 32x32 2872; hand
+2778; 16x32, 16x32 2687. Why reads of half the size win is not established."""
+
+
+def _rule_load(data: Sequence[int]) -> tuple[int, int]:
+    """The rule's tile of a DPAS operand whose subgroup tile is ``data``."""
+    cols = RULE_LOAD[1] if data[1] % RULE_LOAD[1] == 0 else DPAS_COLS
+    return _largest_rows(data[0], RULE_LOAD[0]), cols
+
+
+def _selector_a_load(data: Sequence[int]) -> tuple[int, int]:
+    """Where the selector has no load tiles (lighthouse's attention form)."""
+    return _largest_rows(data[0], DPAS_COLS), DPAS_COLS
+
+
+def _selector_b_load(data: Sequence[int]) -> tuple[int, int]:
     if data[0] % LOAD_MAX_ROWS == 0 and data[1] % LOAD_MAX_COLS == 0:
         return LOAD_MAX_ROWS, LOAD_MAX_COLS
     return DPAS_COLS, DPAS_COLS
@@ -987,11 +984,18 @@ def _plan_operand_load(
             else (selected["load_b_k"], selected["load_b_n"])
         )
     if role.transposed:
-        tile = forced if forced is not None else TRANSPOSED_LOAD
-        if tuple(tile) != TRANSPOSED_LOAD:
+        # A hint for this role goes to the role's plain loads if it has some (K and
+        # V of attention): a transposed read has its own tile.
+        plain = any(
+            not load_role(other.value).transposed
+            for other in kernel.loads
+            if other.op != access.op and _operand_index(other, kernel) == index
+        )
+        tile = forced if forced is not None and not plain else TRANSPOSED_LOAD
+        if tuple(tile) not in TRANSPOSED_LOADS:
             raise LayoutError(
-                f"a transposed load takes {list(TRANSPOSED_LOAD)} tiles, not "
-                f"{list(tile)}"
+                f"a transposed load takes {[list(t) for t in TRANSPOSED_LOADS]} "
+                f"tiles, not {list(tile)}"
             )
         order: tuple[int, int] | None = (0, 1)
     elif role.other:
@@ -1002,13 +1006,25 @@ def _plan_operand_load(
         order = None
         if forced is not None:
             tile = forced
+        elif hints.source == "rule":
+            tile = _rule_load(layout.sg_data)
         elif index == 0:
-            tile = _default_a_load(layout.sg_data, whole_blocks=hints.source == "rule")
+            tile = _selector_a_load(layout.sg_data)
         else:
-            tile = _default_b_load(layout.sg_data)
+            tile = _selector_b_load(layout.sg_data)
     _check_block(tile, layout.sg_data, "load tile")
     plan.anchors.append((access.op, "layout", _layout_text(layout, tile, order)))
     _plan_prefetch(kernel, grid, hints, access, layout, index, selected, plan)
+
+
+def _operand_index(access: _Access, kernel: KernelIR) -> int | None:
+    """Which DPAS operand (0: A, 1: B) the load ``access`` feeds."""
+    for dpas in kernel.dpas:
+        for index, operand in enumerate(dpas.operands[:2]):
+            load = _load_of(kernel, operand)
+            if load is not None and load.op == access.op:
+                return index
+    return None
 
 
 def value_bits(value: ir.Value) -> int:
