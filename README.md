@@ -270,6 +270,7 @@ pre-commit run -a
 |---|---|
 | `HELION_MLIR_COMPILE_TIMEOUT` | Bounds MLIR lowering of each kernel, in seconds (default `30`; `0` disables the limit) |
 | `HELION_MLIR_NATIVE_CALL=0` | Starts the process with the native CPU call paths off (`_compiler/native/`: C++ argument checks and calls, the native kernel run and prepared calls); every call then takes the Python paths. Read once, at import; `helion_mlir_backend.set_native_call(False/True)` switches later (off: at once for every call; on: for kernels compiled from then on). Default: on, if the extension builds. A kernel whose first call can't be planned (e.g. two arguments the same tensor) never runs natively in that process (speed only) |
+| `HELION_MLIR_OUTPUT_POOL=<bytes>` | Most bytes of free blocks the CPU output pool keeps (`_compiler/output_pool.py`: tensors of 4 MiB or more that kernels allocate, reused once their storage dies; a call then pays no page faults, whatever the allocator). `0`: off. Read once, at import; a bad value warns and keeps the default; `helion_mlir_backend.set_output_pool(bytes)` changes it later. Default: the smaller of 1 GiB and 1/8 of the memory (RAM or cgroup limit) |
 | `HELION_MLIR_NATIVE_CACHE` | Where the native extension is built and cached (default `~/.cache/helion_mlir_backend/native`) |
 | `HELION_MLIR_DUMP_IR` | Raw generated IR before inlining (shows `@_aten_*` helpers and tile loops) |
 | `HELION_MLIR_DUMP_PRE_LOWERING` | After inlining / all pre-passes, immediately before the lighthouse lowering schedule |

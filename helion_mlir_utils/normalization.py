@@ -16,6 +16,7 @@ import torch
 from torch import Tensor
 
 import helion_mlir_backend  # noqa: F401
+from helion_mlir_backend import output_pool
 
 # f32 elements of a tile's rows: its intermediates stay in L2.
 _TILE_ELEMENTS = 1 << 16
@@ -47,7 +48,7 @@ def _softmax_kernel(
     if in_place:
         out = x
     else:
-        out = torch.empty_like(x)
+        out = output_pool.empty_like(x)
     for tile_m in hl.tile(m):
         top = hl.full([tile_m, block_n], float("-inf"), dtype=torch.float32)
         for tile_n in hl.tile(whole, block_size=block_n):
@@ -78,7 +79,7 @@ def _softmax_one_kernel(x: Tensor) -> Tensor:
     chunked kernel does not compile for one column."""
     m, n = x.shape
     hl.specialize(n)
-    out = torch.empty_like(x)
+    out = output_pool.empty_like(x)
     for tile_m in hl.tile(m):
         v = x[tile_m, :].to(torch.float32)
         out[tile_m, :] = (v - v + 1.0).to(x.dtype)
@@ -106,7 +107,7 @@ def _group_norm_kernel(
     if in_place:
         out = x3
     else:
-        out = torch.empty_like(x3)
+        out = output_pool.empty_like(x3)
     for tile_m, tile_g in hl.tile([m, groups]):
         y = x3[tile_m, tile_g, :].to(torch.float32)
         mean = y.mean(-1, keepdim=True)

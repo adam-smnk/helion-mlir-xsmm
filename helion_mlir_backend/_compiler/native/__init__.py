@@ -52,6 +52,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from .. import output_pool
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from types import ModuleType
@@ -93,6 +95,15 @@ def set_native_call(enabled: bool) -> None:
         _loaded[0].set_enabled(_enabled)
 
 
+def refresh_allocator() -> None:
+    """Give the extension the output pool's allocator, or none while it is off."""
+    if _loaded and _loaded[0] is not None:
+        _loaded[0].set_fresh_allocator(
+            output_pool._native_allocate if output_pool.enabled() else None,
+            output_pool.MIN_BYTES,
+        )
+
+
 def module() -> ModuleType | None:
     """The extension module, built on first use; ``None`` if disabled or it
     can't be built (logged once)."""
@@ -111,6 +122,7 @@ def module() -> ModuleType | None:
                     exc,
                 )
                 _loaded.append(None)
+            refresh_allocator()
     return _loaded[0]
 
 

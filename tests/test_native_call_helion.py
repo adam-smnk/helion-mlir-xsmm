@@ -441,3 +441,107 @@ def test_native_matches_switch_off(
         assert native_calls > 0, "the plan was not replayed"
     else:
         assert native_calls == 0, "a plan that must be refused ran natively"
+
+
+# A condition on a tensor is data, not metadata: frozen in a plan, it would keep
+# its first value (found in review: ``assert g`` stopped raising on replay).
+_TRUTH_SOURCE = """
+import torch, helion, helion.language as hl
+@helion.kernel(backend="mlir", static_shapes=True, config=helion.Config(block_sizes=[8]))
+def k(x: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
+    {body}
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + 1.0
+    return out
+"""
+
+
+def _truth_kernel(tmp_path, body: str):
+    import importlib.util
+
+    path = tmp_path / "truth_kernel.py"
+    path.write_text(_TRUTH_SOURCE.replace("{body}", body))
+    spec = importlib.util.spec_from_file_location(f"truth_{id(path)}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.k
+
+
+@pytest.mark.parametrize(
+    ("body", "passing", "failing"),
+    [
+        ("assert g", 1.0, 0.0),
+        ("assert not g", 0.0, 1.0),
+        ("assert g, 'g is zero'", 1.0, 0.0),
+        ("assert x.dim() == 1 and g", 1.0, 0.0),
+        ("assert x.dim() == 2 or g", 1.0, 0.0),
+        ("assert (g if x.dim() == 1 else True)", 1.0, 0.0),
+        ("n = 16 if g else 32\n    assert n == 16", 1.0, 0.0),
+        ("n = 32\n    if g:\n        n = 16\n    assert n == 16", 1.0, 0.0),
+        ("h = g\n    assert h", 1.0, 0.0),
+        ("assert abs(g)", 1.0, 0.0),
+        ("assert g > 0", 1.0, 0.0),
+        ("assert g[0]", 1.0, 0.0),
+        ("assert g.sum() > 0", 1.0, 0.0),
+    ],
+)
+def test_condition_on_a_tensor_is_not_frozen(tmp_path, body, passing, failing) -> None:
+    k = _truth_kernel(tmp_path, body)
+    x = torch.zeros(16)
+    good, bad = torch.tensor([passing]), torch.tensor([failing])
+    bound = k.bind((x, good))
+    expected = x + 1.0
+    assert torch.equal(bound(x, good), expected)
+    assert torch.equal(bound(x, good), expected)
+    with pytest.raises(AssertionError):
+        bound(x, bad)
+
+
+@pytest.mark.parametrize("body", ["assert g and x.dim() == 1", "assert int(g)"])
+def test_condition_helion_refuses_is_not_planned(tmp_path, body: str) -> None:
+    k = _truth_kernel(tmp_path, body)
+    x, g = torch.zeros(16), torch.tensor([1.0])
+    with pytest.raises(
+        (helion.exc.TypeInferenceError, helion.exc.TorchOpTracingError)
+    ):
+        k.bind((x, g))(x, g)
+
+
+def test_assert_on_one_element_input_is_not_frozen(tmp_path) -> None:
+    source = """
+import torch, helion, helion.language as hl
+@helion.kernel(backend="mlir", static_shapes=True, config=helion.Config(block_sizes=[1]))
+def k(x: torch.Tensor) -> torch.Tensor:
+    assert x
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = x[tile] + 1.0
+    return out
+"""
+    import importlib.util
+
+    path = tmp_path / "one_element.py"
+    path.write_text(source)
+    spec = importlib.util.spec_from_file_location(f"one_{id(path)}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    one, zero = torch.tensor([1.0]), torch.tensor([0.0])
+    bound = module.k.bind((one,))
+    bound(one)
+    bound(one)
+    with pytest.raises(AssertionError):
+        bound(zero)
+
+
+@pytest.mark.parametrize(
+    "body",
+    ["assert x.dim() == 1", "assert x.size(0) == 16, 'msg'", "assert not x.dim() == 2"],
+)
+def test_assert_on_metadata_stays_native(tmp_path, body: str) -> None:
+    k = _truth_kernel(tmp_path, body)
+    x, g = torch.zeros(16), torch.tensor([1.0])
+    bound = k.bind((x, g))
+    bound(x, g)
+    assert type(bound._run).__name__ == "KernelRun"
+    assert bound._run.planned

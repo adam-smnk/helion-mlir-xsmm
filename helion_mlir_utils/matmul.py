@@ -41,6 +41,7 @@ import torch
 from torch import Tensor
 
 import helion_mlir_backend  # noqa: F401
+from helion_mlir_backend import output_pool
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -73,7 +74,7 @@ _PACK_CONFIG = helion.Config(block_sizes=[])
 @helion.kernel(backend="mlir", config=_PACK_CONFIG)
 def _pad_kernel(x: Tensor, rows: hl.constexpr, cols: hl.constexpr) -> Tensor:
     """``x`` zero-padded to ``[rows, cols]``: tiles past its end read zeros."""
-    out = torch.empty((int(rows), int(cols)), dtype=x.dtype, device=x.device)
+    out = output_pool.empty((int(rows), int(cols)), dtype=x.dtype, device=x.device)
     for tr, tc in hl.tile([int(rows), int(cols)], block_size=[32, 32]):
         out[tr, tc] = x[tr, tc]
     return out
@@ -88,7 +89,7 @@ def pad_2d(x: Tensor, rows: int, cols: int) -> Tensor:
 def _pack_a_kernel(a: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tensor:
     """Pack row-major ``[M, K]`` into ``[M_pad/BM, K_pad/BK, BM, BK]``."""
     mb, kb = int(m_pad) // 32, int(k_pad) // 32
-    out = torch.empty((mb, kb, 32, 32), dtype=a.dtype, device=a.device)
+    out = output_pool.empty((mb, kb, 32, 32), dtype=a.dtype, device=a.device)
     for tm, tk in hl.tile([mb * 32, kb * 32], block_size=[32, 32]):
         out[tm.id, tk.id, :, :] = a[tm, tk]
     return out
@@ -98,7 +99,7 @@ def _pack_a_kernel(a: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tenso
 def _pack_a_kernel_t(a_t: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> Tensor:
     """Pack transposed ``[K, M]`` into ``[M_pad/BM, K_pad/BK, BM, BK]``."""
     mb, kb = int(m_pad) // 32, int(k_pad) // 32
-    out = torch.empty((mb, kb, 32, 32), dtype=a_t.dtype, device=a_t.device)
+    out = output_pool.empty((mb, kb, 32, 32), dtype=a_t.dtype, device=a_t.device)
     for tm, tk in hl.tile([mb * 32, kb * 32], block_size=[32, 32]):
         out[tm.id, tk.id, :, :] = a_t[tk, tm].permute(1, 0)
     return out
@@ -108,7 +109,7 @@ def _pack_a_kernel_t(a_t: Tensor, m_pad: hl.constexpr, k_pad: hl.constexpr) -> T
 def _pack_b_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
     """Pack row-major ``[K, N]`` into ``[N_pad/BN, K_pad/BK, BK, BN]``."""
     kb, nb = int(k_pad) // 32, int(n_pad) // 32
-    out = torch.empty((nb, kb, 32, 32), dtype=b.dtype, device=b.device)
+    out = output_pool.empty((nb, kb, 32, 32), dtype=b.dtype, device=b.device)
     for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
         out[tn.id, tk.id, :, :] = b[tk, tn]
     return out
@@ -118,7 +119,7 @@ def _pack_b_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tenso
 def _pack_b_kernel_t(b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
     """Pack transposed ``[N, K]`` into ``[N_pad/BN, K_pad/BK, BK, BN]``."""
     kb, nb = int(k_pad) // 32, int(n_pad) // 32
-    out = torch.empty((nb, kb, 32, 32), dtype=b_t.dtype, device=b_t.device)
+    out = output_pool.empty((nb, kb, 32, 32), dtype=b_t.dtype, device=b_t.device)
     for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
         out[tn.id, tk.id, :, :] = b_t[tn, tk].permute(1, 0)
     return out
@@ -128,7 +129,7 @@ def _pack_b_kernel_t(b_t: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> T
 def _pack_b_vnni_kernel(b: Tensor, k_pad: hl.constexpr, n_pad: hl.constexpr) -> Tensor:
     """Pack row-major ``[K, N]`` into ``[N_pad/BN, K_pad/BK, BK/2, BN, 2]``."""
     kb, nb = int(k_pad) // 32, int(n_pad) // 32
-    out = torch.empty((nb, kb, 16, 32, 2), dtype=b.dtype, device=b.device)
+    out = output_pool.empty((nb, kb, 16, 32, 2), dtype=b.dtype, device=b.device)
     for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
         pairs = b[tk, tn].reshape(tk.block_size // 2, 2, tn.block_size)
         out[tn.id, tk.id, :, :, :] = pairs.permute(0, 2, 1)
@@ -141,7 +142,7 @@ def _pack_b_vnni_kernel_t(
 ) -> Tensor:
     """Pack transposed ``[N, K]`` into ``[N_pad/BN, K_pad/BK, BK/2, BN, 2]``."""
     kb, nb = int(k_pad) // 32, int(n_pad) // 32
-    out = torch.empty((nb, kb, 16, 32, 2), dtype=b_t.dtype, device=b_t.device)
+    out = output_pool.empty((nb, kb, 16, 32, 2), dtype=b_t.dtype, device=b_t.device)
     for tn, tk in hl.tile([nb * 32, kb * 32], block_size=[32, 32]):
         pairs = b_t[tn, tk].reshape(tn.block_size, tk.block_size // 2, 2)
         out[tn.id, tk.id, :, :, :] = pairs.permute(1, 0, 2)
@@ -163,7 +164,7 @@ def _matmul_blocked_kernel(
     hl.specialize(blocks_k)
     hl.specialize(block_k)
 
-    out = torch.empty(
+    out = output_pool.empty(
         (blocks_m, block_m, blocks_n, block_n),
         dtype=a4.dtype,
         device=a4.device,
@@ -204,7 +205,7 @@ def _matmul_blocked_kernel_bias(
     hl.specialize(block_k)
     hl.specialize(bias3.size(1))
 
-    out = torch.empty(
+    out = output_pool.empty(
         (blocks_m, block_m, blocks_n, block_n),
         dtype=a4.dtype,
         device=a4.device,
@@ -294,7 +295,7 @@ def _matmul_fused_pack(
     hl.specialize(k2)
 
     if out is None:
-        result = torch.empty((m, n), dtype=a.dtype, device=a.device)
+        result = output_pool.empty((m, n), dtype=a.dtype, device=a.device)
     else:
         result = out
     for tile_m, tile_n in hl.tile([m, n]):
@@ -572,7 +573,7 @@ def _matmul_prepacked_vnni(
     hl.specialize(b4.size(3))
 
     if out is None:
-        result = torch.empty((m, panels, panel), dtype=a3.dtype, device=a3.device)
+        result = output_pool.empty((m, panels, panel), dtype=a3.dtype, device=a3.device)
     else:
         result = out
     for tile_m, tile_p in hl.tile([m, panels]):
@@ -617,7 +618,7 @@ def _matmul_prepacked_rows(
     panel = hl.specialize(panel)
     hl.specialize(b3.size(1))
     if out is None:
-        result = torch.empty((m, panels, panel), dtype=a.dtype, device=a.device)
+        result = output_pool.empty((m, panels, panel), dtype=a.dtype, device=a.device)
     else:
         result = out
     for tile_m, tile_p in hl.tile([m, panels]):
@@ -719,7 +720,7 @@ def _matmul_prepacked_rows_call(
         out = _rows_bound(a, b3, bias2, epilogue)(a, b3, bias2, epilogue)
         out = out.view(m, n_pad)
         return out if n == n_pad else out[:, :n]
-    out3 = torch.empty(
+    out3 = output_pool.empty(
         (bulk + BLOCK_M, int(b3.shape[0]), BLOCK_N), dtype=a.dtype, device=a.device
     )
     for rows, out_rows in (
@@ -785,7 +786,7 @@ def _matmul_prepacked_vnni_call(
         return out if n == n_pad else out[:, :n]
 
     rest = _round_up(m - bulk, BLOCK_M)
-    out3 = torch.empty((bulk + rest, panels, panel), dtype=a.dtype, device=a.device)
+    out3 = output_pool.empty((bulk + rest, panels, panel), dtype=a.dtype, device=a.device)
     if bulk:
         bound, consts = _prepacked_bound(a3[:bulk], *operands, tile_m, out3[:bulk])
         bound(a3[:bulk], *operands, *consts, out3[:bulk])
@@ -903,7 +904,7 @@ def _matmul_blocked_kernel_affine(
     hl.specialize(scale3.size(1))
     hl.specialize(post_bias3.size(1))
 
-    out = torch.empty(
+    out = output_pool.empty(
         (blocks_m, block_m, blocks_n, block_n),
         dtype=a4.dtype,
         device=a4.device,
@@ -995,7 +996,7 @@ def _pack_b_vnni_panels_kernel_t(b3_t: Tensor, panel: hl.constexpr) -> Tensor:
     VNNI panels ``[N/panel, K/2, panel, 2]``."""
     n, pairs, vnni = b3_t.shape
     panel = int(panel)
-    out = torch.empty(
+    out = output_pool.empty(
         (n // panel, pairs, panel, vnni), dtype=b3_t.dtype, device=b3_t.device
     )
     for tp, tn in hl.tile([pairs, n]):
@@ -1175,7 +1176,7 @@ def _split_k_partials(a3: Tensor, b3: Tensor) -> Tensor:
     n = b3.size(2)
     chunk = hl.specialize(chunk)
     hl.specialize(b3.size(1))
-    out = torch.empty((splits, m, n), dtype=torch.float32, device=a3.device)
+    out = output_pool.empty((splits, m, n), dtype=torch.float32, device=a3.device)
     for tile_s, tile_m, tile_n in hl.tile([splits, m, n]):
         acc = hl.zeros([tile_s, tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(chunk):
@@ -1190,7 +1191,7 @@ def _sum_partials(partials: Tensor, dtype: torch.dtype) -> Tensor:
     """``partials`` ``[S, M, N]`` summed over S, as ``dtype``."""
     splits, m, n = partials.shape
     hl.specialize(splits)
-    out = torch.empty((m, n), dtype=dtype, device=partials.device)
+    out = output_pool.empty((m, n), dtype=dtype, device=partials.device)
     for tile_m, tile_n in hl.tile([m, n]):
         out[tile_m, tile_n] = partials[:, tile_m, tile_n].sum(0).to(dtype)
     return out
@@ -1330,7 +1331,7 @@ def _matmul_f32_fused_pack(
     else:
         m, k = a.shape
     n = b.shape[0] if trans_b else b.shape[1]
-    out = torch.empty((m, n), dtype=a.dtype, device=a.device)
+    out = output_pool.empty((m, n), dtype=a.dtype, device=a.device)
     for tile_m, tile_n in hl.tile([m, n]):
         acc = hl.zeros(
             [tile_m.block_size // 32, tile_n.block_size // 32, 32, 32],
@@ -1825,7 +1826,7 @@ def _bmm_direct(a: Tensor, b: Tensor) -> Tensor:
     n = b.size(2)
     k = hl.specialize(k)
     hl.specialize(b.size(1))
-    out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
+    out = output_pool.empty((batch, m, n), dtype=a.dtype, device=a.device)
     for tile_b, tile_m, tile_n in hl.tile([batch, m, n]):
         acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
         for tile_k in hl.tile(k):
@@ -1897,7 +1898,7 @@ def bmm(a: Tensor, b: Tensor) -> Tensor:
     n = b.shape[2]
     if a.dtype == torch.bfloat16 and min(m, n) >= BLOCK_M and k >= 2 * BLOCK_K:
         a, b = a.contiguous(), b.contiguous()
-        out = torch.empty((batch, m, n), dtype=a.dtype, device=a.device)
+        out = output_pool.empty((batch, m, n), dtype=a.dtype, device=a.device)
         for i in range(batch):
             bound, consts = _matmul_fused_pack_bound(
                 a[i], b[i], None, identity_epilogue, False, False, out[i]

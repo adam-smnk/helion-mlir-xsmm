@@ -19,6 +19,7 @@
 #include <c10/core/DispatchKeySet.h>
 #include <c10/core/impl/LocalDispatchKeySet.h>
 #include <c10/core/impl/TorchDispatchModeTLS.h>
+#include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/Dtype.h>
 #include <torch/csrc/Exceptions.h>
 #include <torch/csrc/autograd/python_variable.h>
@@ -45,6 +46,34 @@ const c10::DispatchKeySet kPlainCpu({
     c10::DispatchKey::ADInplaceOrView,
     c10::DispatchKey::AutocastCPU,
 });
+
+// set_fresh_allocator: fresh tensors of min_bytes or more come from
+// allocator(sizes, dtype) when it returns a tensor; else from at::empty.
+PyObject* g_fresh_allocator = nullptr;
+size_t g_fresh_min_bytes = 0;
+
+at::Tensor fresh_tensor(const Ints& sizes, c10::ScalarType dtype) {
+  int64_t count = 1;
+  for (int64_t size : sizes) count *= size;
+  if (g_fresh_allocator && static_cast<size_t>(count) * c10::elementSize(dtype) >= g_fresh_min_bytes) {
+    PyObject* shape = PyTuple_New(static_cast<Py_ssize_t>(sizes.size()));
+    for (size_t i = 0; shape && i < sizes.size(); ++i)
+      PyTuple_SET_ITEM(shape, static_cast<Py_ssize_t>(i), PyLong_FromLongLong(sizes[i]));
+    PyObject* made = shape ? PyObject_CallFunctionObjArgs(
+                                 g_fresh_allocator, shape,
+                                 reinterpret_cast<PyObject*>(torch::getTHPDtype(dtype)), nullptr)
+                           : nullptr;
+    Py_XDECREF(shape);
+    if (!made) PyErr_Clear();
+    if (made && THPVariable_Check(made)) {
+      at::Tensor tensor = THPVariable_Unpack(made);
+      Py_DECREF(made);
+      return tensor;
+    }
+    Py_XDECREF(made);
+  }
+  return at::empty(sizes, at::TensorOptions().dtype(dtype).device(at::kCPU));
+}
 
 Ints contiguous_strides(const Ints& sizes) {
   Ints strides(sizes.size());
@@ -438,8 +467,7 @@ PyObject* run_plan(KernelRun* self, PyObject* const* args, Py_ssize_t nargs,
   for (size_t k = 0; k < plan->fresh.size(); ++k) {
     const auto& f = plan->fresh[k];
     const bool resized = reshaped && r.second == static_cast<int>(k);
-    fresh.push_back(at::empty(resized ? *result_sizes : f.sizes,
-                              at::TensorOptions().dtype(f.dtype).device(at::kCPU)));
+    fresh.push_back(fresh_tensor(resized ? *result_sizes : f.sizes, f.dtype));
   }
   EntryCall* entry = reinterpret_cast<EntryCall*>(self->entry);
   const auto& specs = *entry->specs;
@@ -738,8 +766,24 @@ PyObject* set_enabled(PyObject*, PyObject* value) {
   Py_RETURN_NONE;
 }
 
+PyObject* set_fresh_allocator(PyObject*, PyObject* const* args, Py_ssize_t nargs) {
+  if (nargs != 2) {
+    PyErr_SetString(PyExc_TypeError, "set_fresh_allocator(allocator or None, min_bytes)");
+    return nullptr;
+  }
+  const size_t min_bytes = PyLong_AsSize_t(args[1]);
+  if (PyErr_Occurred()) return nullptr;
+  PyObject* old = g_fresh_allocator;
+  g_fresh_allocator = args[0] == Py_None ? nullptr : Py_NewRef(args[0]);
+  g_fresh_min_bytes = min_bytes;
+  Py_XDECREF(old);
+  Py_RETURN_NONE;
+}
+
 PyMethodDef module_methods[] = {
     {"set_enabled", set_enabled, METH_O, "turn the native paths on or off (every call)"},
+    {"set_fresh_allocator", reinterpret_cast<PyCFunction>(reinterpret_cast<void*>(set_fresh_allocator)),
+     METH_FASTCALL, "the allocator of fresh tensors of min_bytes or more"},
     {nullptr, nullptr, 0, nullptr}};
 
 PyModuleDef module_def = {PyModuleDef_HEAD_INIT, "_helion_mlir_native", nullptr, -1,

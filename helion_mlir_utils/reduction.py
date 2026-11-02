@@ -13,6 +13,7 @@ from typing import Callable
 
 import helion
 import helion.language as hl
+from helion_mlir_backend import output_pool
 import torch
 from torch import Tensor
 
@@ -26,7 +27,7 @@ def _matvec_kernel(a: Tensor, x: Tensor) -> Tensor:
     columns."""
     m, k = a.shape
     block_k = hl.register_block_size(k)
-    out = torch.empty([m], dtype=a.dtype, device=a.device)
+    out = output_pool.empty([m], dtype=a.dtype, device=a.device)
     for tile_m in hl.tile(m):
         acc = hl.zeros([tile_m, block_k], dtype=torch.float32)
         for tile_k in hl.tile(k, block_size=block_k):
@@ -70,7 +71,7 @@ def _row_sum_kernel(x: Tensor, epilogue: Callable[[Tensor], Tensor]) -> Tensor:
     m, n = x.shape
     hl.specialize(n)
     block_n = hl.register_block_size(n)
-    out = torch.empty((m, 1), dtype=x.dtype, device=x.device)
+    out = output_pool.empty((m, 1), dtype=x.dtype, device=x.device)
     for tile_m in hl.tile(m):
         acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
         for tile_n in hl.tile(n, block_size=block_n):

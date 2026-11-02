@@ -20,6 +20,7 @@ import copy
 from typing import TYPE_CHECKING
 from typing import Callable
 
+from .. import output_pool
 from .support import UnsupportedOperationError
 
 if TYPE_CHECKING:
@@ -170,8 +171,9 @@ class _MetadataOnly:
     and ``element_size()``, computes with them (arithmetic, comparisons,
     subscripts, ``if``, the builtins ``len``/``min``/``max``/``int``/``abs``)
     and allocates tensors only with ``torch.empty(shape, dtype=, device=)`` or
-    ``torch.empty_like(x)`` (uninitialized; dtype and device given, not
-    defaults); it returns a name or ``None``. Anything else (any other call
+    ``torch.empty_like(x)`` or the same of :mod:`~.output_pool` (uninitialized;
+    dtype and device given, not defaults), and may ``assert`` on all of that (a
+    plan has the metadata of a call that passed); it returns a name or ``None``. Anything else (any other call
     or global, loops, ``del``, attribute or subscript assignment, ...) fails
     the check and keeps every call on the general path."""
 
@@ -214,7 +216,7 @@ class _MetadataOnly:
                 and self.target(stmt.target)
             )
         if isinstance(stmt, ast.If):
-            if not self.expr(stmt.test):
+            if not self.truth(stmt.test):
                 return False
             # A test Helion typed as a literal (e.g. ``out is None``) is fixed
             # for the bound kernel and the plan's argument metadata: only its
@@ -235,6 +237,10 @@ class _MetadataOnly:
             names = set(self.names)
             return all(self.statement(s) for s in taken) and all(
                 self._untyped(s, names) for s in other
+            )
+        if isinstance(stmt, ast.Assert):
+            return self.truth(stmt.test) and (
+                stmt.msg is None or isinstance(stmt.msg, ast.Constant)
             )
         if isinstance(stmt, ast.Return):
             return stmt.value is None or isinstance(
@@ -308,6 +314,17 @@ class _MetadataOnly:
         ast.Call,
     )
 
+    def truth(self, node: ast.expr) -> bool:
+        """``node`` as a condition. A tensor's truth is its data, which a plan
+        doesn't record: replayed, the condition would keep its first value."""
+        from helion._compiler.type_info import TensorType
+
+        if isinstance(node, ast.Name) and isinstance(
+            getattr(node, "_type_info", None), TensorType
+        ):
+            return False
+        return self.expr(node)
+
     def expr(self, node: ast.expr) -> bool:
         from helion._compiler.type_info import TensorType
 
@@ -342,14 +359,18 @@ class _MetadataOnly:
         if isinstance(node, ast.BinOp):
             return self.expr(node.left) and self.expr(node.right)
         if isinstance(node, ast.UnaryOp):
+            if isinstance(node.op, ast.Not):
+                return self.truth(node.operand)
             return self.expr(node.operand)
         if isinstance(node, ast.BoolOp):
-            return all(self.expr(value) for value in node.values)
+            return all(self.truth(value) for value in node.values)
         if isinstance(node, ast.Compare):
             return self.expr(node.left) and all(self.expr(c) for c in node.comparators)
         if isinstance(node, ast.IfExp):
             return (
-                self.expr(node.test) and self.expr(node.body) and self.expr(node.orelse)
+                self.truth(node.test)
+                and self.expr(node.body)
+                and self.expr(node.orelse)
             )
         if isinstance(node, ast.Call):
             return self.call(node)
@@ -377,7 +398,7 @@ class _MetadataOnly:
             )
         if not isinstance(func, ast.Attribute):
             return False
-        if self._is_torch(func.value):
+        if self._allocates(func.value):
             keywords = {keyword.arg for keyword in node.keywords}
             if func.attr == "empty":
                 return (
@@ -398,7 +419,14 @@ class _MetadataOnly:
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
             and node.func.attr in ("empty", "empty_like")
-            and self._is_torch(node.func.value)
+            and self._allocates(node.func.value)
+        )
+
+    def _allocates(self, node: ast.expr) -> bool:
+        return self._is_torch(node) or (
+            isinstance(node, ast.Name)
+            and node.id not in self.names
+            and self.namespace.get(node.id) is output_pool
         )
 
     def _is_torch(self, node: ast.expr) -> bool:
