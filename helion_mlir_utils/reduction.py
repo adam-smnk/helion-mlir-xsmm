@@ -153,7 +153,8 @@ def column_sum(x: Tensor) -> Tensor:
         raise ValueError(f"column_sum() expects a 2-D tensor, got {tuple(x.shape)}")
     m, n = map(int, x.shape)
     if m == 1:
-        return x[0].to(torch.float32)
+        # New memory, as the sum is, and +0.0 where the row has -0.0, as a sum has.
+        return x[0].to(torch.float32) + 0.0
     threads = int(os.environ.get("OMP_NUM_THREADS", torch.get_num_threads()))
     block_sizes = (min(m, 32), max(1, min(512, -(-n // threads))))
     x = x.contiguous()

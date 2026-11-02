@@ -68,6 +68,7 @@ _BUILD_TIMEOUT = 300
 
 _lock = threading.Lock()
 _loaded: list[ModuleType | None] = []
+_load_error: list[str] = []
 
 
 def _from_environment() -> bool:
@@ -121,9 +122,15 @@ def module() -> ModuleType | None:
                     "Python ones: %s",
                     exc,
                 )
+                _load_error.append(str(exc))
                 _loaded.append(None)
             refresh_allocator()
     return _loaded[0]
+
+
+def load_error() -> str | None:
+    """Why :func:`module` found no extension module, if it failed to build."""
+    return _load_error[0] if _load_error else None
 
 
 def _compiler() -> str:

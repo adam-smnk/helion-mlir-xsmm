@@ -124,7 +124,7 @@ def pytest_sessionstart(session: pytest.Session) -> None:
 
     if native.enabled() and native.module() is None:
         raise pytest.UsageError(
-            "the native extension could not be built (see the warning above); set "
+            f"the native extension could not be built: {native.load_error()}; set "
             "HELION_MLIR_NATIVE_CALL=0 to run without it"
         )
 
