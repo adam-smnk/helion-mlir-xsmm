@@ -25,6 +25,7 @@ import math
 import multiprocessing
 import os
 import pickle
+import signal
 import tempfile
 import threading
 from typing import TYPE_CHECKING
@@ -497,6 +498,7 @@ def _lower(
             child.start()
         sender.close()
         error: Exception | None = None
+        died = False
         try:
             if receiver.poll(timeout):
                 ok, result = receiver.recv()
@@ -506,14 +508,16 @@ def _lower(
                 child.kill()
                 error = CompileTimeoutError(pipeline, timeout)
         except EOFError:
-            error = RuntimeError("lighthouse lowering process died")
+            died = True
         finally:
             receiver.close()
             child.join()
         stderr.seek(0)
         output = stderr.read().decode(errors="replace").strip()
+    if died:
+        error = RuntimeError(_death_message(child.exitcode, output))
     if error is not None:
-        if child.exitcode and not isinstance(error, CompileTimeoutError):
+        if child.exitcode and not died and not isinstance(error, CompileTimeoutError):
             error.add_note(f"exit code {child.exitcode}")
         if output:
             error.add_note(f"lighthouse output:\n{output}")
@@ -521,6 +525,21 @@ def _lower(
     if output:
         log.debug("lighthouse output:\n%s", output)
     return ir.Module.parse(result, context=module.context)
+
+
+def _death_message(exitcode: int | None, output: str) -> str:
+    """What killed a lowering process: its signal or exit code, and the assertion
+    it printed (or else its last line of output)."""
+    if exitcode is not None and exitcode < 0:
+        how = f"on {signal.Signals(-exitcode).name}"
+    else:
+        how = f"with exit code {exitcode}"
+    lines = output.splitlines()
+    cause = next((line for line in lines if "Assertion" in line), None)
+    if cause is None and lines:
+        cause = lines[-1]
+    message = f"lighthouse lowering process died {how}"
+    return f"{message}: {cause.strip()}" if cause else message
 
 
 def _anonymous_file() -> BinaryIO:
