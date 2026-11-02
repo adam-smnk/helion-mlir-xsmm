@@ -62,6 +62,15 @@ def build_phase_body(
 
 
 _SUMS = (torch.ops.aten.sum.dim_IntList, torch.ops.aten.sum.default)
+_KEEP_ZERO_AFTER = (
+    tracing_ops._phi,
+    operator.getitem,
+    tracing_ops._mask_to,
+    torch.ops.aten.mul.Tensor,
+    torch.ops.aten.mul.Scalar,
+    torch.ops.aten.neg.default,
+)
+"""Ops after a loop that leave a padded 0 at 0."""
 
 
 def _lower_root(ctx: BuildContext, graph_id: int, grid_ids: list[int]) -> None:
@@ -571,68 +580,113 @@ def _refuse_reduced_after_loop(
     running: list[torch.fx.Node | None],
     body: torch.fx.Graph,
 ) -> None:
-    """Refuse a reduction, after a loop with a partial tile, of the value of its last
-    tile: nothing masks the padding there. Only a sum of padding that stays 0 is
-    right."""
+    """Refuse a use, after a loop with a partial tile, of the value of its last tile
+    that reduces or stores it or that a sibling loop reads: nothing masks the padding
+    there. Only a direct sum or store of padding provably still 0 is allowed; others
+    that happen to be right (``x * exp(-x)``, a sum in a sibling loop) are refused."""
     if block_id not in ctx.block_id_to_valid:
         return
     (outputs,) = next(iter(body.find_nodes(op="output"))).args
     outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
     for index, (node, output) in enumerate(zip(running, outputs, strict=True)):
-        if node is not None:
-            continue
-        for reduction, other in _reductions_after_loop(ctx, block_id, loop, index):
-            if other == 0 and reduction.target in _SUMS and _keeps_zero(ctx, output):
-                continue
+        if node is None and not all(
+            kept and _keeps_zero(ctx, output)
+            for kept in _uses_after_loop(ctx, block_id, loop, index)
+        ):
             raise UnsupportedOperationError(
-                "a reduction after a loop of its last partial tile's value",
+                "a use after a loop of its last partial tile's value",
                 reason="the loop's tile isn't active there, so its padding counts",
                 alternatives=[
-                    "the reduction inside the loop",
+                    "the reduction or store inside the loop",
                     "block sizes that divide the sizes they tile, with "
                     "static_shapes=True",
                 ],
             )
 
 
-def _reductions_after_loop(
+def _uses_after_loop(
     ctx: BuildContext, block_id: int, loop: torch.fx.Node, index: int
-) -> list[tuple[torch.fx.Node, object]]:
-    """The reductions of the loop's result ``index`` with its value in the loop's tile
-    dim, each with the value its padding is masked to (``None`` if it isn't)."""
-    found: list[tuple[torch.fx.Node, object]] = []
-    stack = [
+) -> list[bool]:
+    """For the uses that end the loop's result ``index`` (reductions over the tile's
+    dim, stores), through enclosing loops too: whether padding that was 0 still counts
+    as 0 there."""
+    uses: list[bool] = []
+    stack = [(user, True) for user in _result_users(loop, index)]
+    seen: set[tuple[torch.fx.Node, bool]] = set()
+    while stack:
+        current, clean = stack.pop()
+        if (current, clean) in seen:
+            continue
+        seen.add((current, clean))
+        for user in current.users:
+            if user.op == "output":
+                (outputs,) = user.args
+                outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+                enclosing = _enclosing_loop(ctx, user.graph)
+                if enclosing is not None and current in outputs:
+                    stack.extend(
+                        (next_user, clean)
+                        for next_user in _result_users(
+                            enclosing, outputs.index(current)
+                        )
+                    )
+            elif user.target is torch.ops.aten.sym_size.int:
+                continue
+            elif _is_loop(user):
+                inner = ctx.host_function.device_ir.graphs[user.args[0]].graph
+                if any(
+                    arg is current and _reads_data(ctx, placeholder)
+                    for arg, placeholder in zip(
+                        user.args[3], inner.find_nodes(op="placeholder"), strict=False
+                    )
+                ):
+                    uses.append(False)
+            elif any(
+                reader.target in COUNTING_REDUCTIONS for reader in (user, *user.users)
+            ):
+                uses.append(False)
+            elif user.target is hl_memory.store:
+                uses.append(clean)
+            elif current.target is tracing_ops._mask_to:
+                kept = clean and current.args[1] == 0 and user.target in _SUMS
+                if _has_tile_dim(ctx, block_id, user):
+                    # It reduces another dim: the tile's is still there.
+                    stack.append((user, kept))
+                else:
+                    uses.append(kept)
+            elif user.target is tracing_ops._mask_to or (
+                _has_tile_dim(ctx, block_id, user)
+            ):
+                kept = user.target in (*_KEEP_ZERO_AFTER, *_SUMS)
+                stack.append((user, clean and kept))
+            else:
+                uses.append(clean and user.target in _SUMS)
+    return uses
+
+
+def _result_users(loop: torch.fx.Node, index: int) -> list[torch.fx.Node]:
+    return [
         user
         for user in loop.users
         if user.target is operator.getitem and user.args[1] == index
     ]
-    seen: set[torch.fx.Node] = set()
-    while stack:
-        current = stack.pop()
-        value = current.meta.get("val")
-        if (
-            current in seen
-            or not isinstance(value, torch.Tensor)
-            or not any(
-                ctx.env.resolve_block_id(size) == block_id for size in value.shape
-            )
-        ):
-            continue
-        seen.add(current)
-        for user in current.users:
-            # A counting reduction reads its source through a buffer node.
-            counting = [
-                reader
-                for reader in (user, *user.users)
-                if reader.target in COUNTING_REDUCTIONS
-            ]
-            if counting:
-                found.append((counting[0], None))
-            elif current.target is tracing_ops._mask_to:
-                found.append((user, current.args[1]))
-            else:
-                stack.append(user)
-    return found
+
+
+def _enclosing_loop(ctx: BuildContext, body: torch.fx.Graph) -> torch.fx.Node | None:
+    """The loop whose body is ``body``."""
+    graphs = ctx.host_function.device_ir.graphs
+    for info in graphs.values() if isinstance(graphs, dict) else graphs:
+        for node in info.graph.nodes:
+            if _is_loop(node) and graphs[node.args[0]].graph is body:
+                return node
+    return None
+
+
+def _has_tile_dim(ctx: BuildContext, block_id: int, node: torch.fx.Node) -> bool:
+    value = node.meta.get("val")
+    return isinstance(value, torch.Tensor) and any(
+        ctx.env.resolve_block_id(size) == block_id for size in value.shape
+    )
 
 
 def _keeps_zero(ctx: BuildContext, node: object) -> bool:
@@ -650,7 +704,11 @@ def _keeps_zero(ctx: BuildContext, node: object) -> bool:
         return _keeps_zero(ctx, outputs[node.args[1]])
     operands = [_keeps_zero(ctx, arg) for arg in node.args]
     if node.target in (torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar):
-        return any(operands)
+        # 0 times a value computed from padding may not be 0: 0 / 0, 0 * inf.
+        return any(operands) and all(
+            kept or not isinstance(arg, torch.fx.Node)
+            for kept, arg in zip(operands, node.args, strict=False)
+        )
     if node.target in (
         torch.ops.aten.add.Tensor,
         torch.ops.aten.sub.Tensor,

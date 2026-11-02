@@ -208,6 +208,248 @@ def last_sum_of_scaled(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def stored_exp(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m, 16], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = torch.exp(x[tm, tn])
+        out[tm, :] = value
+    return out
+
+
+def stored_scaled(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m, 16], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn] * 2.0
+        out[tm, :] = value
+    return out
+
+
+def stored_shifted_after(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m, 16], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn] * 2.0
+        out[tm, :] = value + 1.0
+    return out
+
+
+def sum_shifted_after(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn] * 2.0
+        out[tm] = (value + 1.0).sum(-1)
+    return out
+
+
+def einsum_of_exp(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = torch.exp(x[tm, tn])
+        out[tm] = torch.einsum("mn,mn->m", value, value)
+    return out
+
+
+def carried_amax(x: torch.Tensor) -> torch.Tensor:
+    m, a, c = x.shape
+    block_a = hl.register_block_size(a)
+    block_c = hl.register_block_size(c)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_c], dtype=torch.float32)
+        for _ta in hl.tile(a, block_size=block_a):
+            for tc in hl.tile(c, block_size=block_c):
+                value = x[tm, 0, tc]
+        out[tm] = value.amax(-1)
+    return out
+
+
+def carried_sum_of_exp(x: torch.Tensor) -> torch.Tensor:
+    m, a, c = x.shape
+    block_a = hl.register_block_size(a)
+    block_c = hl.register_block_size(c)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_c], dtype=torch.float32)
+        for _ta in hl.tile(a, block_size=block_a):
+            for tc in hl.tile(c, block_size=block_c):
+                value = torch.exp(x[tm, 0, tc])
+        out[tm] = value.sum(-1)
+    return out
+
+
+def carried_stored_exp(x: torch.Tensor) -> torch.Tensor:
+    m, a, c = x.shape
+    block_a = hl.register_block_size(a)
+    block_c = hl.register_block_size(c)
+    out = torch.empty([m, 8], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_c], dtype=torch.float32)
+        for _ta in hl.tile(a, block_size=block_a):
+            for tc in hl.tile(c, block_size=block_c):
+                value = torch.exp(x[tm, 0, tc])
+        out[tm, :] = value
+    return out
+
+
+def carried_sum_of_scaled(x: torch.Tensor) -> torch.Tensor:
+    m, a, c = x.shape
+    block_a = hl.register_block_size(a)
+    block_c = hl.register_block_size(c)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_c], dtype=torch.float32)
+        for _ta in hl.tile(a, block_size=block_a):
+            for tc in hl.tile(c, block_size=block_c):
+                value = x[tm, 0, tc] * 2.0
+        out[tm] = value.sum(-1)
+    return out
+
+
+def sibling_amax(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    block_k = hl.register_block_size(n)
+    out = torch.empty_like(x)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn]
+        for tk in hl.tile(n, block_size=block_k):
+            out[tm, tk] = value.amax(-1, keepdim=True) + x[tm, tk] * 0.0
+    return out
+
+
+def sibling_sum_of_exp(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    block_k = hl.register_block_size(n)
+    out = torch.empty_like(x)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = torch.exp(x[tm, tn])
+        for tk in hl.tile(n, block_size=block_k):
+            out[tm, tk] = value.sum(-1, keepdim=True) + x[tm, tk] * 0.0
+    return out
+
+
+def sibling_same_block(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    block_k = block_n
+    out = torch.empty_like(x)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn]
+        for tk in hl.tile(n, block_size=block_k):
+            out[tm, tk] = value.amax(-1, keepdim=True) + x[tm, tk] * 0.0
+    return out
+
+
+def sibling_sum(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    block_k = hl.register_block_size(n)
+    out = torch.empty_like(x)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn]
+        for tk in hl.tile(n, block_size=block_k):
+            out[tm, tk] = value.sum(-1, keepdim=True) + x[tm, tk] * 0.0
+    return out
+
+
+def sibling_running(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    block_k = hl.register_block_size(n)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn]
+        top = hl.full([tm, 1], float("-inf"), dtype=torch.float32)
+        for _tk in hl.tile(32, block_size=block_k):
+            top = torch.maximum(top, value.amax(-1, keepdim=True))
+        out[tm] = top.squeeze(-1)
+    return out
+
+
+def sibling_two_levels(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    block_k = hl.register_block_size(n)
+    block_j = hl.register_block_size(n)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn]
+        top = hl.full([tm, 1], float("-inf"), dtype=torch.float32)
+        for _tk in hl.tile(16, block_size=block_k):
+            for _tj in hl.tile(16, block_size=block_j):
+                top = torch.maximum(top, value.amax(-1, keepdim=True))
+        out[tm] = top.squeeze(-1)
+    return out
+
+
+def after_times_recip(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn]
+        out[tm] = (value * (1.0 / value)).sum(-1)
+    return out
+
+
+def body_times_recip(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn] * (1.0 / x[tm, tn])
+        out[tm] = value.sum(-1)
+    return out
+
+
+def after_times_exp(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m], dtype=torch.float32, device=x.device)
+    for tm in hl.tile(m):
+        value = hl.zeros([tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(n, block_size=block_n):
+            value = x[tm, tn]
+        out[tm] = (value * torch.exp(-value)).sum(-1)
+    return out
+
+
 def _logical_or(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.logical_or(a, b)
 
@@ -375,3 +617,94 @@ def test_refusal_names_static_shapes(fn: object) -> None:
     with pytest.raises(UnsupportedOperationError) as refused:
         kernel(fn)(torch.randn(16, 64).abs() + 1.0)
     assert "static_shapes=True" in str(refused.value)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [stored_exp, stored_shifted_after, sum_shifted_after, einsum_of_exp],
+    ids=lambda v: v.__name__,
+)
+def test_last_tile_use_after_the_loop_refused(fn: object) -> None:
+    """Padding that isn't 0 reaches a store or a reduction: padded lanes held 1.0, and
+    sums and an einsum were off by 7.8 % and 1 %."""
+    with pytest.raises(UnsupportedOperationError, match="after a loop"):
+        _kernel(fn)(torch.rand(16, 60) + 1.0)
+
+
+def test_last_tile_store_of_padding_that_stays_zero() -> None:
+    x = torch.rand(16, 60) + 1.0
+    got = _kernel(stored_scaled)(x).double()
+    assert (got[:, :12] - x[:, 48:].double() * 2).abs().max() < 1e-5
+    assert torch.count_nonzero(got[:, 12:]) == 0
+
+
+def _kernel_3d(fn: object) -> helion.Kernel:
+    return helion.kernel(
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[8, 8, 16]),
+    )(fn)
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [carried_amax, carried_sum_of_exp, carried_stored_exp],
+    ids=lambda v: v.__name__,
+)
+def test_last_tile_value_through_an_enclosing_loop_refused(fn: object) -> None:
+    """Carried out through the enclosing loop, off by 113 % as a sum of exp."""
+    with pytest.raises(UnsupportedOperationError, match="after a loop"):
+        _kernel_3d(fn)(-(torch.rand(16, 8, 30) + 1.0))
+
+
+def test_last_tile_sum_through_an_enclosing_loop() -> None:
+    x = torch.rand(16, 8, 30) + 1.0
+    ref = (x[:, 0, 24:].double() * 2).sum(-1)
+    got = _kernel_3d(carried_sum_of_scaled)(x).double()
+    assert (got - ref).abs().max() / ref.max() < 1e-5
+
+
+@pytest.mark.parametrize(
+    "fn",
+    [
+        sibling_amax,
+        sibling_sum_of_exp,
+        sibling_same_block,
+        sibling_running,
+        sibling_two_levels,
+    ],
+    ids=lambda v: v.__name__,
+)
+def test_last_tile_value_read_by_a_sibling_loop_refused(fn: object) -> None:
+    """The sibling loop's mask is its own tile's: maxima of negatives were off by
+    100 % and a sum of exp by 2.3 %."""
+    x = -(torch.rand(16, 60) + 1.0)
+    blocks = {sibling_same_block: 2, sibling_two_levels: 4}.get(fn, 3)
+    kernel = helion.kernel(
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[16] * blocks),
+    )
+    with pytest.raises(UnsupportedOperationError, match="after a loop"):
+        kernel(fn)(x)
+
+
+@pytest.mark.parametrize(
+    "fn", [after_times_recip, body_times_recip], ids=lambda v: v.__name__
+)
+def test_zero_times_a_value_from_padding_refused(fn: object) -> None:
+    """Padded lanes hold 0 * inf: NaN in the sum."""
+    with pytest.raises(UnsupportedOperationError, match="after a loop"):
+        _kernel(fn)(torch.rand(16, 60) + 1.0)
+
+
+@pytest.mark.parametrize("fn", [sibling_sum, after_times_exp], ids=lambda v: v.__name__)
+def test_right_but_refused_without_a_proof(fn: object) -> None:
+    """Pinned: right without the refusal, and accepted as a false refusal: nothing
+    proves the padding stays 0 there. This test can change if the walk learns more."""
+    blocks = [16, 16, 16] if fn is sibling_sum else [16, 16]
+    kernel = helion.kernel(
+        backend="mlir", static_shapes=True, config=helion.Config(block_sizes=blocks)
+    )
+    with pytest.raises(UnsupportedOperationError, match="after a loop"):
+        kernel(fn)(torch.rand(16, 60) + 1.0)
