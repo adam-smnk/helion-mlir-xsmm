@@ -175,8 +175,9 @@ What the numbers rest on, each measured alone:
 
 Not covered:
 
-- **`document` skips only the causal part:** a loop bound read from a tensor would skip by data. It needs a
-  proof of full tiles from a tensor read, which no source form gave.
+- **`document`, a known limit:** the kernel skips only the K/V tiles past the query tile, the causal part, and masks
+  the rest. FlexAttention also skips by the data, with a block mask computed on the host: 1356 against 557 µs at S = 2048, growing
+  with S. Skipping here would need a loop bound read from a tensor, with its tiles proven full; not attempted further.
 - `D = 128` (Gemma 2's): lighthouse's attention layout hard-codes a head dim of 64.
 - A bias from a tensor, `bias[tm, tn]`: a third 2D load in an attention kernel has no layout (f32:
   over the block load's limit in XeVM; bf16: a 64-element vector, LLVM's SPIR-V backend aborts).
