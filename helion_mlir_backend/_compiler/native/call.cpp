@@ -315,8 +315,10 @@ int same_value(int kind, PyObject* a, PyObject* b) {
 int same_function(const Param& p, PyObject* fn) {
   if (fn == p.value) return 1;
   if (!PyFunction_Check(fn)) return 0;
-  // Equal code (e.g. the same model loaded from two files), as Helion's
-  // function key compares it.
+  // Equal code and closure cells, e.g. a new closure per call. The kernel's
+  // function key already told apart functions of other globals or defaults
+  // (inject.py) and led here only if they matched; a bound kernel called
+  // directly with another function is not checked for them, on any path.
   const int same_code =
       PyObject_RichCompareBool(PyFunction_GET_CODE(fn), PyFunction_GET_CODE(p.value), Py_EQ);
   if (same_code <= 0) return same_code;

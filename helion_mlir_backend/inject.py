@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 from typing import Callable
 
 log = logging.getLogger(__name__)
@@ -33,6 +34,8 @@ def install() -> bool:
     _register_autotune_cache()
     _accept_mlir_module_globals()
     _keep_runtime_slice_sizes(MLIRBackend)
+    _key_function_args_by_globals_and_defaults(MLIRBackend)
+    _check_module_lookups(MLIRBackend)
     install_trace_mode()
     install_original_args_capture()
     return True
@@ -100,6 +103,111 @@ def _keep_runtime_slice_sizes(MLIRBackend: type) -> None:
 
     CompileEnvironment.try_concretize_symint = try_concretize_symint
     CompileEnvironment._helion_mlir_runtime_slice_sizes = True
+
+
+class _SameObject:
+    """Key part that matches only the very object it holds, unhashable or not.
+    Holding it keeps its id from being reused while the key lives."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: object) -> None:
+        self.value = value
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, _SameObject) and self.value is other.value
+
+    def __hash__(self) -> int:
+        return id(self.value)
+
+    def __repr__(self) -> str:
+        return f"<{type(self.value).__name__} object>"
+
+
+def _default_key(value: object) -> object:
+    """Defaults are compiled in as constants, so equal values may share a key.
+    Floats by their bits: 0.0 == -0.0, and NaN differs from itself."""
+    if type(value) is float:
+        return float, value.hex()
+    if value is None or type(value) in (bool, int, str):
+        return type(value), value
+    return _SameObject(value)
+
+
+def _key_function_args_by_globals_and_defaults(MLIRBackend: type) -> None:
+    """Keep kernels from reusing a compile for a function that differs from it.
+
+    Helion keys a function argument (an epilogue) by its code object and closure
+    cells. Code objects compare by content, ignoring the file, so two modules'
+    functions of the same text and line share a key, as do functions of one
+    ``def`` with different defaults. The second call then ran the first one's
+    compile: other module globals, or the first default, without an error.
+    """
+    import types
+
+    from helion.runtime.kernel import _specialization_extractors as extractors
+
+    original = extractors[types.FunctionType]
+    if getattr(original, "_helion_mlir_globals_and_defaults", False):
+        return
+    backend_name = MLIRBackend().name
+
+    def function_key(kernel: object, fn: types.FunctionType) -> object:
+        key = original(kernel, fn)
+        if kernel.settings.backend != backend_name:  # type: ignore[attr-defined]
+            return key
+        defaults = tuple(map(_default_key, fn.__defaults__ or ()))
+        return key, _SameObject(fn.__globals__), defaults
+
+    function_key._helion_mlir_globals_and_defaults = True  # type: ignore[attr-defined]
+    extractors[types.FunctionType] = function_key
+
+
+def _check_module_lookups(MLIRBackend: type) -> None:
+    """Refuse a module global when ``sys.modules`` names another module.
+
+    Helion finds a global's module through ``sys.modules``, by name. Its check
+    that it found the right one is an ``assert``, gone under ``python -O``, and
+    is skipped for a name it already resolved in this kernel; host code then
+    reads the other module's value.
+    """
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.host_function import HostFunction
+
+    from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
+
+    if getattr(HostFunction, "_helion_mlir_checked_lookups", False):
+        return
+
+    def check(scope: dict[str, object], global_name: str) -> None:
+        if not isinstance(CompileEnvironment.current().backend, MLIRBackend):
+            return
+        name = scope["__name__"]
+        module = sys.modules.get(name)
+        if module is None or vars(module) is not scope:
+            raise UnsupportedOperationError(
+                f"module global {global_name}",
+                reason=f"sys.modules[{name!r}] is "
+                f"{'missing' if module is None else 'another module'}; "
+                "give each loaded module its own name",
+            )
+
+    global_scope_origin = HostFunction.global_scope_origin
+    import_from_module = HostFunction.import_from_module
+
+    def checked_global_scope_origin(self: HostFunction, name: str) -> object:
+        check(self.fn.__globals__, name)
+        return global_scope_origin(self, name)
+
+    def checked_import_from_module(
+        self: HostFunction, module_scope: dict[str, object], name: str
+    ) -> object:
+        check(module_scope, name)
+        return import_from_module(self, module_scope, name)
+
+    HostFunction.global_scope_origin = checked_global_scope_origin
+    HostFunction.import_from_module = checked_import_from_module
+    HostFunction._helion_mlir_checked_lookups = True
 
 
 def _register_autotune_cache() -> None:
