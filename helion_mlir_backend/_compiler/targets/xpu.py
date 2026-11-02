@@ -59,6 +59,7 @@ from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
 from ..mlir_transforms.xevm_fabs import fabs_as_integer_min
+from ..mlir_transforms.xevm_lane_conversions import convert_lanes_where_computed
 from ..mlir_transforms.xevm_lane_reductions import check_lane_reductions
 from ..mlir_transforms.xevm_nsz_minmax import nsz_minmax
 from ..mlir_transforms.xevm_tile_order import ORDER_FIRST_ABOVE
@@ -202,7 +203,8 @@ def _stages(
         stages[index] = ("xevm", _CheckLaneReductions(stages[index][1]))
     if stop_at == "binary":
         # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays,
-        # xevm_nsz_minmax, xevm_unit_clamps, xevm_bf16_extensions and xevm_fabs;
+        # xevm_nsz_minmax, xevm_unit_clamps, xevm_bf16_extensions, xevm_fabs and
+        # xevm_lane_conversions;
         # _ToBinary for xevm_tile_order.
         stages.extend(
             [
@@ -212,6 +214,7 @@ def _stages(
                 ("xevm-unit-clamps", _UnitClamps()),
                 ("xevm-bf16-extensions", _Bf16Extensions()),
                 ("xevm-fabs", _FabsAsIntegerMin()),
+                ("xevm-lane-conversions", _LaneConversions()),
                 ("binary", _ToBinary(_kernels_by_module(entry, kernels))),
             ]
         )
@@ -446,6 +449,15 @@ class _FabsAsIntegerMin(Stage):
 
     def apply(self, module: ir.Module) -> ir.Module:
         fabs_as_integer_min(module)
+        return module
+
+
+class _LaneConversions(Stage):
+    """A narrowing conversion of a vector built by lanes, lane by lane (works around
+    IGC's vectorized cast before its operand, :mod:`xevm_lane_conversions`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        convert_lanes_where_computed(module)
         return module
 
 

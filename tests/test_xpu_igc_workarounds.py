@@ -26,12 +26,14 @@ import torch
 import torch.nn.functional as F
 
 from tests import kernelbench_xpu as kb
+from tests import xpu_math_full_kernels as full_kernels
 from tests.harness import xpu_tensor
 from tests.igc_dumps import igc_dump_problems
 from tests.igc_dumps import narrow_minmax
 
 from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler import xpu_transforms
+from helion_mlir_backend._compiler.targets import xpu as xpu_target
 from helion_mlir_backend._compiler.targets.xpu import bindings_emit_spirv
 
 pytestmark = pytest.mark.isolated
@@ -134,9 +136,12 @@ def _attention_problem() -> kb.Problem:
     return next(p for p in kb.RANK3_PROBLEMS if p.name.startswith("97"))
 
 
-def _kernel(fn: object, blocks: list[int]) -> helion.Kernel:
+def _kernel(fn: object, blocks: list[int], **keys: object) -> helion.Kernel:
     return helion.kernel(
-        fn, backend="mlir", static_shapes=True, config=helion.Config(block_sizes=blocks)
+        fn,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=blocks, **keys),
     )
 
 
@@ -314,15 +319,9 @@ def _problem(prefix: str) -> tuple[helion.Kernel, list[object], helion.Config]:
 
 
 SCANNED_PROBLEMS = [
-    "1_Square_",  # a GEMM: 256 registers matter, and no compare in the kernel.
-    "23_Softmax",  # a row maximum and a row sum.
-    "38_L1Norm_",  # row sums over tiles.
-    "97_",  # the running maximum.
-    "12_Gemm_",  # level 2: its uninitialized reads are dead (see below).
-    "81_Gemm_",  # level 2: clamps.
+    problem.name for problem in (*kb.PROBLEMS, *kb.RANK3_PROBLEMS, *kb.LEVEL2_PROBLEMS)
 ]
-"""Representative kernels of each class with compares, to keep the test small. A
-scan of all 35 XPU problems that lower gave no narrow min/max and no ``(sat)``."""
+"""Every benchmarked XPU problem, as each compiles in its own way."""
 
 
 @BINARIES
@@ -332,7 +331,8 @@ def test_problems_have_no_narrow_minmax_and_use_all_registers(
 ) -> None:
     """Every binary keeps the 256 registers (a second option in ``opts``'s one
     pair of quotes silently loses them, no error) and reaches IGC with the
-    workaround; no size-1 min/max into a vector.
+    workaround; nothing that shows a known miscompile: no size-1 min/max into a
+    vector, no vector compare, no use before its def.
 
     Only the min/max is checked, not all uninitialized reads: seven level 2
     kernels read uninitialized rows of the vectors they then insert into, each
@@ -340,9 +340,8 @@ def test_problems_have_no_narrow_minmax_and_use_all_registers(
     kernel, args, config = _problem(prefix)
     dump = _igc_dump(monkeypatch, tmp_path, kernel, args, config)
     for visaasm in dump.glob("*.visaasm"):
-        text = visaasm.read_text(errors="replace")
-        assert "-TotalGRFNum 256" in text, visaasm.name
-        assert narrow_minmax(visaasm) == [], visaasm.name
+        assert "-TotalGRFNum 256" in visaasm.read_text(errors="replace"), visaasm.name
+    assert _dump_problems(dump) == []
     _assert_options_in_force(dump, cmp=bool(_entries(config, "igc_vectorizer")))
 
 
@@ -365,11 +364,11 @@ def _assert_options_in_force(dump: pathlib.Path, *, cmp: bool) -> None:
     commands = [path.read_text(errors="replace") for path in dump.glob("*_cmd.txt")]
     assert any(wanted in text for text in commands)
     assert not any(other in text for text in commands)
-    if not cmp:
-        optimized = list(dump.glob("*_optimized.ll"))
-        assert optimized
-        for path in optimized:
-            assert "vectorized_" not in path.read_text(errors="replace"), path.name
+    optimized = list(dump.glob("*_optimized.ll"))
+    assert optimized
+    for path in optimized:
+        unwanted = "vectorized_cmp" if cmp else "vectorized_"
+        assert unwanted not in path.read_text(errors="replace"), path.name
 
 
 @BINARIES
@@ -486,20 +485,67 @@ def _rounded_sine(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 
 
 @BINARIES
-def test_vectorizer_cmp_shows_the_fptrunc_miscompile_there(
+def test_vectorizer_cmp_needs_the_lane_conversions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
     """``igc_vectorizer="cmp"`` on the form of ``VectorizerAllowFPTRUNC``'s bug: a use
-    before its def in IGC's IR, stale registers in the output. It is what a kernel
-    must not choose. The negative: the default."""
+    before its def in IGC's IR, stale registers in the output, unless
+    ``xevm_lane_conversions`` runs. If IGC no longer shows it without the rewrite, the
+    rewrite's removal condition may hold: see that module's docstring. The negative:
+    ``"off"`` without the rewrite."""
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")
     kernel = helion.kernel(_rounded_sine, backend="mlir", static_shapes=True)
     args = [xpu_tensor(64, 512, dtype=BF16), xpu_tensor(64, 512, dtype=BF16)]
-    for choice, wrong in (("cmp", True), ("off", False)):
-        directory = tmp_path / choice
+    rewrite = xpu_target.convert_lanes_where_computed
+    for choice, rewritten, wrong in (
+        ("cmp", False, True),
+        ("cmp", True, False),
+        ("off", False, False),
+    ):
+        directory = tmp_path / f"{choice}-{rewritten}"
         directory.mkdir()
+        monkeypatch.setattr(
+            xpu_target,
+            "convert_lanes_where_computed",
+            rewrite if rewritten else lambda module: 0,
+        )
         config = helion.Config(block_sizes=[32, 256], igc_vectorizer=[choice])
         dump = _igc_dump(monkeypatch, directory, kernel, args, config)
-        assert bool(_dump_problems(dump)) == wrong
+        assert bool(_dump_problems(dump)) == wrong, (choice, rewritten)
+
+
+_ROUNDED = ["sin", "log", "powf", "f64_sin"]
+"""Kernels of ``fptrunc/``'s scope: a builtin with branches rounded straight to 16 bits,
+and ``sin`` in f64 narrowed to f32 and then to 16 bits."""
+_ROUNDED_DTYPES = [(BF16, BF16), (F32, BF16), (F16, F16)]
+_ROUNDED_TILES = [((16, 8192), [1, 8192]), ((256, 512), [128, 256])]
+"""1D and 2D tiles: the conversion of a slice in the latter."""
+
+
+@BINARIES
+@pytest.mark.parametrize("dtypes", _ROUNDED_DTYPES, ids=str)
+@pytest.mark.parametrize(("shape", "blocks"), _ROUNDED_TILES, ids=["1d", "2d"])
+@pytest.mark.parametrize("name", _ROUNDED)
+def test_builtins_rounded_to_16_bits_have_no_use_before_def(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+    name: str,
+    shape: tuple[int, int],
+    blocks: list[int],
+    dtypes: tuple[torch.dtype, torch.dtype],
+) -> None:
+    """The exact kernels of ``xevm_lane_conversions``'s regressions, with the
+    vectorizer on."""
+    kernel = helion.kernel(
+        getattr(full_kernels, f"cast_{name}"),
+        backend="mlir",
+        static_shapes=True,
+    )
+    args = [xpu_tensor(*shape, dtype=dtypes[0]), xpu_tensor(*shape, dtype=dtypes[1])]
+    config = helion.Config(block_sizes=blocks, igc_vectorizer=["cmp"])
+    dump = _igc_dump(monkeypatch, tmp_path, kernel, args, config)
+    _assert_options_in_force(dump, cmp=True)
+    assert _dump_problems(dump) == []
 
 
 @BINARIES
@@ -677,3 +723,40 @@ def test_unit_clamps_match_torch(name: str, dtype: torch.dtype) -> None:
     if name in ("hardtanh_of_relu", "clamp_of_clamp"):
         out, ref = out + 0.0, ref + 0.0
     _assert_same_values(out, ref)
+
+
+def _paint(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Leaves ``x``'s value in the registers a later kernel reads if it is wrong."""
+    for tile in hl.tile(x.shape):
+        out[tile] = x[tile] * 1.0 + x[tile] * 1.0 - x[tile]
+    return out
+
+
+@DEVICE
+@pytest.mark.parametrize("dtypes", _ROUNDED_DTYPES, ids=str)
+@pytest.mark.parametrize(("shape", "blocks"), _ROUNDED_TILES, ids=["1d", "2d"])
+def test_f64_narrowed_to_16_bits_matches_fp64(
+    shape: tuple[int, int],
+    blocks: list[int],
+    dtypes: tuple[torch.dtype, torch.dtype],
+) -> None:
+    """Regression: ``fptrunc <8 x double>`` before its operand, so the output was what
+    earlier kernels left, up to 130037 of 131072 elements off by over 1 %."""
+    source, target = dtypes
+    kernel = _kernel(full_kernels.cast_f64_sin, blocks, igc_vectorizer=["cmp"])
+    paint = _kernel(_paint, [32, 256], igc_vectorizer=["off"])
+    generator = torch.Generator().manual_seed(0)
+    x = (torch.rand(shape, generator=generator) * 0.8 + 0.1).to(source)
+    ref = torch.sin(x.double()).to(torch.float32).double()
+    on_device = x.to("xpu")
+    first = None
+    for value in (1234.5, math.nan, 3e38):
+        filled = torch.full((64, 512), value, device="xpu")
+        paint(filled, torch.empty(64, 512, device="xpu"))
+        torch.xpu.synchronize()
+        out = kernel(on_device, torch.empty(shape, dtype=target, device="xpu")).cpu()
+        assert not out.isnan().any()
+        error = (out.double() - ref).abs().max() / ref.abs().max()
+        assert error <= 2**-6, (value, float(error))
+        first = out if first is None else first
+        assert torch.equal(out, first), value

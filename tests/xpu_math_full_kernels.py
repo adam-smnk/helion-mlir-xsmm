@@ -277,6 +277,15 @@ def cast_sin(x, out):
     return out
 
 
+def cast_f64_sin(x, out):
+    """``sin`` in f64, narrowed to f32, then to the output's dtype: not in ``FN``, as
+    ``test_math_every_pattern``'s ranges and tolerances are for f32 math."""
+    for t in hl.tile(x.shape):
+        v = x[t].to(torch.float32)
+        out[t] = (torch.sin(v.to(torch.float64)).to(torch.float32)).to(out.dtype)
+    return out
+
+
 def nat_sin(x, out):
     for t in hl.tile(x.shape):
         out[t] = torch.sin(x[t])

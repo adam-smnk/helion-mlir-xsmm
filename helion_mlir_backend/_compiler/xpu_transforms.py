@@ -168,16 +168,16 @@ The pass's partial switches (``-igc_opts``, comma separated), and what each avoi
   with another one kept over a loop, or with a second row value: a running
   maximum, or a row sum through a clamp.
 - ``VectorizerAllowFPTRUNC=0``: no vector ``fptrunc``. ``fptrunc <8 x float> %v`` is
-  placed before the ``insertelement``s of ``%v``, a use before its def, only where a
-  scalar builtin's result goes straight into a conversion to 16 bits (``sin``, ``cos``,
-  ``tan``, ``log``, ``log2``, ``expm1``, ``sinh``, ``cosh`` and ``acos`` of f32 rounded
-  to bf16 here; ``upstream-repro/igc-vector-minmax/fptrunc`` in the wiki, on a scalar
-  ``tanh`` builtin; Helion's ``tanh`` is a polynomial, ``xpu_math_approx``, and does not
-  take it): the output is whatever those registers hold, left by an earlier kernel,
-  zero only if nothing has written them yet. Not set with :data:`IGC_OPTIONS_CMP`, as it
-  costs most of what that gains on attention (Llama GQA 288 against 220 us), so a
-  ``"cmp"`` kernel of that form is wrong: it is the kernel author's choice, and
-  ``tests/test_xpu_igc_workarounds.py`` scans the kernels that choose it.
+  placed before the ``insertelement``s of ``%v``, a use before its def, where a scalar
+  builtin's result goes straight into a conversion to 16 bits (``sin``, ``cos``, ``tan``,
+  ``log``, ``log2``, ``expm1``, ``sinh``, ``cosh`` and ``acos`` of f32 rounded to bf16
+  here; ``upstream-repro/igc-vector-minmax/fptrunc`` in the wiki, on a scalar ``tanh``
+  builtin; Helion's ``tanh`` is a polynomial, ``xpu_math_approx``, and does not take
+  it), or narrowing from f64: the output is whatever those registers hold, left by an
+  earlier kernel, zero only if nothing has written them yet. Not set with
+  :data:`IGC_OPTIONS_CMP`, as it costs most of what that gains on attention (Llama GQA
+  288 against 220 us): :mod:`.mlir_transforms.xevm_lane_conversions` avoids that form
+  in the IR instead, for every kernel.
 - ``VectorizerAllowSelect=0``: avoids the Triton compiler crash through ``ocloc``,
   as ``VectorizerAllowCMP=0`` also does; cause not investigated.
 - ``VectorizerAllowFADD``, ``FSUB``, ``FMUL``, ``FDIV``, ``EXP2``, ``MAXNUM``,

@@ -95,8 +95,8 @@ VECTORIZER = "igc_vectorizer"
 ``xpu_transforms.IGC_OPTIONS``) or ``"cmp"`` (on but for vector compares,
 ``IGC_OPTIONS_CMP``). Not an XeGPU parameter: it picks the kernel's IGC options. A
 plain choice of the kernel's author, never made automatically and not searched:
-``"cmp"`` is faster on some kernels, and exposed to the IGC bug described at
-``IGC_OPTIONS`` elsewhere. Nothing checks that at compile time."""
+``"cmp"`` is faster on some kernels; ``xevm_lane_conversions`` avoids the known bug it
+is exposed to (``IGC_OPTIONS``). Nothing checks the binary at compile time."""
 _ARITY = {SG_TILES: 2, LOAD_TILES: 4, PREFETCH_TILES: 4, PREFETCH_DEPTHS: 2}
 _ELEMENTWISE_ARITY = {LOAD_TILES: (2, 1)}
 """Other entry lengths: ``[m, n]`` load tiles of 2D elementwise and reduction
