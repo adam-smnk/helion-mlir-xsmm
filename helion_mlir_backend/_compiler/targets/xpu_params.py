@@ -204,9 +204,7 @@ def xegpu_params(config: Mapping[str, object]) -> tuple[KernelParams, ...]:
                 NAN_IGNORING_MAXIMA: "True",
                 VECTORIZER: '"cmp" or "off"',
                 LAYOUTS: '"lighthouse", "ir", "ir-selector" or "ir-upstream"',
-            }.get(
-                key, f"a list of {_ARITY.get(key)} ints"
-            )
+            }.get(key, f"a list of {_ARITY.get(key)} ints")
             raise XeGPUConfigError(
                 f"{key}={value!r}: expected a list with one entry per GPU kernel "
                 f"(top-level grid loop): {entry}, or None"

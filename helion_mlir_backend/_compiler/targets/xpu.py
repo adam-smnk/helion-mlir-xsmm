@@ -52,12 +52,12 @@ from ..mlir.support.debug import xpu_stop_at
 from ..mlir.support.errors import UnsupportedOperationError
 from ..mlir.support.errors import UnsupportedTargetError
 from ..mlir.support.errors import XeGPUConfigError
+from ..mlir_transforms import xegpu_layouts
 from ..mlir_transforms.keep_row_dims import keep_row_dims
 from ..mlir_transforms.xegpu_attention_loops import copy_attention_layouts
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
 from ..mlir_transforms.row_maxima import restore_nan_propagating_maxima
-from ..mlir_transforms import xegpu_layouts
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
@@ -210,7 +210,10 @@ def _stages(
     if stop_at != "xegpu-wg":
         # The reductions as lowered are checked (xevm_lane_reductions).
         index = next(i for i, (name, _) in enumerate(stages) if name == "xevm")
-        stages[index] = ("xevm", _CheckLaneReductions(stages[index][1]))
+        lowering = _CheckLaneReductions(stages[index][1])
+        if any(kernel.layouts is not None for kernel in kernels):
+            lowering = _LayoutWarningsAreErrors(lowering)
+        stages[index] = ("xevm", lowering)
     if stop_at == "binary":
         # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays,
         # xevm_nsz_minmax, xevm_unit_clamps, xevm_bf16_extensions, xevm_fabs and
@@ -425,7 +428,9 @@ class _IRLayouts(Stage):
     def apply(self, module: ir.Module) -> ir.Module:
         module = self.stage.apply(module)
         funcs = {
-            index: _kernel_func(module, xpu_transforms.kernel_module_name(self.entry, index))
+            index: _kernel_func(
+                module, xpu_transforms.kernel_module_name(self.entry, index)
+            )
             for index, kernel in enumerate(self.kernels)
             if kernel.layouts is not None
         }
@@ -504,6 +509,41 @@ def _layout_failure(index: int, kernel: KernelParams, exc: Exception) -> Excepti
         reason=str(exc),
         alternatives=[_CPU],
     )
+
+
+class _LayoutWarningsAreErrors(Stage):
+    """``stage``, failing on a layout warning from its passes. Upstream only warns
+    when a layout a 2D block load cannot take reaches ``visitLoadNdOp``, then
+    lowers wrong rows (``upstream-issues-xpu.md``). For kernels with IR-derived
+    layouts, which must not depend on what the warning goes on to do."""
+
+    def __init__(self, stage: Stage) -> None:
+        self.stage = stage
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        warnings_seen: list[str] = []
+
+        def on_diagnostic(diagnostic: ir.Diagnostic) -> bool:
+            if (
+                diagnostic.severity == ir.DiagnosticSeverity.WARNING
+                and "layout" in diagnostic.message
+            ):
+                warnings_seen.append(diagnostic.message)
+                return True
+            return False
+
+        handler = module.context.attach_diagnostic_handler(on_diagnostic)
+        try:
+            module = self.stage.apply(module)
+        finally:
+            handler.detach()
+        if warnings_seen:
+            raise UnsupportedOperationError(
+                "a kernel whose XeGPU layouts the lowering could not complete",
+                reason="; ".join(sorted(set(warnings_seen))[:4]),
+                alternatives=[_CPU],
+            )
+        return module
 
 
 class _CheckBlockSurfaces(Stage):

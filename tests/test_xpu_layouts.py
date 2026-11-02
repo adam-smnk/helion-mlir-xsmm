@@ -7,14 +7,19 @@ from __future__ import annotations
 import re
 
 import helion
+import helion.language as hl
 import lighthouse.dialects as lh_dialects
 from mlir import ir
+from mlir.passmanager import PassManager
 import pytest
+import torch
 
 from tests import kernelbench_xpu as kb
+from tests import xpu_layout_forms as forms
 from tests.harness import xpu_tensor
 
 from helion_mlir_backend import lower_mlir
+from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 from helion_mlir_backend._compiler.mlir.support import XeGPUConfigError
 from helion_mlir_backend._compiler.mlir_transforms import xegpu_layouts as xl
 from helion_mlir_backend._compiler.targets.xpu_params import xegpu_params
@@ -174,7 +179,7 @@ def _reduction_after_gemm(rows: int = 256, cols: int = 64, k: int = 32) -> str:
 
 
 def _parse(body: str, hints: str = "") -> ir.Module:
-    attrs = f', {xl.HINTS_ATTR} = {{{hints}}}' if hints else ""
+    attrs = f", {xl.HINTS_ATTR} = {{{hints}}}" if hints else ""
     return ir.Module.parse(_FUNC.format(attrs=attrs, body=body))
 
 
@@ -407,3 +412,184 @@ def test_forced_tiles_must_fit_a_subgroup(hint: str, k: int, match: str) -> None
     module = _parse(_gemm_body(256, 256, k), hint)
     with pytest.raises(xl.LayoutError, match=match):
         xl.annotate_layouts(module.operation, _func(module))
+
+
+# --- New forms: refused by lighthouse's path, laid out from their IR --------------
+
+
+def _form_kernel(form: forms.Form, **config: object) -> helion.Kernel:
+    return helion.kernel(
+        form.fn,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=form.blocks, **config),
+    )
+
+
+def _form_args(form: forms.Form) -> list[object]:
+    return [xpu_tensor(*shape, dtype=torch.bfloat16) for shape in form.shapes]
+
+
+@pytest.mark.parametrize("name", list(forms.FORMS))
+def test_form_lowers_from_its_ir(name: str) -> None:
+    form = forms.FORMS[name]
+    kernel = _form_kernel(form, xegpu_layouts=["ir"])
+    text = str(lower_mlir(kernel, _form_args(form), target="xpu", stop_at="xegpu-wg"))
+    store = re.findall(r"xegpu\.store_nd [^\n]*sg_layout = \[(\d+), (\d+)\]", text)
+    assert tuple(map(int, store[-1])) == form.sg_layout
+    for op in ("xegpu.dpas", "xegpu.load_nd", "xegpu.store_nd"):
+        assert all("layout" in line for line in text.splitlines() if f"{op} " in line)
+
+
+@pytest.mark.parametrize("name", [n for n, f in forms.FORMS.items() if f.refusal])
+def test_form_is_refused_by_lighthouses_path(name: str) -> None:
+    form = forms.FORMS[name]
+    with pytest.raises(
+        (UnsupportedOperationError, XeGPUConfigError), match=form.refusal
+    ):
+        lower_mlir(
+            _form_kernel(form), _form_args(form), target="xpu", stop_at="xegpu-wg"
+        )
+
+
+def test_dot_product_row_norm_is_refused_clearly() -> None:
+    """``sum(a * a)`` vectorizes to a ``vector.contract`` of a row with itself, which
+    no XeGPU op takes: refused, not a contraction laid out as a DPAS."""
+
+    def row_l2(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        m, k = x.size()
+        n = w.size(0)
+        out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+        for tm in hl.tile(m):
+            acc = hl.zeros([tm, n], dtype=torch.float32)
+            for tk in hl.tile(k):
+                acc = torch.addmm(acc, x[tm, tk], w[:, tk].T)
+            out[tm, :] = (acc / torch.sqrt((acc * acc).sum(-1, keepdim=True))).to(
+                x.dtype
+            )
+        return out
+
+    kernel = helion.kernel(
+        row_l2,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[128, 32], xegpu_layouts=["ir"]),
+    )
+    args = [
+        xpu_tensor(512, 2048, dtype=torch.bfloat16),
+        xpu_tensor(256, 2048, dtype=torch.bfloat16),
+    ]
+    with pytest.raises(UnsupportedOperationError, match="vector.contract"):
+        lower_mlir(kernel, args, target="xpu", stop_at="xegpu-wg")
+
+
+def test_chain_through_buffer_keeps_its_store() -> None:
+    """The intermediate of ``chain_through_buffer`` is forwarded in registers before
+    XeGPU, and still stored: rows only, each subgroup storing what it owns."""
+    form = forms.FORMS["chain_through_buffer"]
+    kernel = _form_kernel(form, xegpu_layouts=["ir"])
+    text = str(lower_mlir(kernel, _form_args(form), target="xpu", stop_at="xegpu-wg"))
+    (stored,) = re.findall(
+        r"xegpu\.store_nd [^\n]*sg_layout = (\[\d+, \d+\]), sg_data = (\[\d+, \d+\])[^\n]*vector<64x32",
+        text,
+    )
+    assert stored == ("[8, 1]", "[8, 32]")
+
+
+def test_buffer_accesses_are_tied() -> None:
+    """A tile stored and loaded back at the same offsets is one class: a subgroup
+    must load what it stored, with no barrier between subgroups."""
+    tile = _TDESC.format("64x64")
+    f32 = "vector<64x64xf32>"
+    bf16 = "vector<64x64xbf16>"
+    body = f"""
+      %z = arith.constant dense<0.0> : {f32}
+      %da = xegpu.create_nd_tdesc %a : memref<1024x1024xbf16> -> {tile}
+      %db = xegpu.create_nd_tdesc %b : memref<1024x1024xbf16> -> {tile}
+      %scratch = xegpu.create_nd_tdesc %c : memref<1024x1024xbf16> -> {tile}
+      %la = xegpu.load_nd %da[%c0, %c0] : {tile} -> {bf16}
+      %r = scf.for %i = %c0 to %c1024 step %c32 iter_args(%x = %z) -> ({f32}) {{
+        %lb = xegpu.load_nd %db[%i, %c0] : {tile} -> {bf16}
+        %d = xegpu.dpas %la, %lb, %x : {bf16}, {bf16}, {f32} -> {f32}
+        scf.yield %d : {f32}
+      }}
+      %t = arith.truncf %r : {f32} to {bf16}
+      xegpu.store_nd %t, %scratch[%c0, %c0] : {bf16}, {tile}
+      %back = xegpu.load_nd %scratch[%c0, %c0] : {tile} -> {bf16}
+      %e = arith.extf %back : {bf16} to {f32}
+      %q = arith.addf %e, %e : {f32}
+      %u = arith.truncf %q : {f32} to {bf16}
+      xegpu.store_nd %u, %scratch[%c0, %c0] : {bf16}, {tile}
+    """
+    module = _parse(body)
+    kernel = xl.analyze(_func(module))
+    stored = next(a for a in kernel.stores)
+    loaded = next(a for a in kernel.loads if a.source == stored.source)
+    assert kernel.classes.same((stored.value, 0), (loaded.value, 0))
+    assert kernel.classes.same((stored.value, 1), (loaded.value, 1))
+
+
+def test_accesses_at_other_offsets_are_not_tied() -> None:
+    """``x @ x^T``: one buffer read as A and B, at unrelated offsets. Its rows and
+    its contracted dim stay apart, or every grid would be refused."""
+    tile = _TDESC.format("256x32")
+    b_tile = _TDESC.format("32x256")
+    c_tile = _TDESC.format("256x256")
+    body = f"""
+      %z = arith.constant dense<0.0> : vector<256x256xf32>
+      %row = arith.constant 256 : index
+      %da = xegpu.create_nd_tdesc %a : memref<1024x1024xbf16> -> {tile}
+      %db = xegpu.create_nd_tdesc %a : memref<1024x1024xbf16> -> {b_tile}
+      %r = scf.for %i = %c0 to %c1024 step %c32 iter_args(%x = %z) -> (vector<256x256xf32>) {{
+        %la = xegpu.load_nd %da[%c0, %i] : {tile} -> vector<256x32xbf16>
+        %lb = xegpu.load_nd %db[%i, %row] : {b_tile} -> vector<32x256xbf16>
+        %d = xegpu.dpas %la, %lb, %x : vector<256x32xbf16>, vector<32x256xbf16>, vector<256x256xf32> -> vector<256x256xf32>
+        scf.yield %d : vector<256x256xf32>
+      }}
+      %t = arith.truncf %r : vector<256x256xf32> to vector<256x256xbf16>
+      %dc = xegpu.create_nd_tdesc %c : memref<1024x1024xbf16> -> {c_tile}
+      xegpu.store_nd %t, %dc[%c0, %c0] : vector<256x256xbf16>, {c_tile}
+    """
+    module = _parse(body)
+    axes = xl.axes_of(xl.analyze(_func(module)))
+    assert (axes.free_rows, axes.free_cols) == (True, True)
+
+
+_ROW_VECTOR_STORE = """
+module attributes {gpu.container_module} {
+  gpu.module @m [#xevm.target<O = 3>] {
+    gpu.func @k(%src: memref<64x64xf32>, %dst: memref<64xf32>) kernel attributes {known_block_size = array<i32: 64, 1, 1>, known_grid_size = array<i32: 1, 1, 1>} {
+      %mask = arith.constant dense<true> : vector<64xi1>
+      %c0 = arith.constant 0 : index
+      %init = arith.constant dense<0xFF800000> : vector<64xf32>
+      %t = xegpu.create_nd_tdesc %src : memref<64x64xf32> -> !xegpu.tensor_desc<64x16xf32, #xegpu.block_tdesc_attr<boundary_check = false>>
+      %v = xegpu.load_nd %t[%c0, %c0] <{layout = #xegpu.layout<sg_layout = [8, 1], sg_data = [8, 16], inst_data = [8, 16]>}> : !xegpu.tensor_desc<64x16xf32, #xegpu.block_tdesc_attr<boundary_check = false>> -> vector<64x16xf32>
+      %r = vector.multi_reduction <maxnumf>, %v, %init [1] : vector<64x16xf32> to vector<64xf32>
+      %idx = vector.step : vector<64xindex>
+      %ptr = memref.extract_aligned_pointer_as_index %dst : memref<64xf32> -> index
+      %p = arith.index_cast %ptr : index to i64
+      xegpu.store %r, %p[%idx], %mask <{layout = #xegpu.slice<#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 16]>, dims = [1]>}> : vector<64xf32>, i64, vector<64xindex>, vector<64xi1>
+      gpu.return
+    }
+  }
+}
+"""
+
+
+def test_layout_warnings_fail_the_lowering() -> None:
+    """Upstream only warns on a load layout it cannot complete, then lowers wrong
+    rows: with IR-derived layouts the warning is a failure."""
+    from helion_mlir_backend._compiler.targets.xpu import _LayoutWarningsAreErrors
+
+    class Warns:
+        def apply(self, module: ir.Module) -> ir.Module:
+            PassManager.parse(
+                "builtin.module(gpu-lower-to-xevm-pipeline{xegpu-op-level=workgroup "
+                "binary-format=skip})",
+                module.context,
+            ).run(module.operation)
+            return module
+
+    module = ir.Module.parse(_ROW_VECTOR_STORE)
+    with pytest.raises(UnsupportedOperationError, match="lane layouts"):
+        _LayoutWarningsAreErrors(Warns()).apply(module)

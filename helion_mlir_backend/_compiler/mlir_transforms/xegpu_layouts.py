@@ -31,10 +31,11 @@ rows. Elementwise kernels keep ``xegpu_elementwise``'s layout.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
 from dataclasses import dataclass
 from dataclasses import field
 import math
+from operator import itemgetter
+from typing import TYPE_CHECKING
 
 from lighthouse.dialects.transform.transform_ext.utils.select_xegpu_gemm_params import (
     select_xegpu_gemm_params,
@@ -50,6 +51,9 @@ from .xegpu_elementwise import block_load_tile
 from .xegpu_elementwise import block_store_tile
 from .xegpu_elementwise import elementwise_layout
 from .xegpu_elementwise import find_tiles
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 HINTS_ATTR = "xegpu_layouts.hints"
 """Dictionary on a ``gpu.func``, read and removed by :func:`annotate_layouts`:
@@ -352,6 +356,11 @@ def analyze(func: ir.Operation) -> KernelIR:
         elif name not in _NO_TILES and any(
             _shape(value) for value in [*op.operands, *op.results]
         ):
+            if name == "vector.contract":
+                raise LayoutError(
+                    "a 'vector.contract' that is no matmul (e.g. a row's dot product "
+                    "with itself): no XeGPU op takes it"
+                )
             if name != "vector.step":
                 raise LayoutError(f"'{name}' on tile vectors")
     _tie_accesses(classes, [*loads, *stores])
@@ -415,6 +424,16 @@ def axes_of(kernel: KernelIR) -> Axes:
     )
 
 
+def _on_axes(kernel: KernelIR, value: ir.Value) -> tuple[bool, bool]:
+    """Whether ``value`` has dims of the primary tile's rows and columns."""
+    classes, primary = kernel.classes, kernel.primary
+    dims = range(len(_shape(value)))
+    return (
+        any(classes.same((value, dim), (primary, 0)) for dim in dims),
+        any(classes.same((value, dim), (primary, 1)) for dim in dims),
+    )
+
+
 def _divisors(size: int) -> list[int]:
     return [d for d in range(1, size + 1) if size % d == 0]
 
@@ -424,8 +443,13 @@ def legal_grids(axes: Axes) -> list[Grid]:
     leaving a whole DPAS (or 2D block) on each subgroup, within the thread limit."""
     grids = []
     has_dpas = bool(axes.kernel.dpas)
-    for fx in _divisors(axes.rows) if axes.free_rows else [1]:
-        for fy in _divisors(axes.cols) if axes.free_cols else [1]:
+    # A subgroup stores what it owns: a tile stored whole by each of several
+    # subgroups would be written by all of them.
+    on_axes = [_on_axes(axes.kernel, a.value) for a in axes.kernel.stores]
+    free_rows = axes.free_rows and all(rows for rows, _ in on_axes)
+    free_cols = axes.free_cols and all(cols for _, cols in on_axes)
+    for fx in _divisors(axes.rows) if free_rows else [1]:
+        for fy in _divisors(axes.cols) if free_cols else [1]:
             if fx * fy > MAX_SUBGROUPS:
                 continue
             sg_rows, sg_cols = axes.rows // fx, axes.cols // fy
@@ -446,9 +470,10 @@ B50 at K = 8192 (SendStall 41 % against 6 %, L1 2)."""
 
 
 def preferred_grid(axes: Axes, grids: Sequence[Grid]) -> Grid:
-    """The rule's pick among legal ``grids``: most subgroups whose accumulators
-    leave registers for the operands (at most :data:`MAX_SG_ELEMENTS` elements);
-    then the row count closest to :data:`TARGET_SG_ROWS`; then the most columns."""
+    """The rule's pick among legal ``grids``: tiles of whole DPAS depth (at least 8
+    rows, where the kernel has that many); most subgroups whose accumulators leave
+    registers for the operands (at most :data:`MAX_SG_ELEMENTS` elements); then the
+    row count closest to :data:`TARGET_SG_ROWS`; then the most columns."""
     if not grids:
         raise LayoutError(
             f"no legal subgroup grid for a {axes.rows}x{axes.cols} tile: columns "
@@ -460,9 +485,10 @@ def preferred_grid(axes: Axes, grids: Sequence[Grid]) -> Grid:
         if axes.tile(grid)[0] * axes.tile(grid)[1] <= MAX_SG_ELEMENTS
     ] or list(grids)
 
-    def rank(grid: Grid) -> tuple[int, float, int]:
+    def rank(grid: Grid) -> tuple[bool, int, float, int]:
         rows, cols = axes.tile(grid)
-        return (-grid.subgroups, abs(math.log2(rows / TARGET_SG_ROWS)), -cols)
+        shallow = rows < DPAS_ROWS[0] and axes.rows >= DPAS_ROWS[0]
+        return (shallow, -grid.subgroups, abs(math.log2(rows / TARGET_SG_ROWS)), -cols)
 
     return min(fitting, key=rank)
 
@@ -506,9 +532,7 @@ def value_layout(kernel: KernelIR, grid: Grid, value: ir.Value) -> ValueLayout:
     # The axis this value is not distributed on is a broadcast on the other dim.
     for dim in range(rank):
         if factors[dim] is None:
-            distributed = next(
-                (d for d in range(rank) if factors[d] is not None), None
-            )
+            distributed = next((d for d in range(rank) if factors[d] is not None), None)
             if distributed is None:
                 factors[dim] = 1
                 continue
@@ -726,9 +750,16 @@ def _dpas_rows(sg_rows: int) -> int:
     return rows
 
 
-def _default_a_load(sg_rows: int) -> tuple[int, int]:
-    rows = next((r for r in (16, 8, 4, 2, 1) if sg_rows % r == 0), 1)
-    return rows, DPAS_COLS
+def _default_a_load(
+    data: Sequence[int], *, whole_blocks: bool = False
+) -> tuple[int, int]:
+    """A tile of a DPAS's A operand: as many rows as divide the subgroup tile, up
+    to 16 (lighthouse's attention form). ``whole_blocks``: up to 32 rows, 64 bytes
+    wide when K allows, so that a subgroup's K step is one block read."""
+    limit = LOAD_MAX_ROWS if whole_blocks else DPAS_COLS
+    rows = next((r for r in (32, 16, 8, 4, 2, 1) if r <= limit and data[0] % r == 0), 1)
+    cols = LOAD_MAX_COLS if whole_blocks and data[1] % LOAD_MAX_COLS == 0 else DPAS_COLS
+    return rows, cols
 
 
 def _default_b_load(data: Sequence[int]) -> tuple[int, int]:
@@ -761,7 +792,7 @@ def _prefetch_tile(shape: Sequence[int], threads: int) -> tuple[int, int]:
             found.append(((rows, cols), grid[0] * grid[1], -abs(grid[0] - grid[1])))
     if not found:
         raise LayoutError(f"no prefetch tile fits a tile of {list(shape)}")
-    found.sort(key=lambda entry: (entry[1], entry[2]), reverse=True)
+    found.sort(key=itemgetter(1, 2), reverse=True)
     return found[0][0]
 
 
@@ -798,9 +829,7 @@ def plan_layouts(kernel: KernelIR, hints: Hints) -> Plan:
             if access is None or access.op in done:
                 continue
             done.add(access.op)
-            _plan_operand_load(
-                kernel, grid, hints, access, index, by_dpas[dpas], plan
-            )
+            _plan_operand_load(kernel, grid, hints, access, index, by_dpas[dpas], plan)
     for access in kernel.loads:
         if access.op not in done:
             _plan_other_load(kernel, grid, hints, access, plan)
@@ -924,9 +953,7 @@ def _plan_row_store(
     if len(shape) == 1 and classes.same((value, 0), (primary, 0)):
         text = _layout_text(tile)
         plan.anchors.append((op, "layout", f"#xegpu.slice<{text}, dims = [1]>"))
-    elif (
-        len(shape) == 2 and shape[1] == 1 and classes.same((value, 0), (primary, 0))
-    ):
+    elif len(shape) == 2 and shape[1] == 1 and classes.same((value, 0), (primary, 0)):
         keep = ValueLayout(tile.sg_layout, (tile.sg_data[0], 1))
         plan.anchors.append((op, "layout", _layout_text(keep)))
 
@@ -976,7 +1003,7 @@ def _plan_operand_load(
         if forced is not None:
             tile = forced
         elif index == 0:
-            tile = _default_a_load(layout.sg_data[0])
+            tile = _default_a_load(layout.sg_data, whole_blocks=hints.source == "rule")
         else:
             tile = _default_b_load(layout.sg_data)
     _check_block(tile, layout.sg_data, "load tile")
@@ -1024,7 +1051,9 @@ def _plan_prefetch(
             if index == 0
             else (selected["prefetch_b_k"], selected["prefetch_b_n"])
         )
-    elif shared and all(s % t == 0 for s, t in zip(shape, SHARED_PREFETCH, strict=True)):
+    elif shared and all(
+        s % t == 0 for s, t in zip(shape, SHARED_PREFETCH, strict=True)
+    ):
         tile = SHARED_PREFETCH
     else:
         tile = _prefetch_tile(shape, grid.subgroups)
@@ -1116,9 +1145,7 @@ def set_threads(module: ir.Operation, func: ir.Operation, threads: int) -> None:
 
     def visit(op: ir.Operation) -> ir.WalkResult:
         if op.name == "gpu.launch_func" and str(op.attributes["kernel"]) == reference:
-            segments = list(
-                ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"])
-            )
+            segments = list(ir.DenseI32ArrayAttr(op.attributes["operandSegmentSizes"]))
             threads_operand = segments[0] + 3  # after async deps, blocks x, y, z
             with ir.InsertionPoint(op):
                 constant = ir.Operation.create(
@@ -1142,7 +1169,10 @@ def annotate_layouts(module: ir.Operation, func: ir.Operation) -> Plan:
         raise LayoutError(f"unknown layout source {hints.source!r}")
     plan = plan_elementwise(func, hints)
     if plan is None:
-        plan = plan_layouts(analyze(func), hints)
+        kernel = analyze(func)
+        plan = plan_layouts(kernel, hints)
+        if hints.source == "upstream":
+            plan = Plan(plan.grid, _upstream_threads(kernel, plan.threads))
     if HINTS_ATTR in func.attributes:
         del func.attributes[HINTS_ATTR]
     if hints.source == "upstream":
@@ -1155,6 +1185,22 @@ def annotate_layouts(module: ir.Operation, func: ir.Operation) -> Plan:
         op.attributes[PREFETCH_ATTR] = ir.IntegerAttr.get(i64, number)
     set_threads(module, func, plan.threads)
     return plan
+
+
+def _upstream_threads(kernel: KernelIR, fallback: int) -> int:
+    """The baseline's thread count: the most subgroups whose tile DPAS and 2D blocks
+    can take, pinned dims or not, as upstream's propagation distributes across
+    them (a reduction through SLM and a barrier)."""
+    rows, cols = _shape(kernel.primary)
+    counts = [
+        fx * fy
+        for fx in _divisors(rows)
+        for fy in _divisors(cols)
+        if fx * fy <= MAX_SUBGROUPS
+        and (cols // fy) % BLOCK_COLS == 0
+        and (rows // fx) % DPAS_ROWS[0] == 0
+    ]
+    return max(counts) * SUBGROUP_SIZE if counts else fallback
 
 
 def clear_tags(func: ir.Operation) -> None:
@@ -1227,7 +1273,9 @@ def _ints(text: str, key: str) -> list[int] | None:
 
 def _check_attr(text: str, subgroups: int | None) -> list[str]:
     problems = []
-    sg_layout, sg_data, inst = (_ints(text, k) for k in ("sg_layout", "sg_data", "inst_data"))
+    sg_layout, sg_data, inst = (
+        _ints(text, k) for k in ("sg_layout", "sg_data", "inst_data")
+    )
     if sg_layout is None or sg_data is None:
         return [f"no subgroup layout in {text}"]
     if subgroups is not None and math.prod(sg_layout) > subgroups:
