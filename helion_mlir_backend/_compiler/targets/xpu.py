@@ -381,16 +381,40 @@ class _KeepRowDims(Stage):
         return module
 
 
+def _check_dpas_anchored(module: ir.Module) -> None:
+    """A DPAS without a layout lowers with no diagnostic, upstream's propagation
+    completes it, so an annotation that handled one DPAS of two is refused here."""
+    unanchored: list[ir.Operation] = []
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        if op.name == "xegpu.dpas" and "layout_a" not in op.attributes:
+            unanchored.append(op)
+        return ir.WalkResult.ADVANCE
+
+    module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    if unanchored:
+        raise UnsupportedOperationError(
+            "a DPAS the layout annotation left without a layout on XPU",
+            reason=f"no kernel class laid out {len(unanchored)} of the kernel's DPAS",
+            alternatives=["one matmul per top-level hl.tile loop", _CPU],
+        )
+
+
 class _CheckBlockSurfaces(Stage):
     """``stage``, then a failure on 2D block descriptors of surfaces beyond the
-    hardware limits (silently wrong rows, :mod:`xegpu_block_surfaces`)."""
+    hardware limits (silently wrong rows, :mod:`xegpu_block_surfaces`), and on
+    DPAS ops lighthouse's layout annotation left out (``check_dpas``: a layout path
+    that leaves them to upstream's propagation on purpose passes ``False``)."""
 
-    def __init__(self, stage: Stage) -> None:
+    def __init__(self, stage: Stage, check_dpas: bool = True) -> None:
         self.stage = stage
+        self.check_dpas = check_dpas
 
     def apply(self, module: ir.Module) -> ir.Module:
         module = self.stage.apply(module)
         check_block_surfaces(module)
+        if self.check_dpas:
+            _check_dpas_anchored(module)
         return module
 
 

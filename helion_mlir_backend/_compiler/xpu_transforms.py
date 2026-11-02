@@ -430,7 +430,7 @@ def _annotate_kernel(gpu_func: ir.Value, kernel: KernelParams) -> None:
     sg_tile = options.pop("sg_tile")
     alternatives = lh_transform.alternatives(
         gpu_func,
-        num_alternatives=6,
+        num_alternatives=7,
         result_types=[gpu_func.type],
     )
     with alternatives.region(0) as scope:
@@ -441,6 +441,27 @@ def _annotate_kernel(gpu_func: ir.Value, kernel: KernelParams) -> None:
         annotate_attention(scope, dpas_op, force_sg_tile=_attention_sg_tile(sg_tile))
         transform.yield_([scope])
     with alternatives.region(1) as scope:
+        # Sibling GEMMs (xpu_params.is_sibling_gemms): the second DPAS is the
+        # match; annotate_gemm lays out one DPAS, its loads and every store, so
+        # it runs once per DPAS, on handles matched again after its cleanup.
+        dpas_ops = lh_transform.match_op(scope, "xegpu.dpas")
+        transform_ext.extract_handle(dpas_ops, 1, silenceable=True)
+        for index in (0, 1):
+            dpas_ops = lh_transform.match_op(scope, "xegpu.dpas")
+            dpas_op = transform_ext.extract_handle(dpas_ops, index, silenceable=True)
+            annotate_gemm(
+                scope,
+                dpas_op,
+                force_sg_tile=sg_tile,
+                force_load_tile_a=options.get("load_tile_a"),
+                force_load_tile_b=options.get("load_tile_b"),
+                force_prefetch_tile_a=options.get("prefetch_tile_a"),
+                force_prefetch_tile_b=options.get("prefetch_tile_b"),
+                force_prefetch_a_nb=options.get("prefetch_a_nb"),
+                force_prefetch_b_nb=options.get("prefetch_b_nb"),
+            )
+        transform.yield_([scope])
+    with alternatives.region(2) as scope:
         dpas_ops = lh_transform.match_op(scope, "xegpu.dpas")
         dpas_op = transform_ext.extract_handle(dpas_ops, 0, silenceable=True)
         annotate_gemm(
@@ -455,24 +476,24 @@ def _annotate_kernel(gpu_func: ir.Value, kernel: KernelParams) -> None:
             force_prefetch_b_nb=options.get("prefetch_b_nb"),
         )
         transform.yield_([scope])
-    with alternatives.region(2) as scope:
+    with alternatives.region(3) as scope:
         anchor_op = lh_transform.match_op(scope, "vector.multi_reduction")
         anchor_op = transform_ext.extract_handle(anchor_op, 0, silenceable=True)
         annotate_reduction(scope, anchor_op, force_sg_tile=sg_tile)
         annotate_row_result_stores(scope, anchor_op, sg_tile)
         annotate_reduction_tiles(scope, anchor_op, kernel)
         transform.yield_([scope])
-    with alternatives.region(3) as scope:
+    with alternatives.region(4) as scope:
         # A reduction storing only its row results (no 2D tile store).
         anchor_op = lh_transform.match_op(scope, "vector.multi_reduction")
         anchor_op = transform_ext.extract_handle(anchor_op, 0, silenceable=True)
         annotate_row_result_stores(scope, anchor_op, sg_tile, require=True)
         annotate_reduction_tiles(scope, anchor_op, kernel)
         transform.yield_([scope])
-    with alternatives.region(4) as scope:
+    with alternatives.region(5) as scope:
         annotate_elementwise(scope, kernel)
         transform.yield_([scope])
-    with alternatives.region(5) as scope:
+    with alternatives.region(6) as scope:
         transform_ext.emit_definite_failure(
             scope,
             message="annotate_layouts: Could not apply any of the defined patterns.",

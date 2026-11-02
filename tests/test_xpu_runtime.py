@@ -2298,3 +2298,30 @@ def test_runtime_position_out_of_bounds_raises() -> None:
 
     with pytest.raises(IndexError, match="out of bounds"):
         _kernel(get_row, [1, 16])(torch.randn(8, 64, 16).to("xpu"), 64)
+
+
+def test_sibling_gemms_swiglu() -> None:
+    """Two GEMMs of one A tile and an epilogue in one grid loop, at SwiGLU's decode
+    shape and at a tile with less register room, per row against float64, after
+    another kernel ran (stale registers show here)."""
+    from tests.test_xpu_sibling_gemms import swiglu
+
+    for (m, n, k), blocks, extra in (
+        ((64, 512, 256), [64, 256, 32], {"xegpu_sg_tiles": [[8, 64]]}),
+        (
+            (256, 512, 256),
+            [128, 256, 32],
+            {"xegpu_sg_tiles": [[32, 32]], "xegpu_load_tiles": [[32, 32, 16, 16]]},
+        ),
+    ):
+        x = torch.randn(m, k).to(BF16)
+        gate = (torch.randn(n, k) * 0.05).to(BF16)
+        up = (torch.randn(n, k) * 0.05).to(BF16)
+        ref = torch.nn.functional.silu(x.double() @ gate.double().T) * (
+            x.double() @ up.double().T
+        )
+        kernel = _kernel(swiglu, blocks, **extra)
+        out = kernel(x.to("xpu"), gate.to("xpu"), up.to("xpu"))
+        torch.xpu.synchronize()
+        error = (out.cpu().double() - ref).abs().amax(-1) / ref.abs().amax()
+        assert error.max() < 4e-3

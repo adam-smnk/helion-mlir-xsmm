@@ -34,6 +34,7 @@ from .xpu_params import ATTENTION_D_HEAD
 from .xpu_params import ElementwiseShape
 from .xpu_params import GemmShape
 from .xpu_params import attention_shape
+from .xpu_params import is_sibling_gemms
 from .xpu_params import kernel_shape
 
 _DPAS_OPERANDS = frozenset({"f16", "bf16"})
@@ -345,7 +346,17 @@ def _check_kernel_class(loop: ir.Operation) -> None:
         return
     if len(contractions) == 1 and reductions:
         _check_matmul_and_reduction(loop)
-    if len(contractions) == 2:
+    if len(contractions) == 2 and is_sibling_gemms(contractions):
+        if reductions:
+            raise UnsupportedOperationError(
+                "two GEMMs and a row reduction in one grid loop on XPU",
+                reason="no layout form has both",
+                alternatives=[
+                    "the reduction in its own top-level hl.tile loop, after hl.barrier()",
+                    _CPU,
+                ],
+            )
+    elif len(contractions) == 2:
         _check_attention(contractions, loop)
     elif len(contractions) > 2:
         raise UnsupportedOperationError(

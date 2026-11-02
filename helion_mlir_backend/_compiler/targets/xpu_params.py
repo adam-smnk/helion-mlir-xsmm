@@ -420,13 +420,53 @@ def kernel_shape(loop: ir.Operation) -> KernelShape | None:
     if len(contractions) == 1:
         return _gemm_shape(*contractions[0])
     if contractions:
+        ops = [op for op, _ in contractions]
+        if is_sibling_gemms(ops):
+            return _gemm_shape(*contractions[0])
         try:
-            return attention_shape(loop, [op for op, _ in contractions])
+            return attention_shape(loop, ops)
         except ValueError:
             return None
     if first_reduction is None:
         return _elementwise_shape(loop)
     return _reduction_shape(loop, *first_reduction)
+
+
+def is_sibling_gemms(contractions: Sequence[ir.Operation]) -> bool:
+    """Exactly two contractions of one K loop on the same loaded A tile, with the same
+    indexing maps and accumulator type, each accumulating into its own value and
+    with its own B: two GEMMs that differ only in B (``y1 = x @ w1, y2 = x @ w2``).
+    Neither feeds the other, so each takes the same layout as a lone GEMM of that
+    shape. Anything else (a computed A, a shared B, a result as an operand of either)
+    is left to the other forms' checks."""
+    if len(contractions) != 2:
+        return False
+    first, second = (op.operation for op in contractions)
+    loop = first.parent
+    if loop is None or loop.name != "scf.for" or second.parent != loop:
+        return False
+    if len(first.operands) != 3 or len(second.operands) != 3:
+        return False
+    if linalg.get_indexing_maps(first.opview) != linalg.get_indexing_maps(
+        second.opview
+    ):
+        return False
+    tile = first.operands[0]
+    if (
+        tile != second.operands[0]
+        or not isinstance(tile, ir.OpResult)
+        or tile.owner.name != "tensor.extract_slice"
+    ):
+        return False
+    if first.operands[1] == second.operands[1]:
+        return False
+    if first.operands[2].type != second.operands[2].type:
+        return False
+    results = {first.results[0], second.results[0]}
+    return not any(
+        operand in results
+        for operand in (*list(first.operands)[1:], *list(second.operands)[1:])
+    )
 
 
 def attention_shape(
