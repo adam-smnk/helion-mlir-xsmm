@@ -52,11 +52,12 @@ if TYPE_CHECKING:
 
     from lighthouse.execution.runner import Runner
 
+    from .mlir.analysis.signature import ReadOrder
     from helion_mlir_backend._compiler.targets.base import Lowering
 
 log = logging.getLogger(__name__)
 
-_JIT_CACHE: OrderedDict[tuple[str, str, str, bool], CompiledEntry] = OrderedDict()
+_JIT_CACHE: OrderedDict[tuple[str, str, str, bool, str], CompiledEntry] = OrderedDict()
 _JIT_CACHE_SIZE = 128
 
 
@@ -97,6 +98,8 @@ class CompiledEntry:
     runner: Runner
     target: MLIRTarget
     """The target compiled for: its checks and hooks apply to every call."""
+    read_order: ReadOrder | None = None
+    """What its reads see (``None``: no host code known, inputs as at the call)."""
 
     def __post_init__(self) -> None:
         # The ctypes callable of the packed C interface, looked up once.
@@ -357,6 +360,7 @@ def compile_entry(
     *,
     target: MLIRTarget | None = None,
     pipeline: str | None = None,
+    read_order: ReadOrder | None = None,
 ) -> CompiledEntry:
     """Inline, lower and JIT-compile ``entry`` (consumes ``module``) for ``target``
     (default: :func:`resolve_target` for the CPU), or reuse the entry compiled from
@@ -375,7 +379,9 @@ def compile_entry(
         or debug.dump_stages
         or not target.is_full(stop_at)
     ):
-        return _compile_entry(module, entry, target, pipeline, stop_at, debug)
+        return _compile_entry(
+            module, entry, target, pipeline, stop_at, debug, read_order
+        )
     # The native switch is part of the key: entries compiled with it on carry
     # native call paths.
     key = (
@@ -383,11 +389,14 @@ def compile_entry(
         target.name,
         pipeline,
         native.enabled(),
+        repr(read_order),
     )
     if (compiled := _JIT_CACHE.get(key)) is not None:
         _JIT_CACHE.move_to_end(key)
         return compiled
-    compiled = _compile_entry(module, entry, target, pipeline, stop_at, debug)
+    compiled = _compile_entry(
+        module, entry, target, pipeline, stop_at, debug, read_order
+    )
     _JIT_CACHE[key] = compiled
     if len(_JIT_CACHE) > _JIT_CACHE_SIZE:
         _JIT_CACHE.popitem(last=False)
@@ -427,6 +436,7 @@ def _compile_entry(
     pipeline: str,
     stop_at: str | None,
     debug: DebugOptions,
+    read_order: ReadOrder | None,
 ) -> CompiledEntry:
     full = target.is_full(stop_at)
     target.validate_environment(None if full else stop_at)
@@ -436,7 +446,7 @@ def _compile_entry(
         raise LoweringStoppedError(target.name, stop_at)
     with _stage("JIT compilation"):
         runner = target.runner(lowered)
-    return CompiledEntry(entry, args, runner, target)
+    return CompiledEntry(entry, args, runner, target, read_order)
 
 
 def _inline_and_lower(

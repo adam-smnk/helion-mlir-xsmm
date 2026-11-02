@@ -44,6 +44,7 @@ from tests.test_xpu_kernelbench import _reference as level2_reference
 
 from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler import execution
+from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 from helion_mlir_backend._compiler.targets import xpu as xpu_target
 from helion_mlir_backend._compiler.targets.xpu import XpuTarget
 
@@ -2098,3 +2099,140 @@ def test_gemm_binary_has_the_large_register_file() -> None:
     assert zebin.startswith(b"\x7fELF")
     assert re.findall(rb"grf_count:\s*(\d+)", zebin) == [b"256"], zebin[-2000:]
     assert not re.search(rb"spill_size:\s*[1-9]", zebin)
+
+
+def _new_input(seed: int, m: int, n: int) -> torch.Tensor:
+    """A new input per call: an output reuses a freed block, so a repeated input
+    would pass with last call's right contents."""
+    torch.manual_seed(seed)
+    return torch.randn(m, n)
+
+
+def _forward_shift_two_loops(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read and write overlap within the first loop, then an unrelated loop."""
+    m, n = x.shape
+    a = x.clone()
+    w = a[: m - 1]
+    v = a[1:]
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile([m - 1, n]):
+        w[tm, tn] = v[tm, tn] * 2.0
+    hl.barrier()
+    for tm, tn in hl.tile([m, n]):
+        out[tm, tn] = x[tm, tn] + 1.0
+    return a, out
+
+
+@pytest.mark.parametrize("m", [2048, 4096])
+def test_overlapping_views_in_one_loop_keep_the_clone(m: int) -> None:
+    """Regression (review of the first view fix, which raced: up to 22000 elements
+    wrong per call): such a view reads no earlier store: its value at the call."""
+    kernel = _kernel(_forward_shift_two_loops, [1, 64, 1, 64])
+    for seed in range(6):
+        x = _new_input(seed, m, 1024)
+        a, _ = kernel(x.to("xpu"))
+        torch.xpu.synchronize()
+        expected = x.clone()
+        expected[:-1] = x[1:] * 2
+        assert torch.equal(a.cpu(), expected)
+
+
+def _every_other_column(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    a = torch.empty_like(x)
+    v = a[:, ::2]
+    out = torch.empty_like(v)
+    for tm, tn in hl.tile([m, n]):
+        a[tm, tn] = x[tm, tn] * 2.0
+    hl.barrier()
+    for tm, tn in hl.tile([m, n // 2]):
+        out[tm, tn] = v[tm, tn] + 1.0
+    return out
+
+
+def _misaligned_view(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    a = torch.empty_like(x)
+    v = a.view(-1)[4 : 4 + (m - 1) * n].view(m - 1, n)
+    out = torch.empty_like(v)
+    for tm, tn in hl.tile([m, n]):
+        a[tm, tn] = x[tm, tn] * 2.0
+    hl.barrier()
+    for tm, tn in hl.tile([m - 1, n]):
+        out[tm, tn] = v[tm, tn] + 1.0
+    return out
+
+
+@pytest.mark.parametrize("fn", [_every_other_column, _misaligned_view])
+def test_views_a_call_must_copy_are_refused(fn: Callable) -> None:
+    """Regression: strided and misaligned views stay staged copies, so a read after
+    the write would be stale: refused, on the device too."""
+    kernel = _kernel(fn, [1, 64, 1, 64])
+    with pytest.raises(UnsupportedOperationError, match="two kernel calls"):
+        kernel(_new_input(0, 64, 128).to("xpu"))
+
+
+def _view_of_output(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    a = torch.empty_like(x)
+    v = a.view(m * 2, n // 2)
+    out = torch.empty_like(v)
+    for tm, tn in hl.tile([m, n]):
+        a[tm, tn] = x[tm, tn] * 2.0
+    hl.barrier()
+    for tm, tn in hl.tile([m * 2, n // 2]):
+        out[tm, tn] = v[tm, tn] + 1.0
+    return out
+
+
+def test_view_across_phases() -> None:
+    """Regression: the driver cloned the view before the call (it overlaps a written
+    tensor), so the second launch read stale memory: every element wrong, silently."""
+    kernel = _kernel(_view_of_output, [1, 64, 1, 64])
+    for seed in range(4):
+        x = _new_input(seed, 64, 128)
+        out = kernel(x.to("xpu"))
+        torch.xpu.synchronize()
+        assert torch.equal(out.cpu(), (x * 2.0).view(128, 64) + 1.0)
+
+
+def _caller_view(x: torch.Tensor, a: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(v)
+    for tm, tn in hl.tile([m, n]):
+        a[tm, tn] = x[tm, tn] * 2.0
+    hl.barrier()
+    for tm, tn in hl.tile([m * 2, n // 2]):
+        out[tm, tn] = v[tm, tn] + 1.0
+    return out
+
+
+def test_callers_view_sees_the_write() -> None:
+    """A caller's view is read like a host one: it sees earlier writes."""
+    kernel = _kernel(_caller_view, [1, 64, 1, 64])
+    for seed in range(4):
+        x = _new_input(seed, 64, 128)
+        a = torch.empty_like(x, device="xpu")
+        out = kernel(x.to("xpu"), a, a.view(128, 64))
+        torch.xpu.synchronize()
+        assert torch.equal(out.cpu(), (x * 2.0).view(128, 64) + 1.0)
+
+
+@pytest.mark.parametrize(
+    ("name", "refusal"),
+    [
+        ("U2_range_read_then_store", "two kernel calls"),
+        ("U5_dynamic_while_read_then_store", "bufferization"),
+        ("U6_range_second_phase", "XPU"),
+    ],
+)
+def test_next_iteration_reads_are_refused(name: str, refusal: str) -> None:
+    """Regression: a nested loop's next iteration reads what this one stored, so the
+    copy was stale: U2's every element wrong on the B50, silently. U5 and U6 don't
+    reach the read order on XPU: they fail to lower, with no result to be wrong."""
+    from tests.view_read_cases import CASES
+
+    case = CASES[name]
+    kernel = _kernel(case["fn"], [1, 64] * (case["blocks"] // 2))
+    with pytest.raises(Exception, match=refusal):
+        kernel(_new_input(0, 64, 128).to("xpu"))

@@ -25,15 +25,19 @@ from torch.fx.experimental.symbolic_shapes import statically_known_true
 
 from ..support.block_ids import block_id_from_key
 from ..support.block_ids import symbol_origin_info
+from ..support.errors import UnsupportedOperationError
+from ..support.index_meta import resolve_index_descriptor
 from .tensor_effects import accessed_tensor
 from .tensor_effects import host_tensor_name
 from .tensor_effects import subgraph_ids
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from collections.abc import Mapping
 
     from helion._compiler.host_function import HostFunction
 
+    from ..build_context import BuildContext
     from .tensor_effects import TensorEffects
 
 
@@ -152,6 +156,88 @@ class KernelSignature:
                 )
             )
         return cls(refs, scalars, aliases, tuple(phases))
+
+
+@dataclass(frozen=True)
+class ReadOrder:
+    """What a kernel's reads see, by tensor name, in program order."""
+
+    after: Mapping[str, frozenset[str]]
+    """The written tensors stored before a read of this tensor: if they share
+    elements with it, the read must see those stores."""
+    same: Mapping[str, frozenset[str]]
+    """The tensors stored by a root loop that also reads this tensor."""
+
+
+def read_order(
+    hf: HostFunction, signature: KernelSignature, ctx: BuildContext
+) -> ReadOrder:
+    """The kernel's :class:`ReadOrder`, over its root loops in program order. A loop
+    body that runs again reads what its earlier iterations stored."""
+    after: dict[str, set[str]] = {}
+    same: dict[str, set[str]] = {}
+    written: set[str] = set()
+
+    def base(name: str) -> str:
+        return signature.aliases.get(name, name)
+
+    def visit(graph_id: int, stored: set[str]) -> None:
+        for node in hf.device_ir.graphs[graph_id].graph.nodes:
+            if (name := accessed_tensor(node)) is not None:
+                if node.target is memory_ops.store:
+                    written.add(base(name))
+                else:
+                    after.setdefault(base(name), set()).update(written)
+                    same.setdefault(base(name), set()).update(stored)
+            for subgraph_id in subgraph_ids(node):
+                written.update(map(base, _revisited(hf, node, subgraph_id, ctx)))
+                visit(subgraph_id, stored)
+
+    for root_id in hf.device_ir.root_ids:
+        stored = set(map(base, _stored(list(_program_order(hf, root_id)))))
+        visit(root_id, stored)
+    return ReadOrder(
+        {name: frozenset(names) for name, names in after.items()},
+        {name: frozenset(names) for name, names in same.items()},
+    )
+
+
+def _revisited(
+    hf: HostFunction, node: torch.fx.Node, graph_id: int, ctx: BuildContext
+) -> set[str]:
+    """The tensors a nested body stores at elements its next iteration runs over: all
+    of a ``while``'s stores, a ``for``'s stores not indexed by its block ids (``range``
+    and a nested ``hl.tile`` look alike in the device graph). An ``if`` runs once."""
+    if node.target is tracing_ops._if:
+        return set()
+    stores = [
+        (name, store)
+        for store in _program_order(hf, graph_id)
+        if (name := accessed_tensor(store)) is not None
+        and store.target is memory_ops.store
+    ]
+    if node.target is tracing_ops._while_loop:
+        return {name for name, _ in stores}
+    block_ids = list(hf.device_ir.graphs[graph_id].block_ids or ())
+    return {name for name, store in stores if not _indexed_by(store, block_ids, ctx)}
+
+
+def _indexed_by(store: torch.fx.Node, block_ids: list[int], ctx: BuildContext) -> bool:
+    """A store's index uses one of ``block_ids`` or a tile nested in them; an index
+    that doesn't resolve counts as not, which refuses rather than reads stale."""
+    for index in store.args[1]:
+        if index is None or isinstance(index, slice):
+            continue
+        try:
+            block_id = resolve_index_descriptor(ctx, index).block_id
+        except UnsupportedOperationError:
+            continue
+        if (
+            block_id is not None
+            and ctx.geometry.owning_block(block_id, block_ids) is not None
+        ):
+            return True
+    return False
 
 
 def _program_order(hf: HostFunction, graph_id: int) -> Iterator[torch.fx.Node]:

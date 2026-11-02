@@ -232,6 +232,9 @@ class MLIRBackend(Backend):
         for full Helion semantics. The target follows the tensors' device (or
         ``HELION_MLIR_TARGET``); ``pipeline`` defaults to the target's.
 
+        Inputs hold their values at the call: no host code is known here, so an
+        input sharing elements with a written tensor is a copy of it.
+
         Returns every tensor the kernel writes, in entry argument order: one
         tensor, or a list when there are several.
         """

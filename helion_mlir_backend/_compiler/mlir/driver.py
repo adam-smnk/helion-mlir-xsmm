@@ -16,6 +16,7 @@ import torch
 from .. import native
 from ..execution import compile_entry
 from ..targets import resolve_target
+from .analysis.signature import read_order
 from .codegen import MLIRModuleBuilder
 from .host_code import build_host_function
 from .support import UnsupportedOperationError
@@ -82,7 +83,11 @@ def compile_kernel(
             for name in builder.context.signature.refs
         }
     mlir_target.configure(module, config)
-    entry = compile_entry(module, hf.name, target=mlir_target, pipeline=pipeline)
+    with env:
+        order = read_order(hf, builder.context.signature, builder.context)
+    entry = compile_entry(
+        module, hf.name, target=mlir_target, pipeline=pipeline, read_order=order
+    )
     host_globals = host_function.__globals__
     aliases = host_function._helion_mlir_aliases
     arg_exprs = [
@@ -334,9 +339,10 @@ def call_entry(
     finishes the call. Tensors are passed contiguous (a copy for strided ones,
     copied back for inouts) and with their data aligned to the target's
     ``buffer_alignment`` (a copy likewise). An input that overlaps an inout is
-    cloned so the ``restrict`` arguments hold; overlapping inouts are rejected. Runtime scalars
-    are passed by value. ``sizes`` (each argument's size expressions) lets runtime
-    sizes the kernel assumes equal be checked. Calls that need none of this
+    cloned so the ``restrict`` arguments hold, unless it reads what the kernel wrote
+    earlier (:func:`_reads_earlier_writes`); overlapping inouts are rejected. Runtime
+    scalars are passed by value. ``sizes`` (each argument's size expressions) lets
+    runtime sizes the kernel assumes equal be checked. Calls that need none of this
     (:meth:`CompiledEntry.call_in_place`) skip it: per-call host time is a large
     part of a small kernel's time.
     """
@@ -366,6 +372,18 @@ def call_entry(
                 "kernel writes two tensors that share memory",
                 reason="each written tensor must be its own buffer",
             )
+    tensor_args = [arg for arg in entry.args if arg.role != "scalar"]
+    written = [
+        (arg.name, tensor)
+        for arg, tensor, role in zip(tensor_args, tensors, roles, strict=True)
+        if role == "inout" and tensor.numel()
+    ]
+    passed_as_is = [
+        role == "in"
+        and _overlaps_any(tensor, inout_spans)
+        and _reads_earlier_writes(entry, arg.name, tensor, written)
+        for arg, tensor, role in zip(tensor_args, tensors, roles, strict=True)
+    ]
     staged = [
         _aligned(
             # A negative or conjugate view's storage holds the values unnegated
@@ -374,11 +392,11 @@ def call_entry(
             tensor.resolve_conj().resolve_neg().contiguous()
             if tensor.is_neg() or tensor.is_conj()
             else tensor.clone(memory_format=torch.contiguous_format)
-            if role == "in" and _overlaps_any(tensor, inout_spans)
+            if role == "in" and not as_is and _overlaps_any(tensor, inout_spans)
             else tensor.contiguous(),
             target.buffer_alignment,
         )
-        for tensor, role in zip(tensors, roles, strict=True)
+        for tensor, role, as_is in zip(tensors, roles, passed_as_is, strict=True)
     ]
     buffers = iter(staged)
     arguments = [
@@ -392,6 +410,79 @@ def call_entry(
         if role == "inout" and copy is not tensor:
             tensor.copy_(copy)
     return inouts
+
+
+def _reads_earlier_writes(
+    entry: CompiledEntry,
+    name: str,
+    tensor: torch.Tensor,
+    written: list[tuple[str, torch.Tensor]],
+) -> bool:
+    """Whether input ``tensor``, whose bytes overlap a written tensor, must be passed
+    as it is: it shares elements with a tensor stored before it is read, and a copy
+    would not hold what was stored. A kernel whose reads the target can't honour is
+    refused: never a stale read. No such store: ``False``, its value at the call."""
+    order = entry.read_order
+    if order is None:
+        return False
+    after = order.after.get(name, frozenset())
+    if not any(
+        other in after and _share_elements(tensor, stored) for other, stored in written
+    ):
+        return False
+    shared = [
+        (other, stored) for other, stored in written if _share_elements(tensor, stored)
+    ]
+    same = order.same.get(name, frozenset())
+    alignment = entry.target.buffer_alignment
+    if (
+        entry.target.phases_see_aliases
+        and _passes_as_is(tensor, alignment)
+        and all(_passes_as_is(other, alignment) for _, other in shared)
+        and not any(other in same for other, _ in shared)
+    ):
+        return True
+    raise UnsupportedOperationError(
+        "a tensor read after the kernel wrote into its elements",
+        reason=(
+            f"'{name}' shares elements with a tensor the kernel stores before it "
+            "reads it: on this target, or with this view's strides, alignment or a "
+            "store in the same loop, the read can't see that store"
+        ),
+        alternatives=["two kernel calls, the second one reading the view"],
+    )
+
+
+def _passes_as_is(tensor: torch.Tensor, alignment: int) -> bool:
+    """``call_entry`` passes ``tensor``'s own storage (no staged copy)."""
+    return (
+        tensor.is_contiguous()
+        and not tensor.is_neg()
+        and not tensor.is_conj()
+        and (alignment <= 1 or tensor.data_ptr() % alignment == 0)
+    )
+
+
+def _share_elements(a: torch.Tensor, b: torch.Tensor) -> bool:
+    """Whether two tensors share an element (rare path: only for tensors whose byte
+    spans overlap). Different element sizes count as shared."""
+    if not a.numel() or not b.numel():
+        return False
+    if not _spans_overlap(_byte_span(a), _byte_span(b)):
+        return False
+    if a.element_size() != b.element_size():
+        return True
+    if a.is_contiguous() and b.is_contiguous():
+        return True
+
+    def elements(tensor: torch.Tensor) -> torch.Tensor:
+        offsets = torch.zeros((), dtype=torch.int64)
+        for size, stride in zip(tensor.shape, tensor.stride(), strict=True):
+            steps = torch.arange(size) * stride * tensor.element_size()
+            offsets = offsets.unsqueeze(-1) + steps
+        return offsets.flatten() + tensor.data_ptr()
+
+    return bool(torch.isin(elements(a), elements(b)).any())
 
 
 def _aligned(tensor: torch.Tensor, alignment: int) -> torch.Tensor:

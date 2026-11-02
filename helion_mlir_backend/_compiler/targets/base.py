@@ -142,6 +142,10 @@ class MLIRTarget(abc.ABC):
     :meth:`passes_in_place`; any other tensor takes the Python paths
     (default: no native paths)."""
 
+    phases_see_aliases: bool = False
+    """Whether a kernel's loops read what earlier loops stored through an input
+    sharing their elements, passed as it is: each launch takes device pointers. Other
+    targets refuse such a kernel (``call_entry``)."""
     buffer_alignment: int = 1
     """The byte alignment the compiled kernels assume for the data of every
     tensor argument; ``call_entry`` passes a staged copy of a tensor whose data

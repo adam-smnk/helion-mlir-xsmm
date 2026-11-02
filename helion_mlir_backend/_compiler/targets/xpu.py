@@ -498,6 +498,7 @@ class XpuTarget(MLIRTarget):
     config_keys = XPU_CONFIG_KEYS
     stop_points = XPU_STOP_POINTS
 
+    phases_see_aliases = True
     buffer_alignment = 64
     """Tensor data is passed 64-byte aligned (misaligned views, e.g.
     ``x[1:]``, as aligned copies; ``call_entry``). The kernels need it: a 2D
