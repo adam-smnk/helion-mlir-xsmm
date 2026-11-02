@@ -369,11 +369,14 @@ def tile_window(
     begin, end = ctx.block_id_to_bounds[block_id]
     # A loop over one enclosing tile ends within the enclosing loop.
     outer = block_id
+    seen = {block_id}
     while (
         isinstance(end, ir.Value)
         and (outer := ctx.geometry.enclosing_tiles.get(outer)) is not None
+        and outer not in seen
         and outer in ctx.block_id_to_bounds
     ):
+        seen.add(outer)
         end = ctx.block_id_to_bounds[outer][1]
     low = ctx.index_facts(begin).low
     if low is None or low + bias < 0:

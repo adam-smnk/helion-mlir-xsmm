@@ -18,6 +18,7 @@ from .lowering.tensor_state import TensorState
 from .sizes import Sizes
 from .support import DynamicShapeError
 from .support import block_id_from_key
+from .support.errors import UnsupportedOperationError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -294,6 +295,17 @@ class BuildContext:
         span: int | None = None,
     ) -> Generator[None]:
         """Bind a loop induction variable and bounds, restoring the previous ones."""
+        if block_id in self.block_id_to_iv:
+            raise UnsupportedOperationError(
+                "nested tile loops of one block size",
+                reason=(
+                    "a block size is one symbol: both loops' tiles would index "
+                    "with the inner loop's position"
+                ),
+                alternatives=[
+                    "hl.register_block_size for each loop, with the same value"
+                ],
+            )
         saved = [
             (table, table.get(block_id))
             for table in (

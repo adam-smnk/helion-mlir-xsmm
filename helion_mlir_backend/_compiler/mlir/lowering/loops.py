@@ -60,6 +60,15 @@ def build_phase_body(
 
 def _lower_root(ctx: BuildContext, graph_id: int, grid_ids: list[int]) -> None:
     """Parallel ``scf.forall`` if each iteration writes disjoint regions, else sequential."""
+    if len(set(grid_ids)) != len(grid_ids):
+        raise UnsupportedOperationError(
+            "nested tile loops of one block size",
+            reason=(
+                "a block size is one symbol: both loops' tiles would index "
+                "with the inner loop's position"
+            ),
+            alternatives=["hl.register_block_size for each loop, with the same value"],
+        )
     geometry = ctx.geometry
     bounds = [
         LoopBounds(ctx.sizes.value(bound.begin), ctx.sizes.value(bound.end), bound.step)
