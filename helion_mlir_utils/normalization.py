@@ -19,9 +19,15 @@ import helion_mlir_backend  # noqa: F401
 
 # f32 elements of a tile's rows: its intermediates stay in L2.
 _TILE_ELEMENTS = 1 << 16
+# In place, a store chunk goes through a copy of a whole row tile's chunk, lowered
+# per element: 1024x1024 softmax on 4 threads, 256 rows, took 17 s to compile (not
+# in place 2.4 s). More tiles than threads are fine.
+_IN_PLACE_TILE_ELEMENTS = 1 << 12
 
 
-def _softmax_kernel(x: Tensor, whole: hl.constexpr) -> Tensor:
+def _softmax_kernel(
+    x: Tensor, whole: hl.constexpr, in_place: hl.constexpr = hl.constexpr(False)
+) -> Tensor:
     """Softmax over the last dim of ``[M, N]`` in passes over column chunks:
     row maxima, sums of exponentials, then the normalized output. Whole-row
     ops instead get the row reduction fused into, and recomputed by, every
@@ -31,11 +37,17 @@ def _softmax_kernel(x: Tensor, whole: hl.constexpr) -> Tensor:
     one reduction per row at the end. A partial last chunk reduces over its
     own columns, so its padding is masked out (``_mask_to``): lane-wise, the
     padded lanes' zeros would enter the maximum and add ``exp(-max)`` per
-    lane to the sum."""
+    lane to the sum.
+
+    ``in_place`` writes into ``x``: a tile's row statistics are reduced before
+    its store pass, which reads each chunk before writing it."""
     m, n = x.shape
     hl.specialize(n)
     block_n = hl.register_block_size(n)
-    out = torch.empty_like(x)
+    if in_place:
+        out = x
+    else:
+        out = torch.empty_like(x)
     for tile_m in hl.tile(m):
         top = hl.full([tile_m, block_n], float("-inf"), dtype=torch.float32)
         for tile_n in hl.tile(whole, block_size=block_n):
@@ -84,12 +96,17 @@ def _group_norm_kernel(
     extra: Tensor,
     eps: hl.constexpr,
     epilogue: Callable[[Tensor, Tensor], Tensor],
+    in_place: hl.constexpr = hl.constexpr(False),
 ) -> Tensor:
     """``epilogue(GroupNorm(x), extra)`` of ``x3`` ``[M, G, C/G]``; ``weight``,
-    ``bias`` and ``extra`` are per-channel ``[G, C/G]``."""
+    ``bias`` and ``extra`` are per-channel ``[G, C/G]``. ``in_place`` writes
+    into ``x3``: a tile reads its groups before writing them."""
     m, groups, group_size = x3.shape
     hl.specialize(group_size)
-    out = torch.empty_like(x3)
+    if in_place:
+        out = x3
+    else:
+        out = torch.empty_like(x3)
     for tile_m, tile_g in hl.tile([m, groups]):
         y = x3[tile_m, tile_g, :].to(torch.float32)
         mean = y.mean(-1, keepdim=True)
@@ -119,14 +136,18 @@ def _threads() -> int:
     return int(os.environ.get("OMP_NUM_THREADS", torch.get_num_threads()))
 
 
-def _row_tile(rows: int, width: int, other_tiles: int = 1) -> int:
-    """Rows per tile: within ``_TILE_ELEMENTS`` and leaving every thread a tile."""
+def _row_tile(
+    rows: int, width: int, other_tiles: int = 1, elements: int = _TILE_ELEMENTS
+) -> int:
+    """Rows per tile: within ``elements`` and leaving every thread a tile."""
     per_thread = -(-rows * other_tiles // _threads())
-    return max(1, min(_TILE_ELEMENTS // width, per_thread))
+    return max(1, min(elements // width, per_thread))
 
 
-def softmax(x: Tensor) -> Tensor:
-    """Softmax over the last dim of a 2-D ``x``."""
+def softmax(x: Tensor, in_place: bool = False) -> Tensor:
+    """Softmax over the last dim of a 2-D ``x``. ``in_place`` may overwrite a
+    contiguous ``x`` (the caller's fresh intermediate) instead of allocating
+    an output; use the result, not ``x``."""
     if x.dim() != 2:
         raise ValueError(f"softmax() expects a 2-D tensor, got {tuple(x.shape)}")
     m, n = map(int, x.shape)
@@ -135,8 +156,10 @@ def softmax(x: Tensor) -> Tensor:
     block_n = min(n, 128)
     whole = hl.constexpr(n // block_n * block_n)
     # The column block is registered first.
-    kernel = _kernel(_softmax_kernel, [block_n, _row_tile(m, block_n)])
-    return kernel(x.contiguous(), whole)
+    elements = _IN_PLACE_TILE_ELEMENTS if in_place else _TILE_ELEMENTS
+    tile_m = _row_tile(m, block_n, elements=elements)
+    kernel = _kernel(_softmax_kernel, [block_n, tile_m])
+    return kernel(x.contiguous(), whole, hl.constexpr(in_place))
 
 
 def group_norm(
@@ -147,9 +170,12 @@ def group_norm(
     eps: float,
     epilogue: Callable[[Tensor, Tensor], Tensor] = _second_operand,
     extra: Tensor | None = None,
+    in_place: bool = False,
 ) -> Tensor:
     """``epilogue(GroupNorm(x), extra)`` of ``x`` ``[M, C]``; ``extra`` is an
-    optional per-channel ``[C]`` operand of ``epilogue`` (default: identity)."""
+    optional per-channel ``[C]`` operand of ``epilogue`` (default: identity).
+    ``in_place`` may overwrite a contiguous ``x`` (the caller's fresh
+    intermediate) instead of allocating an output; use the result, not ``x``."""
     if x.dim() != 2 or x.shape[1] % num_groups:
         raise ValueError(
             f"group_norm() expects [M, C] with C divisible by {num_groups} groups, "
@@ -160,7 +186,12 @@ def group_norm(
     groups_per_tile = max(1, min(num_groups, _TILE_ELEMENTS // 32 // group_size))
     while num_groups % groups_per_tile:
         groups_per_tile -= 1
-    tile_m = _row_tile(m, groups_per_tile * group_size, num_groups // groups_per_tile)
+    tile_m = _row_tile(
+        m,
+        groups_per_tile * group_size,
+        num_groups // groups_per_tile,
+        _IN_PLACE_TILE_ELEMENTS if in_place else _TILE_ELEMENTS,
+    )
     kernel = _kernel(_group_norm_kernel, [tile_m, groups_per_tile])
     channels = (num_groups, group_size)
     return kernel(
@@ -170,4 +201,5 @@ def group_norm(
         (weight if extra is None else extra).view(channels),
         hl.constexpr(eps),
         epilogue,
+        hl.constexpr(in_place),
     ).view(m, c)
