@@ -2236,3 +2236,48 @@ def test_next_iteration_reads_are_refused(name: str, refusal: str) -> None:
     kernel = _kernel(case["fn"], [1, 64] * (case["blocks"] // 2))
     with pytest.raises(Exception, match=refusal):
         kernel(_new_input(0, 64, 128).to("xpu"))
+
+
+def test_call_right_with_work_outstanding_on_the_stream() -> None:
+    """A kernel right after torch's unfinished work on its input. On this machine a
+    call with no wait at all was right too (the driver seems to run queues in order,
+    ``XpuTarget.prepare_call``), so removing the wait can't be a failing control."""
+
+    def add_one(x: torch.Tensor) -> torch.Tensor:
+        m, n = x.shape
+        out = torch.empty_like(x)
+        for tm, tn in hl.tile([m, n]):
+            out[tm, tn] = x[tm, tn] + 1.0
+        return out
+
+    kernel = _kernel(add_one, [1, 256])
+    a = torch.rand(4096, 4096, device="xpu")
+    for seed in range(6):
+        torch.manual_seed(seed)
+        y = torch.rand(64, 4096)
+        x = y.to("xpu")
+        x = x * 1.0
+        _ = torch.matmul(a, a)  # outstanding on the stream when the kernel is called
+        out = kernel(x)
+        torch.xpu.synchronize()
+        assert torch.equal(out.cpu(), y + 1.0)
+
+
+def test_call_right_after_a_large_copy_to_the_device() -> None:
+    """A copy may use another engine: the kernel reads it right after. No-wait isn't a
+    failing control here either (see above)."""
+
+    def add_one(x: torch.Tensor) -> torch.Tensor:
+        m, n = x.shape
+        out = torch.empty_like(x)
+        for tm, tn in hl.tile([m, n]):
+            out[tm, tn] = x[tm, tn] + 1.0
+        return out
+
+    kernel = _kernel(add_one, [1, 8192])
+    for seed in range(6):
+        torch.manual_seed(seed)
+        y = torch.rand(16384, 8192)
+        out = kernel(y.to("xpu"))
+        torch.xpu.synchronize()
+        assert torch.equal(out.cpu(), y + 1.0)

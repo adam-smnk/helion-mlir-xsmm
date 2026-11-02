@@ -10,6 +10,7 @@ ignores the keys.
 from __future__ import annotations
 
 import re
+from unittest import mock
 
 import helion
 from helion.autotuner import config_spec as helion_config_spec
@@ -33,6 +34,7 @@ from helion_mlir_backend._compiler.mlir_transforms.xegpu_elementwise import (
 from helion_mlir_backend._compiler.mlir_transforms.xegpu_reduction import (
     reduction_tiles,
 )
+from helion_mlir_backend._compiler.targets import XpuTarget
 from helion_mlir_backend._compiler.targets import get_target
 from helion_mlir_backend._compiler.targets import target_config_keys
 from helion_mlir_backend._compiler.targets.xpu_params import PARAMS_ATTR
@@ -1085,3 +1087,34 @@ def test_columns_first_rule_needs_a_known_gemm() -> None:
     assert not columns_first(None)
     assert not columns_first(ReductionShape(64, 64))
     assert not columns_first(ElementwiseShape((1, 8192), (16,), (16,)))
+
+
+def _xpu_buffer(index: int = 0) -> object:
+    return mock.Mock(device=torch.device("xpu", index))
+
+
+@pytest.mark.parametrize("idle", [False, True])
+def test_prepare_call_waits_only_for_a_busy_stream(idle: bool) -> None:
+    target = XpuTarget()
+    stream = mock.Mock()
+    stream.query.return_value = idle
+    with (
+        mock.patch.object(torch.xpu, "current_stream", return_value=stream),
+        mock.patch.object(torch.xpu, "synchronize") as synchronize,
+    ):
+        target.prepare_call([_xpu_buffer(), _xpu_buffer()])
+    assert synchronize.called is (not idle)
+
+
+def test_prepare_call_refuses_several_devices() -> None:
+    target = XpuTarget()
+    with pytest.raises(ValueError, match="several devices"):
+        target.prepare_call([_xpu_buffer(0), _xpu_buffer(1)])
+
+
+def test_prepare_call_without_device_tensors_does_nothing() -> None:
+    target = XpuTarget()
+    cpu = mock.Mock(device=torch.device("cpu"))
+    with mock.patch.object(torch.xpu, "current_stream") as stream:
+        target.prepare_call([cpu])
+    assert not stream.called

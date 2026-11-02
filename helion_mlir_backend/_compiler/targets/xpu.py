@@ -586,18 +586,36 @@ class XpuTarget(MLIRTarget):
             )
 
     def prepare_call(self, buffers: Sequence[torch.Tensor]) -> None:
-        """Wait for torch's work on the buffers (e.g. host-code ``torch.zeros``):
-        the kernels run on the Level Zero runtime's own queue."""
-        devices = {t.device for t in buffers if t.device.type == "xpu"}
-        if len(devices) > 1:
-            raise ValueError(
-                f"the kernel's tensors are on several devices: {sorted(map(str, devices))}"
-            )
-        for device in devices:
+        """Wait for torch's work on the current stream (e.g. host-code
+        ``torch.zeros``): the kernels run on the Level Zero runtime's own queue.
+        Work on another stream isn't waited for: as with torch's own ops, users
+        synchronize across streams.
+
+        A ``query`` is 1.4 us where an idle ``synchronize`` is 25.5, half of a tiny
+        kernel's call. On the Arc B50 with this driver, no wait at all still gave
+        right results (180 of 180 calls after a matmul; the call took the matmul's
+        full time): probably the driver running queues on one compute engine in order
+        (inferred). That is no guarantee, and untested for copy engines and on B70:
+        not to be relied on, so this wait stays."""
+        device = None
+        for tensor in buffers:
+            current = tensor.device
+            if current.type != "xpu":
+                continue
+            if device is None:
+                device = current
+            elif current != device:
+                raise ValueError(
+                    "the kernel's tensors are on several devices: "
+                    f"{sorted(map(str, {device, current}))}"
+                )
+        if device is None:
+            return
+        index = device.index if device.index is not None else 0
+        if not torch.xpu.current_stream(index).query():
             torch.xpu.synchronize(device)
-            index = device.index if device.index is not None else 0
-            if index != self._device_index:
-                self._set_runtime_device(index)
+        if index != self._device_index:
+            self._set_runtime_device(index)
 
     def _set_runtime_device(self, index: int) -> None:
         library = _runtime_library()
