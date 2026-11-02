@@ -163,6 +163,8 @@ in µs; wall minus device is the host path and differs by backend. Largest error
 
 FlexAttention skips K/V blocks by a mask computed on the host, so `document` also skips by data there.
 
+`causal_split` at S = 2048 is a tie with native once clocks are factored out (2220k against 2213k cycles), with FlexAttention 1.5 % ahead.
+
 What the numbers rest on, each measured alone:
 
 - **Query tiles first in `hl.tile`:** the dispatch runs them fastest, so consecutive workgroups
