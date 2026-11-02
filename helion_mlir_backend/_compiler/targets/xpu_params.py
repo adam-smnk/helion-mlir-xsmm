@@ -21,8 +21,8 @@ shorter list -- leaves the parameter to lighthouse's inference:
   GEMM kernel prefetches A and B.
 - ``xegpu_nan_ignoring_maxima``: ``True`` for an attention kernel whose row
   maxima may ignore NaN. :data:`NAN_IGNORING_MAXIMA` has the reasoning.
-- ``igc_vectorizer``, not an XeGPU parameter: IGC's vectorizer for the kernel, ``"off"``,
-  the default, or ``"cmp"``. :data:`VECTORIZER` has the reasoning.
+- ``igc_vectorizer``, not an XeGPU parameter: IGC's vectorizer for the kernel, ``"cmp"``,
+  the default, or ``"off"``. :data:`VECTORIZER` has the reasoning.
 
 The workgroup tile and the K tile are not parameters: they are the kernel's
 block sizes (the grid tiles and the inner K tile), which lighthouse reads off
@@ -91,12 +91,17 @@ loses them, as a default ``unitrace`` does, gets wrong rows; nothing refuses it 
 compile time. ``tests/test_xpu_igc_workarounds.py`` scans these binaries.
 ``tests/test_xpu_runtime.py`` compares with torch: ``test_attention_nonfinite``."""
 VECTORIZER = "igc_vectorizer"
-"""Per GPU kernel: IGC's vectorizer ``"off"`` (the default,
-``xpu_transforms.IGC_OPTIONS``) or ``"cmp"`` (on but for vector compares,
-``IGC_OPTIONS_CMP``). Not an XeGPU parameter: it picks the kernel's IGC options. A
-plain choice of the kernel's author, never made automatically and not searched:
-``"cmp"`` is faster on some kernels; ``xevm_lane_conversions`` avoids the known bug it
-is exposed to (``IGC_OPTIONS``). Nothing checks the binary at compile time."""
+"""Per GPU kernel: IGC's vectorizer ``"cmp"`` (on but for vector compares, the default,
+``xpu_transforms.IGC_OPTIONS``) or ``"off"`` (the escape hatch, ``IGC_OPTIONS_OFF``). Not
+an XeGPU parameter: it picks the kernel's IGC options. Never chosen automatically and
+not searched. ``xevm_lane_conversions`` avoids the bug ``"cmp"`` leaves exposed.
+Nothing checks the binary at compile time, as IGC versions differ.
+
+On an Arc B50 with IGC 2.41, every kernel benchmarked here gives correct results; the
+two known bugs are avoided by this option and an IR rewrite, on that one IGC build.
+Other kernels and other builds are not proven: ``agent-tools/igc_binary_check.py`` in
+helion-mlir-dev checks a kernel's binaries, and ``igc_vectorizer="off"`` is the escape
+hatch."""
 _ARITY = {SG_TILES: 2, LOAD_TILES: 4, PREFETCH_TILES: 4, PREFETCH_DEPTHS: 2}
 _ELEMENTWISE_ARITY = {LOAD_TILES: (2, 1)}
 """Other entry lengths: ``[m, n]`` load tiles of 2D elementwise and reduction
@@ -110,7 +115,7 @@ _FIELDS = {
     PREFETCH_TILES: "prefetch_tiles",
     PREFETCH_DEPTHS: "prefetch_depths",
     NAN_IGNORING_MAXIMA: "nan_ignoring_maxima",
-    VECTORIZER: "vectorizer_cmp",
+    VECTORIZER: "vectorizer_off",
 }
 PARAMS_ATTR = "helion.xegpu_params"
 """Module attribute holding the parameters: one dictionary per kernel."""
@@ -127,8 +132,8 @@ class KernelParams:
     prefetch_depths: tuple[int, ...] | None = None
     nan_ignoring_maxima: tuple[int, ...] | None = None
     """``(1,)`` if set, as module attributes hold arrays."""
-    vectorizer_cmp: tuple[int, ...] | None = None
-    """``(1,)`` for ``igc_vectorizer="cmp"``."""
+    vectorizer_off: tuple[int, ...] | None = None
+    """``(1,)`` for ``igc_vectorizer="off"``."""
 
     def forced(self) -> dict[str, tuple[int, ...]]:
         """The forced parameters, by config key."""
@@ -177,7 +182,7 @@ def xegpu_params(config: Mapping[str, object]) -> tuple[KernelParams, ...]:
         if value is None:
             continue
         if not isinstance(value, (list, tuple)):
-            entry = {NAN_IGNORING_MAXIMA: "True", VECTORIZER: '"off" or "cmp"'}.get(
+            entry = {NAN_IGNORING_MAXIMA: "True", VECTORIZER: '"cmp" or "off"'}.get(
                 key, f"a list of {_ARITY.get(key)} ints"
             )
             raise XeGPUConfigError(
@@ -203,10 +208,10 @@ def _entry(key: str, index: int, item: object) -> tuple[int, ...] | None:
     if key == VECTORIZER:
         if item not in ("off", "cmp"):
             raise XeGPUConfigError(
-                f'{key}[{index}]={item!r}: expected "off", "cmp" or None (one entry '
+                f'{key}[{index}]={item!r}: expected "cmp", "off" or None (one entry '
                 "per GPU kernel)"
             )
-        return (1,) if item == "cmp" else None
+        return (1,) if item == "off" else None
     if key == NAN_IGNORING_MAXIMA:
         if item is not True:
             raise XeGPUConfigError(

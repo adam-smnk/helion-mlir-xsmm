@@ -1130,17 +1130,12 @@ def attention_blocks(batch: int, heads: int, seq: int) -> list[int]:
     return ATTENTION_OTHER_SHAPES_BLOCKS
 
 
-ATTENTION_XEGPU = {
-    "xegpu_nan_ignoring_maxima": [True],
-    "igc_vectorizer": ["cmp"],
-}
-"""NaN-ignoring row maxima and IGC's vectorizer on but for compares, faster with the
-same output bits (``examples/xpu/README.md``). Why that holds:
+ATTENTION_XEGPU = {"xegpu_nan_ignoring_maxima": [True]}
+"""NaN-ignoring row maxima, faster with the same output bits (``examples/xpu/README.md``). Why that holds:
 ``xpu_params.NAN_IGNORING_MAXIMA``. Keep in sync with AI-bench's ``backends/utils/helion_mlir_xpu_utils/attention.py``."""
 ATTENTION_BLOCKS = [1, 1, 512, 64]
 """Flash-attention block sizes ``[batch, head, query rows, K/V rows]`` of the bench
-shape, picked on the Arc B50 for a head dim of 64, with
-``igc_vectorizer="cmp"`` and NaN-ignoring row maxima:
+shape, picked on the Arc B50 for a head dim of 64, with NaN-ignoring row maxima:
 
 - Batch and head blocks 1: each workgroup works on one (batch, head) matrix
   (unit tile dims are folded; the grid is B x H x S/512 = 32x32x1).
@@ -1198,15 +1193,7 @@ def _gemm(
     )
 
 
-VECTORIZER_CMP = {"igc_vectorizer": ["cmp"]}
-"""The kernels that choose it (``test_chosen_kernels_after_other_kernels``), with what
-they gain: device time with the vectorizer off is 29_Softplus +6.3 %, L2
-29_Matmul_Mish_Mish +6.9 %, L2 81 +3.3 %. Keep in sync with AI-bench's ``_VECTORIZER``."""
-
-
-def _unary(
-    name: str, fn: Callable[..., object], xegpu: dict[str, object] | None = None
-) -> Problem:
+def _unary(name: str, fn: Callable[..., object]) -> Problem:
     # The grid runs the column tiles first (x), the rows second.
     grid = tuple(
         size // block
@@ -1221,7 +1208,6 @@ def _unary(
         BF16,
         ELEMENTWISE_BLOCKS,
         grid,
-        xegpu=xegpu or {},
     )
 
 
@@ -1277,7 +1263,7 @@ PROBLEMS: tuple[Problem, ...] = (
     _unary("25_Swish", _swish),
     _unary("27_SELU_", _selu),
     _unary("28_HardSigmoid", _hardsigmoid),
-    _unary("29_Softplus", _softplus, VECTORIZER_CMP),
+    _unary("29_Softplus", _softplus),
     _unary("30_Softsign", _softsign),
     _unary("31_ELU", _elu),
     _unary("32_HardTanh", _hardtanh),
@@ -1397,7 +1383,6 @@ def _linear(
     fn: Callable[..., object],
     mnk: tuple[int, int, int],
     scalars: tuple[float, ...] = (),
-    extra: dict[str, object] | None = None,
 ) -> Problem:
     """``fn`` of ``x: [M, K]``, ``weight: [N, K]`` and ``bias: [N]``."""
     m, n, k = mnk
@@ -1416,7 +1401,7 @@ def _linear(
         blocks,
         grid,
         scalars,
-        {**xegpu, **(extra or {})},
+        xegpu,
     )
 
 
@@ -1435,7 +1420,7 @@ LEVEL2_PROBLEMS: tuple[Problem, ...] = (
         _LINEAR_MNK,
         (2.0, 0.1),
     ),
-    _linear("29_Matmul_Mish_Mish", _linear_mish_mish, _LINEAR_MNK, (), VECTORIZER_CMP),
+    _linear("29_Matmul_Mish_Mish", _linear_mish_mish, _LINEAR_MNK),
     _linear(
         "40_Matmul_Scaling_ResidualAdd",
         _linear_scaling_residual_add,
@@ -1459,8 +1444,6 @@ LEVEL2_PROBLEMS: tuple[Problem, ...] = (
         "81_Gemm_Swish_Divide_Clamp_Tanh_Clamp",
         _linear_swish_divide_clamp_tanh_clamp,
         _LINEAR_MNK,
-        (),
-        VECTORIZER_CMP,
     ),
 )
 """KernelBench level 2 problems with an ``mlir-gpu-bench`` variant: ``nn.Linear``

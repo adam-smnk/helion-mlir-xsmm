@@ -146,7 +146,7 @@ keeps lighthouse's inference.
 | `xegpu_prefetch_tiles` | `[a_m, a_k, b_k, b_n]`: A and B prefetch tiles, in the operand's stored orientation (`[n, k]` for a transposed B) | GEMM kernels |
 | `xegpu_prefetch_depths` | `[a_nb, b_nb]`: K iterations A and B are prefetched ahead | GEMM kernels |
 | `xegpu_nan_ignoring_maxima` | `True`: row maxima that only shift an `exp` ignore NaN, which is faster. The output is the same, as a NaN score gives a NaN row through `exp` and the sum, given IGC's options: this form is what IGC's vectorizer miscompiles without them ([`xpu_params.py`](helion_mlir_backend/_compiler/targets/xpu_params.py)) | attention kernels |
-| `igc_vectorizer` | Not an XeGPU parameter. `"off"`, the default, or `"cmp"`: IGC's vectorizer on but for vector compares, faster on some kernels and wrong in others (`xpu_transforms.IGC_OPTIONS`). The kernel author's choice: not searched, not checked at compile time | every kernel |
+| `igc_vectorizer` | Not an XeGPU parameter. `"cmp"`, the default: IGC's vectorizer on but for vector compares. `"off"`: the escape hatch, the vectorizer off, slower on some kernels (`xpu_transforms.IGC_OPTIONS`). Not searched, not checked at compile time; see below the table | every kernel |
 
 ```python
 config = helion.Config(
@@ -166,6 +166,14 @@ above, e.g. a reduction's load tile rows divide its subgroup rows and f32 loads 
 kernels raise `XeGPUConfigError` (an `MLIRBackendError`, so the autotuner skips the
 config). The CPU target ignores the `xegpu_*` keys, so one config can serve both
 devices.
+
+IGC's vectorizer is on by default (`igc_vectorizer` above). On an Arc B50 with IGC 2.41,
+every kernel benchmarked is correct. The two known bugs are avoided by a flag
+(`VectorizerAllowCMP=0`) and an IR rewrite (`xevm_lane_conversions`), on that one IGC
+build. Other kernels and other builds are not proven, and nothing checks a binary at
+compile time: `agent-tools/igc_binary_check.py` in helion-mlir-dev is the check, and
+`igc_vectorizer=["off"]` the escape hatch. The vectorizer also costs compile time: 23.4
+against 19.4 s over the 37 benchmarked problems, nearly all of it L2 29 (7.1 against 2.1 s).
 
 ### Autotuning on the XPU
 

@@ -1552,9 +1552,10 @@ _ATTENTION_CASES = {
     "97-b4h8": ((4, 8, 512, 64), (4, 8, 512, 64)),
 }
 _FORMS = {
-    "shipped": {"xegpu_nan_ignoring_maxima": [True], "igc_vectorizer": ["cmp"]},
-    "vectorizer-off": {"xegpu_nan_ignoring_maxima": [True]},
+    "shipped": {"xegpu_nan_ignoring_maxima": [True]},
+    "vectorizer-off": {"xegpu_nan_ignoring_maxima": [True], "igc_vectorizer": ["off"]},
     "nan-propagating": {},
+    "nan-propagating-off": {"igc_vectorizer": ["off"]},
 }
 """Row maxima and IGC's vectorizer: what the example and 97 use, and the others."""
 
@@ -1598,17 +1599,16 @@ def test_attention_after_other_kernels(case: str, form: str) -> None:
         ("81_Gemm_Swish", None),
     ],
 )
-def test_chosen_kernels_after_other_kernels(
+def test_vectorizer_gains_after_other_kernels(
     prefix: str, shapes: tuple[tuple[int, ...], ...] | None
 ) -> None:
-    """The kernels other than attention that choose ``igc_vectorizer="cmp"``: the
-    same bits as with the vectorizer off, and stable after other kernels; a sentinel
+    """The kernels other than attention that gain most from the vectorizer: the
+    same bits as with it off, and stable after other kernels; a sentinel
     if their code changes. It cannot show that they avoid the bug: they do not take
     that path (the no-option control does not fail for them)."""
     problems = (*kb.PROBLEMS, *kb.LEVEL2_PROBLEMS)
     problem = next(p for p in problems if p.name.startswith(prefix))
-    assert problem.xegpu.get("igc_vectorizer") == ["cmp"]
-    off = {k: v for k, v in problem.xegpu.items() if k != "igc_vectorizer"}
+    off = {**problem.xegpu, "igc_vectorizer": ["off"]}
     generator = torch.Generator().manual_seed(0)
     inputs = [
         torch.randn(*shape, generator=generator).to(problem.dtype).to(DEVICE)
@@ -1641,7 +1641,7 @@ def test_attention_matrix_finds_the_miscompile(
     monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")
     # In-process entries are cached by module text, which the option is not part of.
     monkeypatch.setattr(execution, "_JIT_CACHE", type(execution._JIT_CACHE)())
-    for name in ("IGC_OPTIONS", "IGC_OPTIONS_CMP"):
+    for name in ("IGC_OPTIONS", "IGC_OPTIONS_OFF"):
         monkeypatch.setattr(
             xpu_target.xpu_transforms, name, "-ze-opt-large-register-file"
         )

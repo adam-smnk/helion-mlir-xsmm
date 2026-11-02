@@ -43,7 +43,7 @@ BATCH, HEADS, KV_HEADS, SEQ, HEAD_DIM = 4, 32, 8, 512, 64
 BLOCK_SIZES = [1, 1, 256, 64]
 """``[batch, K/V head, query rows, K/V rows]``, picked for an Arc Pro B50 (16
 Xe-cores, 32 large-register threads per core, 2048 bf16 DPAS flop/clk per core),
-with ``igc_vectorizer="cmp"``:
+with IGC's vectorizer on, the default:
 
 - Batch and K/V head 1: a workgroup works on one K/V head; those dims become
   grid dims (grid 4 x 8 x 8 = 256 workgroups, 16 waves of 16 Xe-cores).
@@ -112,7 +112,6 @@ def _make_kernel(block_sizes: list[int]) -> object:
         config=helion.Config(
             block_sizes=block_sizes,
             xegpu_nan_ignoring_maxima=[True],
-            igc_vectorizer=["cmp"],
         ),
     )
 

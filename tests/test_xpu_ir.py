@@ -1060,7 +1060,7 @@ def test_other_tile_expressions_are_a_clear_error(
 @pytest.mark.parametrize(
     ("value", "match"),
     [
-        (["on"], r"igc_vectorizer\[0\]='on': expected \"off\", \"cmp\" or None"),
+        (["on"], r"igc_vectorizer\[0\]='on': expected \"cmp\", \"off\" or None"),
         ([True], r"igc_vectorizer\[0\]=True: expected"),
         ("cmp", r"igc_vectorizer='cmp': expected a list"),
     ],
@@ -1077,7 +1077,7 @@ def test_vectorizer_choice_differs_in_the_module() -> None:
     """Part of the module, so of the JIT cache key: the two compile separately."""
     config = helion.Config(block_sizes=[256, 256, 32])
     texts = []
-    for xegpu in ({}, {"igc_vectorizer": ["cmp"]}):
+    for xegpu in ({}, {"igc_vectorizer": ["off"]}):
         module = generate_mlir(matmul, _gemm_args(), config=config)
         get_target("xpu").configure(module, xegpu)
         texts.append(str(module))

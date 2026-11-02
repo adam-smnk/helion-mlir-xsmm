@@ -2,7 +2,7 @@
 (IGC's own dumps, no device) and on the device. Causes and reproducers are in
 helion-mlir-dev's ``agent-wiki/upstream-repro/xpu-nan/README.md``.
 
-- ``IGC_OPTIONS``'s ``EnableVectorizer=0``: ``IGCVectorizer`` rebuilds a
+- ``IGC_OPTIONS``'s ``VectorizerAllowCMP=0``: ``IGCVectorizer`` rebuilds a
   compare and select as a vector one, and IGC emits that as a size-1 min/max
   into a vector: the other elements read stale registers. The kernels here are
   deterministic: they are wrong on any run with it (the row value stays in the
@@ -342,32 +342,24 @@ def test_problems_have_no_narrow_minmax_and_use_all_registers(
     for visaasm in dump.glob("*.visaasm"):
         assert "-TotalGRFNum 256" in visaasm.read_text(errors="replace"), visaasm.name
     assert _dump_problems(dump) == []
-    _assert_options_in_force(dump, cmp=bool(_entries(config, "igc_vectorizer")))
+    _assert_options_in_force(dump, off=False)
 
 
-def _entries(config: helion.Config | None, key: str) -> list[object]:
-    return (
-        [item for item in (config.config.get(key) or ()) if item == "cmp"]
-        if config
-        else []
-    )
-
-
-def _assert_options_in_force(dump: pathlib.Path, *, cmp: bool) -> None:
+def _assert_options_in_force(dump: pathlib.Path, *, off: bool) -> None:
     """IGC's command line has the option: one that reaches only ``_options.txt`` is
-    lost (a tool preloaded into ``ocloc``, a libocloc build of LLVM, ...), and
-    without it no vectorized code in an ``"off"`` binary."""
+    lost (a tool preloaded into ``ocloc``, a libocloc build of LLVM, ...); no vector
+    compare, and no vectorized code at all in an ``"off"`` binary."""
     options = [path.read_text() for path in dump.glob("*_options.txt")]
     assert any("-ze-opt-large-register-file" in text for text in options)
-    wanted = "VectorizerAllowCMP=0" if cmp else "EnableVectorizer=0"
-    other = "EnableVectorizer=0" if cmp else "VectorizerAllowCMP=0"
+    wanted = "EnableVectorizer=0" if off else "VectorizerAllowCMP=0"
+    other = "VectorizerAllowCMP=0" if off else "EnableVectorizer=0"
     commands = [path.read_text(errors="replace") for path in dump.glob("*_cmd.txt")]
     assert any(wanted in text for text in commands)
     assert not any(other in text for text in commands)
     optimized = list(dump.glob("*_optimized.ll"))
     assert optimized
     for path in optimized:
-        unwanted = "vectorized_cmp" if cmp else "vectorized_"
+        unwanted = "vectorized_" if off else "vectorized_cmp"
         assert unwanted not in path.read_text(errors="replace"), path.name
 
 
@@ -376,7 +368,7 @@ def _assert_options_in_force(dump: pathlib.Path, *, cmp: bool) -> None:
 def test_vectorizer_choice_reaches_igc(
     vectorizer: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """``igc_vectorizer``: the kernel's choice on IGC's command line, ``"off"`` the
+    """``igc_vectorizer``: the kernel's choice on IGC's command line, ``"cmp"`` the
     default, on a kernel with no other reason to be checked."""
     problem = next(p for p in kb.PROBLEMS if p.name.startswith("1_Square"))
     config = helion.Config(
@@ -386,7 +378,7 @@ def test_vectorizer_choice_reaches_igc(
     )
     args = [xpu_tensor(*shape, dtype=problem.dtype) for shape in problem.shapes]
     dump = _igc_dump(monkeypatch, tmp_path, problem.kernel, args, config)
-    _assert_options_in_force(dump, cmp=vectorizer == "cmp")
+    _assert_options_in_force(dump, off=vectorizer == "off")
 
 
 def _two_elementwise(x: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
@@ -403,7 +395,7 @@ _FIVE = re.compile(r"5\.000000e\+00|0x4014000000000000")
 
 @BINARIES
 @pytest.mark.parametrize(
-    "choices", [["cmp", None], [None, "cmp"]], ids=["first", "second"]
+    "choices", [["off", None], [None, "off"]], ids=["first", "second"]
 )
 def test_vectorizer_choice_is_per_kernel(
     choices: list[str | None], monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
@@ -425,8 +417,8 @@ def test_vectorizer_choice_is_per_kernel(
             continue
         keys = command.read_text(errors="replace")
         seen[module] = (
-            "cmp" if "VectorizerAllowCMP" in keys else None,
-            "EnableVectorizer" in keys,
+            "off" if "EnableVectorizer" in keys else None,
+            "VectorizerAllowCMP" in keys,
         )
     assert set(seen) == {0, 1}
     for module, choice in enumerate(choices):
@@ -436,7 +428,7 @@ def test_vectorizer_choice_is_per_kernel(
 def _lost_options(monkeypatch: pytest.MonkeyPatch) -> None:
     """As a tool that drops ``-igc_opts`` does."""
     monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")
-    for name in ("IGC_OPTIONS", "IGC_OPTIONS_CMP"):
+    for name in ("IGC_OPTIONS", "IGC_OPTIONS_OFF"):
         monkeypatch.setattr(xpu_transforms, name, "-ze-opt-large-register-file")
 
 
@@ -485,10 +477,10 @@ def _rounded_sine(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
 
 
 @BINARIES
-def test_vectorizer_cmp_needs_the_lane_conversions(
+def test_the_vectorizer_needs_the_lane_conversions(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
-    """``igc_vectorizer="cmp"`` on the form of ``VectorizerAllowFPTRUNC``'s bug: a use
+    """The default, ``"cmp"``, on the form of ``VectorizerAllowFPTRUNC``'s bug: a use
     before its def in IGC's IR, stale registers in the output, unless
     ``xevm_lane_conversions`` runs. If IGC no longer shows it without the rewrite, the
     rewrite's removal condition may hold: see that module's docstring. The negative:
@@ -534,31 +526,17 @@ def test_builtins_rounded_to_16_bits_have_no_use_before_def(
     blocks: list[int],
     dtypes: tuple[torch.dtype, torch.dtype],
 ) -> None:
-    """The exact kernels of ``xevm_lane_conversions``'s regressions, with the
-    vectorizer on."""
+    """The exact kernels of ``xevm_lane_conversions``'s regressions."""
     kernel = helion.kernel(
         getattr(full_kernels, f"cast_{name}"),
         backend="mlir",
         static_shapes=True,
     )
     args = [xpu_tensor(*shape, dtype=dtypes[0]), xpu_tensor(*shape, dtype=dtypes[1])]
-    config = helion.Config(block_sizes=blocks, igc_vectorizer=["cmp"])
+    config = helion.Config(block_sizes=blocks)
     dump = _igc_dump(monkeypatch, tmp_path, kernel, args, config)
-    _assert_options_in_force(dump, cmp=True)
+    _assert_options_in_force(dump, off=False)
     assert _dump_problems(dump) == []
-
-
-@BINARIES
-@pytest.mark.parametrize(
-    "prefix", ["97_", "29_Softplus", "29_Matmul_Mish_Mish", "81_Gemm_Swish"]
-)
-def test_kernels_that_choose_the_vectorizer_show_no_known_miscompile(
-    prefix: str, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
-) -> None:
-    """Their binaries as built, with this IGC."""
-    kernel, args, config = _problem(prefix)
-    assert config.config["igc_vectorizer"] == ["cmp"]
-    assert _dump_problems(_igc_dump(monkeypatch, tmp_path, kernel, args, config)) == []
 
 
 def test_igc_dump_problems(tmp_path: pathlib.Path) -> None:
@@ -743,8 +721,8 @@ def test_f64_narrowed_to_16_bits_matches_fp64(
     """Regression: ``fptrunc <8 x double>`` before its operand, so the output was what
     earlier kernels left, up to 130037 of 131072 elements off by over 1 %."""
     source, target = dtypes
-    kernel = _kernel(full_kernels.cast_f64_sin, blocks, igc_vectorizer=["cmp"])
-    paint = _kernel(_paint, [32, 256], igc_vectorizer=["off"])
+    kernel = _kernel(full_kernels.cast_f64_sin, blocks)
+    paint = _kernel(_paint, [32, 256])
     generator = torch.Generator().manual_seed(0)
     x = (torch.rand(shape, generator=generator) * 0.8 + 0.1).to(source)
     ref = torch.sin(x.double()).to(torch.float32).double()

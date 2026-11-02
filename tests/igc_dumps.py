@@ -1,5 +1,5 @@
 """What in IGC's dumps of a binary shows a miscompile that ``xpu_transforms.IGC_OPTIONS``
-avoids, for the tests of ``tests/test_xpu_igc_workarounds.py``. The compile does not
+and ``xevm_lane_conversions`` avoid, for the tests of ``tests/test_xpu_igc_workarounds.py``. The compile does not
 check this: IGC versions differ. ``agent-tools/igc_binary_check.py`` in
 helion-mlir-dev reports the same and more for any dump.
 

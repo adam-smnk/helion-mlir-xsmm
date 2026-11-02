@@ -135,8 +135,8 @@ def legalize_host_ops() -> ir.Module:
     return schedule
 
 
-IGC_OPTIONS = r"-ze-opt-large-register-file\" \"-igc_opts \'EnableVectorizer=0\'"
-"""IGC options of a device binary with ``igc_vectorizer`` ``"off"``, today's default.
+IGC_OPTIONS = r"-ze-opt-large-register-file\" \"-igc_opts \'VectorizerAllowCMP=0\'"
+"""IGC options of a device binary by default: ``igc_vectorizer`` unset or ``"cmp"``.
 Only ``gpu-module-to-binary``'s ``opts`` pass them to IGC (the XPU target's binary
 stage); this LLVM never reads a target's ``cmd-options`` flag.
 
@@ -147,15 +147,23 @@ in one pair silently lose the large register file (128 GRFs, with no error). The
 escaped quotes close the first pair and open a second one.
 
 - The large register file: 256 GRFs; without it GEMMs get 128 and spill.
-- ``EnableVectorizer=0`` turns off ``IGCVectorizer``, which miscompiled kernels in
-  the two ways below (IGC 2.41, B50) and took a compiler crash on a Triton kernel.
+- ``VectorizerAllowCMP=0`` keeps ``IGCVectorizer`` on without its vector compares,
+  one of the two miscompiles below (IGC 2.41, B50). The other one, a vector ``fptrunc``
+  before its operand, is avoided in the IR (:mod:`.mlir_transforms.xevm_lane_conversions`).
 
-Device time with this against :data:`IGC_OPTIONS_CMP`, on the B50 at bench shapes:
+On an Arc B50 with IGC 2.41, every kernel benchmarked here gives correct results; the
+two known bugs are avoided by this option and an IR rewrite, on that one IGC build.
+Other kernels and other builds are not proven: ``agent-tools/igc_binary_check.py`` in
+helion-mlir-dev checks a kernel's binaries, and ``igc_vectorizer="off"`` is the escape
+hatch.
+
+Device time with :data:`IGC_OPTIONS_OFF` against this, on the B50 at bench shapes:
 29_Softplus +6.3 %, L2 29_Matmul_Mish_Mish +6.9 %, L2 81 +3.3 %, attention with
 ``maxnum`` row maxima +17 % on 97 at ``[1, 1, 256, 32]`` (3003 against 2561 us) and
 +44 % on Llama GQA at ``[1, 1, 256, 64]`` (318 against 220), the rest about 1 % or
-less either way. So this is the default and that one a choice, per kernel, for
-kernels whose results were checked under it.
+less either way. Compile time is the price: over the 37 benchmarked problems 23.4
+against 19.4 s with :data:`IGC_OPTIONS_OFF` on the compile node, nearly all of it L2
+29_Matmul_Mish_Mish (7.1 against 2.1 s).
 
 The pass's partial switches (``-igc_opts``, comma separated), and what each avoids:
 
@@ -174,8 +182,8 @@ The pass's partial switches (``-igc_opts``, comma separated), and what each avoi
   here; ``upstream-repro/igc-vector-minmax/fptrunc`` in the wiki, on a scalar ``tanh``
   builtin; Helion's ``tanh`` is a polynomial, ``xpu_math_approx``, and does not take
   it), or narrowing from f64: the output is whatever those registers hold, left by an
-  earlier kernel, zero only if nothing has written them yet. Not set with
-  :data:`IGC_OPTIONS_CMP`, as it costs most of what that gains on attention (Llama GQA
+  earlier kernel, zero only if nothing has written them yet. Not set here, as it
+  costs most of what that gains on attention (Llama GQA
   288 against 220 us): :mod:`.mlir_transforms.xevm_lane_conversions` avoids that form
   in the IR instead, for every kernel.
 - ``VectorizerAllowSelect=0``: avoids the Triton compiler crash through ``ocloc``,
@@ -183,9 +191,10 @@ The pass's partial switches (``-igc_opts``, comma separated), and what each avoi
 - ``VectorizerAllowFADD``, ``FSUB``, ``FMUL``, ``FDIV``, ``EXP2``, ``MAXNUM``,
   ``WAVEALL``, ``WAVEALLJoint``, ``UniformCMP``, ``UniformSelect``: no bug known in
   them, none tried on our kernels."""
-IGC_OPTIONS_CMP = r"-ze-opt-large-register-file\" \"-igc_opts \'VectorizerAllowCMP=0\'"
-"""IGC options of a device binary with ``igc_vectorizer`` ``"cmp"``: the vectorizer
-on, but for vector compares. See :data:`IGC_OPTIONS`."""
+IGC_OPTIONS_OFF = r"-ze-opt-large-register-file\" \"-igc_opts \'EnableVectorizer=0\'"
+"""IGC options of a device binary with ``igc_vectorizer`` ``"off"``, the escape hatch:
+``EnableVectorizer=0`` turns ``IGCVectorizer`` off, with the two miscompiles below
+:data:`IGC_OPTIONS` and a compiler crash on a Triton kernel. See :data:`IGC_OPTIONS`."""
 XEVM_TARGET = '#xevm.target<O = 3, chip = "bmg">'
 """The one XeVM target of every GPU module: lighthouse's (``O = 3``, ``bmg``)."""
 _NO_MODULE = "^$"

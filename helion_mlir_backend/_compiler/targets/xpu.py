@@ -316,8 +316,8 @@ class _BinaryPasses:
     def run(self, operation: ir.Operation, name: str) -> None:
         kernel = self.kernels.get(name, KernelParams())
         options = (
-            xpu_transforms.IGC_OPTIONS_CMP
-            if kernel.vectorizer_cmp
+            xpu_transforms.IGC_OPTIONS_OFF
+            if kernel.vectorizer_off
             else xpu_transforms.IGC_OPTIONS
         )
         if options not in self.passes:

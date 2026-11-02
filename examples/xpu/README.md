@@ -14,8 +14,6 @@ flash-attention kernel:
 - Hand-picked config, with its rationale next to `BLOCK_SIZES`: workgroups of 256
   query rows (16 subgroups of 16 rows) over K/V tiles of 64. Shapes that does not fit
   take 128 query rows (`llama_attention`'s docstring).
-- `igc_vectorizer=["cmp"]`: IGC's vectorizer on but for vector compares, the kernel's
-  own choice against the default `"off"` (`xpu_transforms.IGC_OPTIONS`).
 - `xegpu_nan_ignoring_maxima=[True]`: the row maxima ignore NaN, with the same
   output given IGC's options (below).
 - The scale is an `hl.constexpr` (a constant in the IR); a runtime float also works.
@@ -38,10 +36,10 @@ includes the host work of a call. µs.
 
 | | Llama GQA device | wall | 97 (32x32x512x64) device | wall |
 |---|---|---|---|---|
-| this kernel: `[1, 1, 256, 64]`, 97 `[1, 1, 512, 64]`, `"cmp"`, NaN-ignoring maxima | 217 | 319 | 2129 | 2405 |
-| vectorizer off, NaN-ignoring, `[1, 1, 512, 128]` (best found off) | 298 | 410 | 2798 | 3028 |
-| `"cmp"`, NaN-propagating, same blocks | 349 | 479 | 3423 | 3660 |
-| all defaults: off, NaN-propagating, `[1, 1, 128, 64]` | 399 | 527 | 4434 | 4652 |
+| this kernel: `[1, 1, 256, 64]`, 97 `[1, 1, 512, 64]`, vectorizer on (the default), NaN-ignoring maxima | 217 | 319 | 2129 | 2405 |
+| `igc_vectorizer=["off"]`, NaN-ignoring, `[1, 1, 512, 128]` (best found off) | 298 | 410 | 2798 | 3028 |
+| vectorizer on, NaN-propagating, same blocks | 349 | 479 | 3423 | 3660 |
+| `igc_vectorizer=["off"]`, NaN-propagating, `[1, 1, 128, 64]` | 399 | 527 | 4434 | 4652 |
 | torch SDPA | 283 | 327 | 2813 | 2939 |
 | lighthouse SDPA fusion through AI-bench's pipeline, this backend's tail (default options) | 445 | 579 | 4660 | 4878 |
 
@@ -74,7 +72,7 @@ default `unitrace`, which loses them, up to half of the rows came out NaN. Nothi
 refuses that at compile time, since IGC versions differ; the backend's tests scan
 these binaries.
 
-Checked on the device with `"cmp"` against torch's SDPA on the device and in f64, in
+Checked on the device with the vectorizer on against torch's SDPA on the device and in f64, in
 the tests 188 cases plus 4 of the row below (47 edits, small GQA and 97 shapes, bf16 and
 f16), and once by hand 284 with the spec shapes in bf16 (NaN, inf and -inf in Q, K and V, single elements, rows,
 tiles and heads): the two forms give the same bits in all of them, with torch's NaN
@@ -88,6 +86,16 @@ give the same NaN pattern.
   torch's SDPA on the device; f64 does not overflow.
 - Torch's SDPA on the CPU in bf16 gives no NaN for an inf input where the device and
   f64 do; the comparison above does not use it.
+
+### IGC's vectorizer
+
+The kernel runs with IGC's vectorizer on, as every kernel does by default
+(`xpu_transforms.IGC_OPTIONS`); `igc_vectorizer=["off"]` turns it off for a kernel.
+On an Arc B50 with IGC 2.41, every kernel benchmarked is correct. The two known bugs
+are avoided by a flag (`VectorizerAllowCMP=0`) and an IR rewrite
+(`xevm_lane_conversions`), on that one IGC build. Other kernels and other builds
+are not proven; `agent-tools/igc_binary_check.py` in helion-mlir-dev checks a kernel's
+binaries.
 
 ### Not covered
 
