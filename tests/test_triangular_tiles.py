@@ -51,6 +51,16 @@ def behind_window(
     return out
 
 
+def zero_span(x: torch.Tensor, width: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(tm.begin, tm.begin + width):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
 def capped(x: torch.Tensor, cap: hl.constexpr) -> torch.Tensor:
     out = torch.empty_like(x)
     for tm in hl.tile(x.size(0)):
@@ -116,6 +126,17 @@ def test_loop_to_a_minimum_runs_no_key_past_it() -> None:
         _kernel(capped, 16, 8),
         lambda a, *_: _expected(a, 16, lambda _, end: (0, min(end, 24))),
         [x, hl.constexpr(24)],
+    )
+
+
+def test_a_loop_that_spans_nothing_runs_no_tile() -> None:
+    """Regression: ``ZeroDivisionError`` in the proof of full tiles: the tile of a
+    loop whose span is 0 has size 0."""
+    x = torch.randn(32, 8)
+    check_kernel(
+        _kernel(zero_span, 8, 4),
+        lambda a, *_: torch.zeros_like(a),
+        [x, hl.constexpr(0)],
     )
 
 

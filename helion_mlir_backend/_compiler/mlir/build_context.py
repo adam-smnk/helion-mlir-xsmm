@@ -243,7 +243,8 @@ class BuildContext:
             )
         first, last = self.index_facts(begin), self.index_facts(end)
         if (
-            first.multiple % size == 0
+            size  # A tile of a loop that spans nothing has size 0.
+            and first.multiple % size == 0
             and last.multiple % size == 0
             and first.low is not None
             and first.low >= 0
@@ -263,6 +264,8 @@ class BuildContext:
                     continue
                 begin, end = self.block_id_to_bounds[block_id]
                 size = self.geometry.tile_extent(block_id)
+                if not size:
+                    return None
                 if not isinstance(begin, int) or not isinstance(end, int):
                     return (
                         IndexFacts(size)
