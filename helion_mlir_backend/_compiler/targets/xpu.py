@@ -177,6 +177,7 @@ def _stages(
         ("nan-maxima", _NanMaxima(kernels)),
         ("bufferized", xegpu.bufferize_schedule(entry)),
         ("host-legalized", xpu_transforms.legalize_host_ops()),
+        ("grid-mappings", _StripGridMappings()),
         # Lighthouse's outline_gpu_func and annotate_layouts schedules, per kernel.
         ("gpu-outlining", xpu_transforms.outline_kernels(entry, kernels, columns)),
         # Row results stored as [rows, 1] columns: see keep_row_dims.
@@ -379,6 +380,20 @@ def _compile_ordered(
             stacklevel=2,
         )
         return {}
+
+
+class _StripGridMappings(Stage):
+    """The placeholder mappings that kept grid loops of one tile, right before
+    outlining: :mod:`~..mlir.lowering.loops`."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        def visit(op: ir.Operation) -> ir.WalkResult:
+            if op.name == "scf.forall" and "mapping" in op.attributes:
+                del op.attributes["mapping"]
+            return ir.WalkResult.ADVANCE
+
+        module.operation.walk(visit)
+        return module
 
 
 class _KeepRowDims(Stage):

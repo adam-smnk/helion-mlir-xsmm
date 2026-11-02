@@ -1096,15 +1096,15 @@ def test_vectorizer_choice_differs_in_the_module() -> None:
     ("q_shape", "blocks"),
     [((1, 1, 128, 64), [1, 1, 128, 64]), ((1, 1, 512, 64), [1, 1, 512, 64])],
 )
-def test_one_workgroup_with_per_kernel_keys_is_a_clear_error(
+def test_one_workgroup_with_per_kernel_keys(
     q_shape: tuple[int, ...], blocks: list[int]
 ) -> None:
     """Regression: "lists of 1 entries, but the kernel has 0 GPU kernel(s)", as the
-    tile of the whole shape leaves no grid loop."""
+    tile of the whole shape left no grid loop. It is one GPU kernel, with the key."""
     config = helion.Config(block_sizes=blocks, igc_vectorizer=["cmp"])
     args = [xpu_tensor(*q_shape, dtype=torch.bfloat16) for _ in range(3)]
-    with pytest.raises(XeGPUConfigError, match="no grid loop is left"):
-        lower_xpu_stages(_kernel(config)(attention), args)
+    _, lowered = lower_xpu_stages(_kernel(config)(attention), args)
+    assert lowered.count("gpu.launch_func") == 1
 
 
 @pytest.mark.isolated
@@ -1411,6 +1411,7 @@ def test_stage_dumps(monkeypatch: pytest.MonkeyPatch) -> None:
         "nan-maxima",
         "bufferized",
         "host-legalized",
+        "grid-mappings",
         "gpu-outlining",
         "row-results",
         "xegpu-initial",

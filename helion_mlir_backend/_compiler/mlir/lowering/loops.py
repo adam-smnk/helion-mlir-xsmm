@@ -27,6 +27,7 @@ from ..analysis.geometry import loop_block_ids
 from ..analysis.tensor_effects import accessed_tensor
 from ..support import NodeLoweringError
 from ..support import UnsupportedOperationError
+from ..support.debug import target_override
 from . import emit
 from .control_flow import carried_positions
 from .control_flow import lower_subgraph
@@ -154,6 +155,21 @@ def _trip_count(bound: LoopBounds) -> int | ir.Value:
     ).result
 
 
+def _on_xpu(ctx: BuildContext) -> bool:
+    return ctx.env.device.type == "xpu" or target_override() == "xpu"
+
+
+def _keep_one_tile_grid(forall: scf_d.ForallOp, trips: list[int | ir.Value]) -> None:
+    """A grid of one tile keeps its loop: canonicalization folds single-iteration
+    dims of a loop without a ``mapping``, and the XPU target's GPU kernels are the
+    grid loops, so the whole kernel would become host code touching device
+    memory. The mapping is a placeholder until the XPU target outlines the kernel
+    (``strip_grid_mappings``). A grid with several tiles folds its unit dims."""
+    if all(trip == 1 for trip in trips):
+        threads = ", ".join(f"#gpu.thread<linear_dim_{i}>" for i in range(len(trips)))
+        forall.operation.attributes["mapping"] = ir.Attribute.parse(f"[{threads}]")
+
+
 def _emit_forall(
     ctx: BuildContext,
     graph: torch.fx.Graph,
@@ -170,6 +186,8 @@ def _emit_forall(
         [1] * rank,
         shared_outs=[ctx.tensors.value(name) for name in names],
     )
+    if _on_xpu(ctx):
+        _keep_one_tile_grid(forall, trips)
     with ir.InsertionPoint(forall.body):
         for block_id, bound, trip_iv in zip(
             grid_ids, bounds, forall.induction_variables, strict=True
