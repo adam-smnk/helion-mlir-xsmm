@@ -49,6 +49,7 @@ from .vectorize_pads import vectorize_pads
 from .version_padded_operands import version_padded_operands
 from .widen_misread_amx_operands import widen_misread_amx_operands
 from .widen_transposes import widen_transposes
+from .xegpu_attention_loops import copy_attention_layouts
 from .xegpu_elementwise import InferXeGPUElementwiseLayoutOp
 from .xegpu_elementwise import infer_xegpu_elementwise_layout
 from .xegpu_elementwise import map_elementwise_grid
@@ -74,6 +75,7 @@ __all__ = [
     "forward_rows",
     "hoist_allocas",
     "hoist_invariant_scalars",
+    "copy_attention_layouts",
     "infer_xegpu_elementwise_layout",
     "infer_xegpu_reduction_tiles",
     "legalize_for_llvm",

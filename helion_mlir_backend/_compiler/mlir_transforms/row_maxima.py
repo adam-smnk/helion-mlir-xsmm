@@ -81,6 +81,18 @@ def _carried(op: ir.Operation, value: ir.Value) -> list[ir.Value] | None:
     return carried
 
 
+def _next_loop(op: ir.Operation, value: ir.Value) -> list[ir.Value]:
+    """The values a ``scf.for`` ``op`` passes ``value``, an initial value of it, to: the
+    iteration argument and the loop result (several K/V loops are one online softmax).
+    Empty if ``value`` is its bound or step."""
+    arguments = list(op.regions[0].blocks[0].arguments)
+    carried: list[ir.Value] = []
+    for index, operand in enumerate(op.operands):
+        if index >= 3 and operand == value:
+            carried += [arguments[index - 2], op.results[index - 3]]
+    return carried
+
+
 def _nan_reaches_the_whole_row(exp: ir.Operation, source_shift: bool) -> bool:
     """The forward slice of ``exp``'s result keeps NaN up to stores, of which there
     is one at least. With ``source_shift``, what is stored has also been through a
@@ -106,6 +118,8 @@ def _nan_reaches_the_whole_row(exp: ir.Operation, source_shift: bool) -> bool:
                 carried = _carried(op, value)
                 if carried is None:
                     return False
+                work += carried
+            elif name == "scf.for" and (carried := _next_loop(op, value)):
                 work += carried
             elif (
                 name in _NAN_KEEPING
@@ -137,11 +151,24 @@ def _nan_reaches_the_whole_row(exp: ir.Operation, source_shift: bool) -> bool:
                         if carried in values and carried not in mixed:
                             mixed.add(carried)
                             changed = True
+                elif use.owner.name == "scf.for":
+                    for carried in _next_loop(use.owner, value):
+                        if carried in values and carried not in mixed:
+                            mixed.add(carried)
+                            changed = True
     return all(store.operands[0] in mixed for store in stores)
 
 
 def _kind_name(op: ir.Operation) -> str:
     return _kind(op).removeprefix("#vector.kind<").removesuffix(">")
+
+
+def _is_max_reduction(value: ir.Value) -> bool:
+    return (
+        isinstance(value, ir.OpResult)
+        and value.owner.name == _REDUCTION
+        and _kind(value.owner) in (_MAXNUM, _MAXIMUM)
+    )
 
 
 def nan_cannot_be_lost(reduction: ir.Operation) -> bool:
@@ -188,8 +215,18 @@ def nan_cannot_be_lost(reduction: ir.Operation) -> bool:
                 if carried is None:
                     return False
                 work += carried
+            elif name == "scf.for" and (carried := _next_loop(op, value)):
+                work += carried
             else:
                 return False
+    # A later K/V loop's maximum reduction, compared with the running maximum, is the
+    # same chain, with its own source (also checked on its own, as a reduction here).
+    sources = {source}
+    for op in compares + maxima:
+        for operand in op.operands:
+            if operand not in chain and _is_max_reduction(operand):
+                chain.add(operand)
+                sources.add(operand.owner.operands[0])
     conditions = {op.results[0] for op in compares}
     if not all(set(op.operands) <= chain for op in compares + maxima):
         return False
@@ -208,7 +245,7 @@ def nan_cannot_be_lost(reduction: ir.Operation) -> bool:
         users = [use.owner for use in shift.results[0].uses]
         if right not in chain or len(users) != 1 or users[0].name != "math.exp":
             return False
-        is_source = left == source
+        is_source = left in sources
         if not is_source and left not in chain:
             return False
         found_source = found_source or is_source

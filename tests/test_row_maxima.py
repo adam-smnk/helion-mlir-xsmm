@@ -167,3 +167,80 @@ def test_only_named_kernels_keep_them(kernels: set[int], kept: int, kind: str) -
     module, _ = _reduction(_module(_SOFTMAX))
     assert restore_nan_propagating_maxima(module, kernels, "helion.kernel") == kept
     assert f"<{kind}>" in str(module)
+
+
+def _two_kv_loops(after: str = "") -> str:
+    """Two K/V loops of one online softmax: the second starts from the first's running
+    maximum and output, and compares its own maximum with the running one."""
+
+    def loop(name: str, source: str, inits: tuple[str, str]) -> str:
+        return f"""
+    %{name}:2 = scf.for %j{name} = %c0 to %c4 step %c1
+        iter_args(%running{name} = {inits[0]}, %acc{name} = {inits[1]}) -> ({_R}, {_M}) {{
+      %max{name} = vector.multi_reduction <maxnumf>, {source}, %init [1] : {_M} to {_R}
+      %wider{name} = arith.cmpf ogt, %running{name}, %max{name} : {_R}
+      %new{name} = arith.select %wider{name}, %running{name}, %max{name}
+          : vector<8xi1>, {_R}
+      %b{name} = vector.broadcast %new{name} : {_R} to vector<4x8xf32>
+      %shift{name} = vector.transpose %b{name}, [1, 0] : vector<4x8xf32> to {_M}
+      %d{name} = arith.subf {source}, %shift{name} : {_M}
+      %p{name} = math.exp %d{name} : {_M}
+      %sum{name} = vector.multi_reduction <add>, %p{name}, %zeros [1] : {_M} to {_R}
+      %bs{name} = vector.broadcast %sum{name} : {_R} to vector<4x8xf32>
+      %ts{name} = vector.transpose %bs{name}, [1, 0] : vector<4x8xf32> to {_M}
+      %next{name} = arith.addf %acc{name}, %ts{name} : {_M}
+      scf.yield %new{name}, %next{name} : {_R}, {_M}
+    }}"""
+
+    return f"""
+func.func @f(%out: tensor<8x4xf32>, %s: {_M}, %t: {_M}, %init: {_R}) -> tensor<8x4xf32> {{
+  %c0 = arith.constant 0 : index
+  %c1 = arith.constant 1 : index
+  %c4 = arith.constant 4 : index
+  %zero = arith.constant dense<0.0> : {_M}
+  %zeros = arith.constant dense<0.0> : {_R}
+  %r = scf.forall (%i) in (2) shared_outs(%o = %out) -> (tensor<8x4xf32>) {{
+    {loop("a", "%s", ("%init", "%zero"))}
+    {loop("c", "%t", ("%a#0", "%a#1"))}
+    {after}
+    %w = vector.transfer_write %c#1, %o[%c0, %c0] {{in_bounds = [true, true]}}
+        : {_M}, tensor<8x4xf32>
+    scf.forall.in_parallel {{
+      tensor.parallel_insert_slice %w into %o[0, 0] [8, 4] [1, 1]
+          : tensor<8x4xf32> into tensor<8x4xf32>
+    }}
+  }} {{helion.kernel = 0 : i64}}
+  return %r : tensor<8x4xf32>
+}}
+"""
+
+
+def _max_reductions_of(text: str) -> list[bool]:
+    with ir.Context() as context:
+        context.allow_unregistered_dialects = False
+        module = ir.Module.parse(text)
+        found: list[bool] = []
+
+        def visit(op: ir.Operation) -> ir.WalkResult:
+            if op.name == "vector.multi_reduction" and "add" not in str(
+                op.attributes["kind"]
+            ):
+                found.append(nan_cannot_be_lost(op))
+            return ir.WalkResult.ADVANCE
+
+        module.operation.walk(visit)
+        return found
+
+
+def test_maxima_of_later_kv_loops_are_one_chain() -> None:
+    """Both loops' maxima may ignore NaN; a NaN in either loop's scores reaches its
+    ``exp``, and the output through the carried accumulator."""
+    assert _max_reductions_of(_two_kv_loops()) == [True, True]
+
+
+def test_stored_maximum_of_two_loops_keeps_propagating_nan() -> None:
+    """Negative: the running maximum's other use, after both loops."""
+    after = f"""
+    %use = vector.transfer_write %c#0, %o[%c0, %c0] {{in_bounds = [true]}}
+        : {_R}, tensor<8x4xf32>"""
+    assert _max_reductions_of(_two_kv_loops(after)) == [False, False]

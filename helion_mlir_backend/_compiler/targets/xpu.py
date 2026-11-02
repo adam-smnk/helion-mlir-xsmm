@@ -52,6 +52,7 @@ from ..mlir.support.debug import xpu_stop_at
 from ..mlir.support.errors import UnsupportedOperationError
 from ..mlir.support.errors import UnsupportedTargetError
 from ..mlir_transforms.keep_row_dims import keep_row_dims
+from ..mlir_transforms.xegpu_attention_loops import copy_attention_layouts
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
 from ..mlir_transforms.row_maxima import restore_nan_propagating_maxima
@@ -401,8 +402,9 @@ def _check_dpas_anchored(module: ir.Module) -> None:
 
 
 class _CheckBlockSurfaces(Stage):
-    """``stage``, then a failure on 2D block descriptors of surfaces beyond the
-    hardware limits (silently wrong rows, :mod:`xegpu_block_surfaces`), and on
+    """``stage``, the anchors of an attention kernel's later K/V loops
+    (:mod:`xegpu_attention_loops`), then a failure on 2D block descriptors of surfaces
+    beyond the hardware limits (silently wrong rows, :mod:`xegpu_block_surfaces`), and on
     DPAS ops lighthouse's layout annotation left out (``check_dpas``: a layout path
     that leaves them to upstream's propagation on purpose passes ``False``)."""
 
@@ -412,6 +414,7 @@ class _CheckBlockSurfaces(Stage):
 
     def apply(self, module: ir.Module) -> ir.Module:
         module = self.stage.apply(module)
+        copy_attention_layouts(module)
         check_block_surfaces(module)
         if self.check_dpas:
             _check_dpas_anchored(module)

@@ -356,7 +356,7 @@ def _check_kernel_class(loop: ir.Operation) -> None:
                     _CPU,
                 ],
             )
-    elif len(contractions) == 2:
+    elif len(contractions) >= 2 and len(contractions) % 2 == 0:
         _check_attention(contractions, loop)
     elif len(contractions) > 2:
         raise UnsupportedOperationError(

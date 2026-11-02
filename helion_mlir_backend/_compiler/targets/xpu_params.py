@@ -476,15 +476,30 @@ def attention_shape(
     (linalg ops, in program order) are ``contractions``; ``ValueError`` naming
     the part of the structure that is missing.
 
-    By IR property: two 2D contractions in one ``scf.for`` of the grid loop (the
-    K/V loop); the first (``Q @ K^T``) contracts its B operand transposed; the
+    By IR property, for every pair of contractions, of same tiles (several K/V loops
+    are one online softmax; a kernel can mask only the tiles that need it): two 2D
+    contractions in one ``scf.for`` of the grid loop (the K/V loop); the first (``Q @ K^T``) contracts its B operand transposed; the
     second (``P @ V``) takes as A operand a value computed from the first's
     result through at least one reduction over its rows, and the loop carries
     its result (the output accumulator)."""
-    if len(contractions) != 2:
+    if not contractions or len(contractions) % 2:
         raise ValueError(
-            f"{len(contractions)} contractions (attention has two: Q @ K^T, P @ V)"
+            f"{len(contractions)} contractions (attention has two per loop over K/V "
+            "tiles: Q @ K^T, P @ V)"
         )
+    shapes = {
+        _attention_loop_shape(loop, contractions[i : i + 2])
+        for i in range(0, len(contractions), 2)
+    }
+    if len(shapes) != 1:
+        raise ValueError("the loops over K/V tiles have different tiles")
+    return shapes.pop()
+
+
+def _attention_loop_shape(
+    loop: ir.Operation, contractions: Sequence[ir.Operation]
+) -> AttentionShape:
+    """:func:`attention_shape` of one loop over K/V tiles, its two contractions."""
     scores, update = (op.operation for op in contractions)
     kv_loop = scores.parent
     if (
