@@ -2363,3 +2363,31 @@ def test_row_store_out_of_bounds_raises(pos: int) -> None:
     cache = torch.zeros(8, 8, 512, 64, device="xpu").to(BF16)
     with pytest.raises(IndexError, match="out of bounds"):
         _kernel(put_row, [1, 1, 64])(torch.randn(8, 8, 64).to(BF16).to("xpu"), cache, pos)
+
+
+def _add_one(x: torch.Tensor) -> torch.Tensor:
+    m, n = x.shape
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile([m, n]):
+        out[tm, tn] = x[tm, tn] + 1.0
+    return out
+
+
+def test_kernel_waits_for_a_copy_offloaded_from_the_host() -> None:
+    """A non-blocking host-to-device copy runs on the copy engine, off the compute ring
+    a kernel's launch waits on: with no wait in ``prepare_call``, 60 of 60 calls read
+    the old data on the B50 (``UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD=1`` hides it). The
+    stream's ``query`` says busy, so the gate waits. A fresh value per trial, so
+    stale data can't pass."""
+    kernel = _kernel(_add_one, [1, 256])
+    dst = torch.zeros((128, 1024, 1024), device="xpu")
+    pinned = torch.zeros((128, 1024, 1024)).pin_memory()
+    for trial in range(8):
+        value = 1000.0 + trial
+        pinned.fill_(value)
+        dst.zero_()
+        torch.xpu.synchronize()
+        dst.copy_(pinned, non_blocking=True)
+        out = kernel(dst[-1, -64:, :])
+        torch.xpu.synchronize()
+        assert (out.cpu() == value + 1).all()

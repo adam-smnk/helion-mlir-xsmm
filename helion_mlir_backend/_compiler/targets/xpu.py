@@ -616,11 +616,11 @@ class XpuTarget(MLIRTarget):
         synchronize across streams.
 
         A ``query`` is 1.4 us where an idle ``synchronize`` is 25.5, half of a tiny
-        kernel's call. On the Arc B50 with this driver, no wait at all still gave
-        right results (180 of 180 calls after a matmul; the call took the matmul's
-        full time): probably the driver running queues on one compute engine in order
-        (inferred). That is no guarantee, and untested for copy engines and on B70:
-        not to be relied on, so this wait stays."""
+        kernel's call. On the Arc B50, no wait at all still gave right results after
+        compute work (180 of 180 calls after a matmul; the call took the matmul's full
+        time): probably one ring per engine, in submission order (inferred). After a
+        non-blocking copy from pinned host memory, on the copy engine, no wait read the
+        old data in 60 of 60 calls, so this wait stays. Untested on B70."""
         device = None
         for tensor in buffers:
             current = tensor.device
