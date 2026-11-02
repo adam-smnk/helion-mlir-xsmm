@@ -51,7 +51,10 @@ _UNIT_LEADING_BLOCKS = (
 
 
 def check_xegpu_capabilities(
-    module: ir.Module, entry: str, ir_layouts: Sequence[bool] = ()
+    module: ir.Module,
+    entry: str,
+    ir_layouts: Sequence[bool] = (),
+    ir_layouts_default: bool = False,
 ) -> list[ir.Operation]:
     """Raise :class:`UnsupportedOperationError` if ``entry`` of the inlined and
     prepared (unit tile dims folded) ``module`` is outside what the XeGPU
@@ -65,7 +68,9 @@ def check_xegpu_capabilities(
     for index, loop in enumerate(loops):
         _check_full_tiles(loop)
         _check_tile_ranks(loop)
-        _check_kernel_class(loop, index < len(ir_layouts) and ir_layouts[index])
+        _check_kernel_class(
+            loop, ir_layouts[index] if index < len(ir_layouts) else ir_layouts_default
+        )
         check_math(loop)
     return loops
 

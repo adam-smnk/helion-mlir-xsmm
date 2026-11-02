@@ -211,7 +211,7 @@ def _stages(
         # The reductions as lowered are checked (xevm_lane_reductions).
         index = next(i for i, (name, _) in enumerate(stages) if name == "xevm")
         lowering = _CheckLaneReductions(stages[index][1])
-        if any(kernel.layouts is not None for kernel in kernels):
+        if any(kernel.layout_source is not None for kernel in kernels):
             lowering = _LayoutWarningsAreErrors(lowering)
         stages[index] = ("xevm", lowering)
     if stop_at == "binary":
@@ -432,7 +432,7 @@ class _IRLayouts(Stage):
                 module, xpu_transforms.kernel_module_name(self.entry, index)
             )
             for index, kernel in enumerate(self.kernels)
-            if kernel.layouts is not None
+            if kernel.layout_source is not None
         }
         if not funcs:
             return module
@@ -735,7 +735,10 @@ class XpuTarget(MLIRTarget):
         _apply_stage("prepare", prepare, module, dump)
         params = take_params(module)
         loops = check_xegpu_capabilities(
-            module, entry, [kernel.layouts is not None for kernel in params]
+            module,
+            entry,
+            [kernel.layout_source is not None for kernel in params],
+            KernelParams().layout_source is not None,
         )
         shapes = [kernel_shape(loop) for loop in loops]
         check_params(params, shapes)

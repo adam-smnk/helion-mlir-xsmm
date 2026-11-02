@@ -57,7 +57,7 @@ def _without_explicit_fields(text: str) -> str:
 def test_same_kernels_as_lighthouse(problem: kb.Problem) -> None:
     """The toggle's reproduction claim: with lighthouse's selector as the source
     and the same config, the same XeGPU, on every KernelBench kernel."""
-    lighthouse = _kernels(_lower(problem))
+    lighthouse = _kernels(_lower(problem, xegpu_layouts=["lighthouse"]))
     derived = _kernels(_lower(problem, xegpu_layouts=["ir-selector"]))
     if problem.name in HAS_EXPLICIT_FIELDS:
         lighthouse = _without_explicit_fields(lighthouse)
@@ -70,15 +70,37 @@ def test_same_kernels_as_lighthouse(problem: kb.Problem) -> None:
 
 def test_toggle_values() -> None:
     params = xegpu_params(
-        {"xegpu_layouts": ["ir", "lighthouse", None, "ir-selector", "ir-upstream"]}
+        {"xegpu_layouts": ["ir", "lighthouse", "ir-selector", "ir-upstream"]}
     )
     assert [p.layout_source for p in params] == [
         "rule",
         None,
-        None,
         "selector",
         "upstream",
     ]
+
+
+def test_default_layouts_follow_the_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from helion_mlir_backend._compiler.targets.xpu_params import DEFAULT_LAYOUTS_ATTR
+    from helion_mlir_backend._compiler.targets.xpu_params import KernelParams
+    from helion_mlir_backend._compiler.targets.xpu_params import attach_params
+    from helion_mlir_backend._compiler.targets.xpu_params import take_params
+
+    entry = xegpu_params({"xegpu_layouts": [None]})[0]
+    for value, source in (("ir", "rule"), ("lighthouse", None)):
+        monkeypatch.setenv("HELION_MLIR_XPU_LAYOUTS", value)
+        assert entry.layout_source == source
+        assert KernelParams().layout_source == source
+        module = ir.Module.parse("module {}")
+        attach_params(module, ())
+        assert DEFAULT_LAYOUTS_ATTR in str(module)
+        take_params(module)
+        assert DEFAULT_LAYOUTS_ATTR not in str(module)
+    monkeypatch.setenv("HELION_MLIR_XPU_LAYOUTS", "guess")
+    with pytest.raises(XeGPUConfigError, match="HELION_MLIR_XPU_LAYOUTS"):
+        _ = KernelParams().layout_source
 
 
 @pytest.mark.parametrize(
@@ -101,9 +123,13 @@ def test_toggle_is_part_of_the_module_text() -> None:
         assert "layouts" in str(module)
 
 
-def test_lighthouse_value_is_the_default() -> None:
+def test_explicit_lighthouse_is_the_lighthouse_path() -> None:
+    """The value reaches the same kernels as the environment's default for it."""
     problem = kb.PROBLEMS[0]
-    assert _lower(problem) == _lower(problem, xegpu_layouts=["lighthouse"])
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("HELION_MLIR_XPU_LAYOUTS", "lighthouse")
+        by_default = _kernels(_lower(problem))
+    assert by_default == _kernels(_lower(problem, xegpu_layouts=["lighthouse"]))
 
 
 def test_forced_tiles_are_checked_from_the_ir() -> None:
@@ -448,7 +474,10 @@ def test_form_is_refused_by_lighthouses_path(name: str) -> None:
         (UnsupportedOperationError, XeGPUConfigError), match=form.refusal
     ):
         lower_mlir(
-            _form_kernel(form), _form_args(form), target="xpu", stop_at="xegpu-wg"
+            _form_kernel(form, xegpu_layouts=["lighthouse"]),
+            _form_args(form),
+            target="xpu",
+            stop_at="xegpu-wg",
         )
 
 

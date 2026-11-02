@@ -49,6 +49,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from dataclasses import fields
+import os
 from typing import TYPE_CHECKING
 
 from lighthouse.schedule.xegpu import matmul_constraints
@@ -110,8 +111,25 @@ not force), ``"ir-selector"`` (the same, with lighthouse's parameter selection
 where it applies) or ``"ir-upstream"`` (the rule's thread count, then what
 upstream's ``xegpu-propagate-layout`` defaults to; a baseline to measure against).
 Not searched by the autotuner."""
-LAYOUT_VALUES = {"ir": 1, "ir-selector": 2, "ir-upstream": 3}
+LAYOUT_VALUES = {"lighthouse": 0, "ir": 1, "ir-selector": 2, "ir-upstream": 3}
 LAYOUT_SOURCES = {1: "rule", 2: "selector", 3: "upstream"}
+DEFAULT_LAYOUTS = "lighthouse"
+"""What a kernel without an ``xegpu_layouts`` entry takes."""
+DEFAULT_LAYOUTS_ATTR = "helion.xegpu_default_layouts"
+"""Module attribute: the default ``HELION_MLIR_XPU_LAYOUTS`` asks for, so that
+modules compiled under it differ, also as JIT cache keys."""
+
+
+def default_layouts() -> str:
+    """``HELION_MLIR_XPU_LAYOUTS``, else :data:`DEFAULT_LAYOUTS`."""
+    value = os.environ.get("HELION_MLIR_XPU_LAYOUTS", "").strip() or DEFAULT_LAYOUTS
+    if value not in LAYOUT_VALUES:
+        raise XeGPUConfigError(
+            f"HELION_MLIR_XPU_LAYOUTS={value!r}; expected one of {sorted(LAYOUT_VALUES)}"
+        )
+    return value
+
+
 _ARITY = {SG_TILES: 2, LOAD_TILES: 4, PREFETCH_TILES: 4, PREFETCH_DEPTHS: 2}
 _ELEMENTWISE_ARITY = {LOAD_TILES: (2, 1)}
 """Other entry lengths: ``[m, n]`` load tiles of 2D elementwise and reduction
@@ -146,12 +164,13 @@ class KernelParams:
     vectorizer_off: tuple[int, ...] | None = None
     """``(1,)`` for ``igc_vectorizer="off"``."""
     layouts: tuple[int, ...] | None = None
-    """``(LAYOUT_VALUES[...],)``; ``None``: lighthouse's annotation."""
+    """``(LAYOUT_VALUES[...],)``; ``None``: :func:`default_layouts`."""
 
     @property
     def layout_source(self) -> str | None:
         """The source of IR-derived layouts; ``None``: lighthouse's annotation."""
-        return LAYOUT_SOURCES[self.layouts[0]] if self.layouts else None
+        value = self.layouts[0] if self.layouts else LAYOUT_VALUES[default_layouts()]
+        return LAYOUT_SOURCES.get(value)
 
     def forced(self) -> dict[str, tuple[int, ...]]:
         """The forced parameters, by config key."""
@@ -226,8 +245,6 @@ def _entry(key: str, index: int, item: object) -> tuple[int, ...] | None:
     if item is None:
         return None
     if key == LAYOUTS:
-        if item == "lighthouse":
-            return None
         if item not in LAYOUT_VALUES:
             raise XeGPUConfigError(
                 f'{key}[{index}]={item!r}: expected "lighthouse", "ir", '
@@ -271,7 +288,13 @@ def _entry(key: str, index: int, item: object) -> tuple[int, ...] | None:
 
 
 def attach_params(module: ir.Module, params: Sequence[KernelParams]) -> None:
-    """Record ``params`` on ``module`` (nothing for none)."""
+    """Record ``params`` on ``module`` (nothing for none), and the default layouts
+    if ``HELION_MLIR_XPU_LAYOUTS`` asks for one."""
+    with module.context:
+        if os.environ.get("HELION_MLIR_XPU_LAYOUTS", "").strip():
+            module.operation.attributes[DEFAULT_LAYOUTS_ATTR] = ir.StringAttr.get(
+                default_layouts()
+            )
     if not params:
         return
     with module.context:
@@ -290,6 +313,8 @@ def attach_params(module: ir.Module, params: Sequence[KernelParams]) -> None:
 def take_params(module: ir.Module) -> tuple[KernelParams, ...]:
     """The parameters :func:`attach_params` recorded on ``module``, removed from it."""
     attributes = module.operation.attributes
+    if DEFAULT_LAYOUTS_ATTR in attributes:
+        del attributes[DEFAULT_LAYOUTS_ATTR]
     if PARAMS_ATTR not in attributes:
         return ()
     kernels = ir.ArrayAttr(attributes[PARAMS_ATTR])
@@ -861,7 +886,7 @@ def check_params(
                 "it applies to attention kernels, whose row maxima only shift an "
                 "exponential"
             )
-        if kernel.layouts is not None:
+        if kernel.layout_source is not None:
             # Legality comes from the IR when the layouts are derived, with
             # what is forced as hints in it (xegpu_layouts.check_layouts).
             continue

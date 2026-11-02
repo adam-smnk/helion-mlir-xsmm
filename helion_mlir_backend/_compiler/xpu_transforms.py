@@ -352,7 +352,7 @@ def _set_threads(func: ir.Value, index: int, kernel: KernelParams) -> ir.Value:
     way its kernel class needs (lighthouse's alternatives, then elementwise
     kernels; scoped to the function: it must be isolated from above); returns
     the new ``func``."""
-    if kernel.layouts is not None:
+    if kernel.layout_source is not None:
         # The layout stage sets the count it derives (xegpu_layouts.set_threads).
         launch = _only(_kernel_ops(func, "gpu.launch", index))
         xegpu.set_gpu_launch_threads(launch, threads=[NB_WORKITEMS, 1, 1])
@@ -415,7 +415,7 @@ def annotate_kernels(entry: str, kernels: Sequence[KernelParams]) -> ir.Module:
     ht.HelionTransformDialect.load()
     with schedule_boilerplate() as (schedule, named_seq):
         for index, kernel in enumerate(kernels):
-            if kernel.layouts is not None:
+            if kernel.layout_source is not None:
                 continue
             gpu_module = _only(
                 match(
