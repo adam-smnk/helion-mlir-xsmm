@@ -113,9 +113,10 @@ Kernels take `[B * H, S, D]` tiles of one stream and query rows; `as_streams` ma
 Shapes: `S` a multiple of 256, `D = 64`; no masked loads and no partial tiles. Config and its
 rationale: `BLOCK_SIZES`, `MASK_BLOCK_SIZES`. `check --vectorizer off` runs without IGC's vectorizer.
 
-The source also runs through Helion's Triton backend, with another config. It uses `hl.dot`, as
-`torch.einsum` of bf16 operands rounds its result to bf16 in that backend (a larger error), and
-on 4-D tiles took two orders of magnitude longer there.
+The same file also runs through Helion's Triton backend, with its own config; that shows the source is
+portable, not what the Triton-XPU stack can do. Rank 3 with `torch.exp` is about 2460 µs at `(4, 16, 1024, 64)`
+there: `torch.exp` lowers to `__imf_expf`. Rank 2 with `indexing="tensor_descriptor"` and `tl.math.exp2` is 673 µs on the
+same stack. `hl.dot` is used as `torch.einsum` of bf16 operands rounds its result to bf16 in that backend.
 
 Definitions used (`i` query row, `j` key row, `h` query head; scores after the scale `1 / sqrt(D)`):
 
