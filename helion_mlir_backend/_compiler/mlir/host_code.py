@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ast
 import copy
+import types
 from typing import TYPE_CHECKING
 from typing import Callable
 
@@ -60,19 +61,38 @@ def build_host_function(
         lineno=1,
         col_offset=0,
     )
-    module = ast.Module(body=[func_def], type_ignores=[])
+    # Host expressions of globals go through these aliases (``_source_module.W``).
+    # They are the factory's parameters, so that the host function runs on the
+    # module's own globals, as the kernel does in plain Python and in Helion's
+    # codegen, and they stay out of the module.
+    aliases = {
+        imported.alias: imported.value for imported in hf.global_imports.values()
+    }
+    factory = ast.FunctionDef(
+        name=f"{func_name}_factory",
+        args=ast.arguments(
+            posonlyargs=[],
+            args=[ast.arg(arg=alias) for alias in aliases],
+            kwonlyargs=[],
+            kw_defaults=[],
+            defaults=[],
+        ),
+        body=[func_def, ast.Return(ast.Name(id=func_name, ctx=ast.Load()))],
+        decorator_list=[],
+        returns=None,
+        type_comment=None,
+        lineno=1,
+        col_offset=0,
+    )
+    module = ast.Module(body=[factory], type_ignores=[])
     ast.fix_missing_locations(module)
 
     code = compile(module, filename=f"<helion-mlir-host:{hf.name}>", mode="exec")
-    namespace: dict[str, object] = dict(hf.fn.__globals__)
-    # Host expressions of globals go through these aliases (``_source_module.W``).
-    namespace.update(
-        {alias: imported.value for alias, imported in hf.global_imports.items()}
-    )
-    exec(code, namespace)
-    function = namespace[func_name]
+    factory_code = next(c for c in code.co_consts if isinstance(c, types.CodeType))
+    function = types.FunctionType(factory_code, hf.fn.__globals__)(*aliases.values())
+    function._helion_mlir_aliases = aliases  # type: ignore[attr-defined]
     function._helion_mlir_metadata_only = _MetadataOnly(  # type: ignore[attr-defined]
-        hf.definition.args, namespace
+        hf.definition.args, hf.fn.__globals__
     ).check(body)
     return function  # type: ignore[return-value]
 
@@ -175,7 +195,9 @@ class _MetadataOnly:
     dtype and device given, not defaults), and may ``assert`` on all of that (a
     plan has the metadata of a call that passed); it returns a name or ``None``. Anything else (any other call
     or global, loops, ``del``, attribute or subscript assignment, ...) fails
-    the check and keeps every call on the general path."""
+    the check and keeps every call on the general path, which reads globals
+    anew. ``torch``, ``output_pool`` and the builtins above are the only global
+    reads a plan fixes, as checked at compile time."""
 
     _ATTRIBUTES = frozenset({"shape", "dtype", "device", "ndim"})
     _METHODS = frozenset({"size", "stride", "dim", "numel", "element_size"})

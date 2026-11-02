@@ -84,6 +84,7 @@ def compile_kernel(
     mlir_target.configure(module, config)
     entry = compile_entry(module, hf.name, target=mlir_target, pipeline=pipeline)
     host_globals = host_function.__globals__
+    aliases = host_function._helion_mlir_aliases
     arg_exprs = [
         compile(arg.name, f"<helion-mlir-arg:{arg.name}>", "eval") for arg in entry.args
     ]
@@ -107,6 +108,8 @@ def compile_kernel(
         host = host_function(*args)
         try:
             local_vars = next(host)
+            if aliases:
+                local_vars.update(aliases)
             call_entry(
                 entry,
                 [
