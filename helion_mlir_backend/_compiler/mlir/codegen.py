@@ -192,13 +192,15 @@ class MLIRModuleBuilder:
                 values[ref.name] = bufferization_d.ToTensorOp(
                     tensor_type, arg, restrict=True, writable=ref.written or None
                 ).result
-            values.update(
-                (scalar.key, arg)
+            # Apart from the tensors: a scalar's key may equal a tensor's name.
+            scalar_values = {
+                scalar.key: arg
                 for scalar, arg in zip(scalars, args[len(refs) :], strict=True)
-            )
+            }
             for phase, fn_op in zip(signature.phases, phases, strict=True):
-                operands = [*phase.ins, *phase.inouts, *phase.scalars]
-                call = func_d.CallOp(fn_op, [values[name] for name in operands])
+                operands = [values[name] for name in (*phase.ins, *phase.inouts)]
+                operands += [scalar_values[key] for key in phase.scalars]
+                call = func_d.CallOp(fn_op, operands)
                 values.update(zip(phase.inouts, call.results, strict=True))
             for ref, arg in zip(refs, args, strict=False):
                 if ref.written:

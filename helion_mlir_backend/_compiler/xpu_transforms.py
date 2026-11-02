@@ -54,6 +54,8 @@ def prepare_for_xegpu() -> ir.Module:
       ``linalg.generic``: lighthouse matches named matmuls and generics only, and
       vectorizes a generic contraction to a ``vector.contract`` whose transposed
       operands load transposed.
+    - A store at a fixed index stores that slice, not the whole region the
+      iteration owns (``fold_region_inserts``: one row of a K/V cache).
     - Elementwise ops are fused (e.g. into a reduction's producers), unused
       symbols (inlined phase and helper functions) dropped, and the module
       cleaned up.
@@ -96,6 +98,7 @@ def prepare_for_xegpu() -> ir.Module:
             module, ["linalg.contract", "linalg.batch_matmul", "linalg.elementwise"]
         )
         structured.structured_generalize(anytype, contracts)
+        ht.fold_region_inserts(module)
         module = apply_registered_pass(module, "linalg-fuse-elementwise-ops")
         with ir.InsertionPoint(transform.apply_patterns(module).patterns):
             structured.apply_patterns_linalg_fold_unit_extent_dims_via_reshapes()

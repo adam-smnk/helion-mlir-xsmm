@@ -2325,3 +2325,41 @@ def test_sibling_gemms_swiglu() -> None:
         torch.xpu.synchronize()
         error = (out.cpu().double() - ref).abs().amax(-1) / ref.abs().amax()
         assert error.max() < 4e-3
+
+
+def test_row_store_after_other_kernels() -> None:
+    """One row of a cache written, the other rows kept, in one launch among others:
+    the K/V cache write of a decode step."""
+    from tests.test_xpu_fold_region_inserts import put_row
+
+    x = torch.randn(8, 8, 64).to(BF16)
+    cache = torch.randn(8, 8, 512, 64).to(BF16)
+    device_cache = cache.to("xpu")
+    _kernel(put_row, [1, 1, 64])(x.to("xpu"), device_cache, 511)
+    torch.xpu.synchronize()
+    expected = cache.clone()
+    expected[:, :, 511] = x
+    assert torch.equal(device_cache.cpu(), expected)
+
+
+@pytest.mark.parametrize("pos", [-1, -512, 511])
+def test_row_store_at_a_runtime_position(pos: int) -> None:
+    from tests.test_xpu_fold_region_inserts import put_row
+
+    x = torch.randn(8, 8, 64).to(BF16)
+    cache = torch.randn(8, 8, 512, 64).to(BF16)
+    device_cache = cache.to("xpu")
+    _kernel(put_row, [1, 1, 64])(x.to("xpu"), device_cache, pos)
+    torch.xpu.synchronize()
+    expected = cache.clone()
+    expected[:, :, pos] = x
+    assert torch.equal(device_cache.cpu(), expected)
+
+
+@pytest.mark.parametrize("pos", [512, -513])
+def test_row_store_out_of_bounds_raises(pos: int) -> None:
+    from tests.test_xpu_fold_region_inserts import put_row
+
+    cache = torch.zeros(8, 8, 512, 64, device="xpu").to(BF16)
+    with pytest.raises(IndexError, match="out of bounds"):
+        _kernel(put_row, [1, 1, 64])(torch.randn(8, 8, 64).to(BF16).to("xpu"), cache, pos)
