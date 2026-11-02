@@ -7,6 +7,7 @@ memref-ABI entry (runtime scalars by value), then finishes the host code and ret
 
 from __future__ import annotations
 
+import bisect
 import keyword
 from typing import TYPE_CHECKING
 
@@ -365,19 +366,21 @@ def call_entry(
         )
     roles = [arg.role for arg in entry.args if arg.role != "scalar"]
     inouts = [t for t, role in zip(tensors, roles, strict=True) if role == "inout"]
-    inout_spans = [_byte_span(t) for t in inouts if t.numel()]
-    for i, first in enumerate(inout_spans):
-        if any(_spans_overlap(first, second) for second in inout_spans[i + 1 :]):
-            raise UnsupportedOperationError(
-                "kernel writes two tensors that share memory",
-                reason="each written tensor must be its own buffer",
-            )
+    inout_spans = sorted(_byte_span(t) for t in inouts if t.numel())
+    if any(_spans_overlap(a, b) for a, b in zip(inout_spans, inout_spans[1:])):
+        raise UnsupportedOperationError(
+            "kernel writes two tensors that share memory",
+            reason="each written tensor must be its own buffer",
+        )
     tensor_args = [arg for arg in entry.args if arg.role != "scalar"]
-    written = [
-        (arg.name, tensor)
-        for arg, tensor, role in zip(tensor_args, tensors, roles, strict=True)
-        if role == "inout" and tensor.numel()
-    ]
+    written = sorted(
+        (
+            (_byte_span(tensor), arg.name, tensor)
+            for arg, tensor, role in zip(tensor_args, tensors, roles, strict=True)
+            if role == "inout" and tensor.numel()
+        ),
+        key=lambda stored: stored[0],
+    )
     passed_as_is = [
         role == "in"
         and _overlaps_any(tensor, inout_spans)
@@ -416,7 +419,7 @@ def _reads_earlier_writes(
     entry: CompiledEntry,
     name: str,
     tensor: torch.Tensor,
-    written: list[tuple[str, torch.Tensor]],
+    written: list[tuple[tuple[int, int], str, torch.Tensor]],
 ) -> bool:
     """Whether input ``tensor``, whose bytes overlap a written tensor, must be passed
     as it is: it shares elements with a tensor stored before it is read, and a copy
@@ -426,12 +429,21 @@ def _reads_earlier_writes(
     if order is None:
         return False
     after = order.after.get(name, frozenset())
+    if not after:
+        return False
+    span = _byte_span(tensor)
+    start = bisect.bisect_left(written, span, key=lambda stored: stored[0])
+    near = []
+    for stored_span, other, stored in written[max(start - 1, 0) :]:
+        if stored_span[0] >= span[1]:
+            break
+        near.append((other, stored))
     if not any(
-        other in after and _share_elements(tensor, stored) for other, stored in written
+        other in after and _share_elements(tensor, stored) for other, stored in near
     ):
         return False
     shared = [
-        (other, stored) for other, stored in written if _share_elements(tensor, stored)
+        (other, stored) for other, stored in near if _share_elements(tensor, stored)
     ]
     same = order.same.get(name, frozenset())
     alignment = entry.target.buffer_alignment
@@ -553,10 +565,14 @@ def _check_sizes(
 
 
 def _overlaps_any(tensor: torch.Tensor, spans: list[tuple[int, int]]) -> bool:
+    """``spans``: sorted and disjoint, as ``call_entry`` checks the written tensors'.
+    A kernel of many tensors: a search per input, not a scan."""
     if not spans or tensor.numel() == 0:
         return False
     span = _byte_span(tensor)
-    return any(_spans_overlap(span, other) for other in spans)
+    index = bisect.bisect_left(spans, span)
+    near = spans[max(index - 1, 0) : index + 1]
+    return any(_spans_overlap(span, other) for other in near)
 
 
 def _spans_overlap(a: tuple[int, int], b: tuple[int, int]) -> bool:

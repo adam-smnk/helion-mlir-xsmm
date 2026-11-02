@@ -7,6 +7,8 @@ per call: an output's block is reused, so a repeated input would pass by acciden
 # ruff: noqa: FURB118
 from __future__ import annotations
 
+from unittest import mock
+
 import helion
 import pytest
 import torch
@@ -128,3 +130,24 @@ def test_read_after_a_store_is_refused_on_the_plan_path_too() -> None:
         torch.manual_seed(call)
         with pytest.raises(UnsupportedOperationError, match="two kernel calls"):
             kernel(*make(torch.randn(cases.M, cases.N)))
+
+
+@pytest.mark.parametrize(
+    ("span", "expected"),
+    [
+        ((0, 10), False),
+        ((0, 11), True),
+        ((15, 20), True),
+        ((30, 40), False),
+        ((0, 100), True),
+        ((25, 26), False),
+        ((39, 41), True),
+        ((55, 60), False),
+    ],
+)
+def test_overlaps_any_of_sorted_spans(span: tuple[int, int], expected: bool) -> None:
+    """The search covers an input wider than the spans it overlaps, and each side."""
+    tensor = mock.Mock()
+    tensor.numel.return_value = span[1] - span[0]
+    with mock.patch.object(driver, "_byte_span", return_value=span):
+        assert driver._overlaps_any(tensor, [(10, 20), (40, 50)]) is expected
