@@ -10,8 +10,12 @@ import os
 import shutil
 from unittest.mock import patch
 
+import helion
+import helion.language as hl
 from mlir import ir
 import pytest
+import torch
+import torch.nn.functional as F
 
 from tests import kernelbench_xpu as kb
 from tests.harness import lower_xpu
@@ -29,6 +33,8 @@ BINARIES = pytest.mark.skipif(
     reason="needs the SPIR-V target and ocloc",
 )
 _XEVM = '[#xevm.target<chip = "bmg">]'
+_NEVER_FIRST = 10**12
+"""``ORDER_FIRST_ABOVE`` for the compile-first path."""
 _F32 = "vector<8xf32>"
 _CHUNKS = 4
 
@@ -228,7 +234,13 @@ def test_a_kernel_without_spill_is_not_ordered() -> None:
 @BINARIES
 @pytest.mark.isolated
 def test_a_spilling_kernel_is_ordered() -> None:
-    """The exact problem: its first compile spills, the kept one does not."""
+    """The exact problem, compile first: its first binary spills, the kept one does
+    not.
+
+    ``spill_bytes`` reads ``spill_size`` from the binary, and no such text reads as
+    no spill, as it would if the binary format changed: a kernel would then simply
+    never be ordered. This test is what catches that, and it runs only where
+    binaries build (``BINARIES``)."""
     calls, spy = _spy()
     spills: list[int] = []
     real = xpu_target.spill_bytes
@@ -238,13 +250,27 @@ def test_a_spilling_kernel_is_ordered() -> None:
         return spills[-1]
 
     with (
+        patch.object(xpu_target, "ORDER_FIRST_ABOVE", _NEVER_FIRST),
         patch.object(xpu_target, "order_tile_chunks", spy),
         patch.object(xpu_target, "spill_bytes", record),
     ):
         text = _binary("29_Matmul_Mish_Mish", list(kb.LEVEL2_PROBLEMS))
     assert calls == [1]
     assert spills[0] > 0
-    assert spills[1] == 0
+    assert 0 in spills
+    assert spill_bytes_of(text) == 0
+
+
+@BINARIES
+@pytest.mark.isolated
+def test_long_math_is_compiled_ordered_first() -> None:
+    """The exact problem: expected to spill, compiled ordered, no spill: no plain
+    compile (10 s saved)."""
+    records: list[tuple[bool, list[str]]] = []
+    with patch.object(xpu_target, "_compile", _recording_compile(records)):
+        text = _binary("29_Matmul_Mish_Mish", list(kb.LEVEL2_PROBLEMS))
+    assert [(ordered, len(binaries)) for ordered, binaries in records] == [(True, 1)]
+    assert _binary_lines(text) == records[0][1]
     assert spill_bytes_of(text) == 0
 
 
@@ -254,14 +280,123 @@ def spill_bytes_of(text: str) -> int:
         return spill_bytes(ir.Module.parse(text).operation)
 
 
+def _binary_lines(text: str) -> list[str]:
+    return [line.strip() for line in text.splitlines() if "gpu.binary @" in line]
+
+
+def _recording_compile(records: list[tuple[bool, list[str]]], fail: bool = False):
+    """``_compile``, keeping each call's binaries as text: the same kernel lowered
+    twice need not give the same bytes, so a binary is compared within one lowering."""
+    real = xpu_target._compile
+
+    def recording(to_binary, gpu_modules, *, ordered=False):
+        if ordered and fail:
+            raise RuntimeError("no compile today")
+        binaries = real(to_binary, gpu_modules, ordered=ordered)
+        if binaries:
+            records.append(
+                (ordered, [str(binary).strip() for binary in binaries.values()])
+            )
+        return binaries
+
+    return recording
+
+
+def _two_launches(x, o1, o2):
+    for tile in hl.tile(x.shape):
+        o1[tile] = F.mish(F.mish(F.mish(x[tile].to(torch.float32)))).to(x.dtype)
+    hl.barrier()
+    for tile in hl.tile(x.shape):
+        o2[tile] = F.mish(o1[tile].to(torch.float32)).to(x.dtype)
+    return o2
+
+
 @BINARIES
 @pytest.mark.isolated
-def test_an_order_that_does_not_help_is_dropped() -> None:
-    """With an order that changes nothing, the spill stays, and the first binary
-    is the one returned (byte for byte: same input, same compile)."""
-    with patch.object(xpu_target, "order_tile_chunks", lambda module: 0):
+@pytest.mark.parametrize("first", ["compile", "order"])
+def test_only_the_spilling_kernel_is_ordered(first: str) -> None:
+    """Two launches, one spilling (mish x3, then mish): only the spilling GPU module
+    is compiled ordered, and the other keeps its plain binary (ordered, it would
+    take the form that cost elementwise Mish time for nothing). ``compile``: both
+    compiled plain, then the spilling one ordered; ``order``: predicted."""
+    kernel = helion.kernel(
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[256, 256, 128, 256]),
+    )(_two_launches)
+    args = [xpu_tensor(1024, 8192, dtype=torch.bfloat16)] * 3
+    records: list[tuple[bool, list[str]]] = []
+    threshold = _NEVER_FIRST if first == "compile" else xpu_target.ORDER_FIRST_ABOVE
+    with (
+        patch.dict(os.environ, {"HELION_MLIR_COMPILE_TIMEOUT": "0"}),
+        patch.object(xpu_target, "ORDER_FIRST_ABOVE", threshold),
+        patch.object(xpu_target, "_compile", _recording_compile(records)),
+    ):
+        lines = _binary_lines(lower_xpu(kernel, args, "binary"))
+    shapes = [(ordered, len(binaries)) for ordered, binaries in records]
+    if first == "compile":
+        assert shapes == [(False, 2), (True, 1)]
+        plain, ordered = records[0][1], records[1][1]
+        assert lines == [ordered[0], plain[1]]
+        assert ordered[0] != plain[0]
+    else:
+        assert shapes == [(True, 1), (False, 1)]
+        assert lines == [records[0][1][0], records[1][1][0]]
+
+
+def _failing_order(module: object) -> int:
+    raise RuntimeError("no order today")
+
+
+@BINARIES
+@pytest.mark.isolated
+@pytest.mark.parametrize("first", ["compile", "order"])
+@pytest.mark.parametrize("failure", ["order", "compile"])
+def test_a_failed_ordered_compile_keeps_the_plain_binary(
+    failure: str, first: str
+) -> None:
+    """The attempt fails in the reorder or in IGC, after a spill (``compile``) or
+    in place of the first compile (``order``): a warning, and the plain binary."""
+    records: list[tuple[bool, list[str]]] = []
+    threshold = 0 if first == "order" else _NEVER_FIRST
+    with (
+        patch.object(xpu_target, "ORDER_FIRST_ABOVE", threshold),
+        patch.object(xpu_target, "spill_bytes", lambda binary: 1),
+        patch.object(
+            xpu_target,
+            "_compile",
+            _recording_compile(records, fail=failure == "compile"),
+        ),
+        patch.object(
+            xpu_target,
+            "order_tile_chunks",
+            _failing_order if failure == "order" else xpu_target.order_tile_chunks,
+        ),
+        pytest.warns(UserWarning, match="could not be compiled in chunk order"),
+    ):
+        text = _binary("1_Square_matrix_multiplication_", list(kb.PROBLEMS))
+    assert [ordered for ordered, _ in records] == [False]
+    assert _binary_lines(text) == records[0][1]
+
+
+@BINARIES
+@pytest.mark.isolated
+@pytest.mark.parametrize("first", ["compile", "order"])
+def test_an_order_that_does_not_help_is_dropped(first: str) -> None:
+    """With an order that changes nothing the spill stays, and the plain binary is
+    returned, also when the ordered one was compiled first."""
+    records: list[tuple[bool, list[str]]] = []
+    threshold = _NEVER_FIRST if first == "compile" else xpu_target.ORDER_FIRST_ABOVE
+    with (
+        patch.object(xpu_target, "ORDER_FIRST_ABOVE", threshold),
+        patch.object(xpu_target, "order_tile_chunks", lambda module: 0),
+        patch.object(xpu_target, "_compile", _recording_compile(records)),
+    ):
         kept = _binary("29_Matmul_Mish_Mish", list(kb.LEVEL2_PROBLEMS))
     assert spill_bytes_of(kept) > 0
+    plain = next(binaries for ordered, binaries in records if not ordered)
+    assert _binary_lines(kept) == plain
+    assert sorted(ordered for ordered, _ in records) == [False, True]
 
 
 @pytest.mark.isolated

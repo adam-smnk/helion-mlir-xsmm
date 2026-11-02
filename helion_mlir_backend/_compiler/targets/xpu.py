@@ -32,6 +32,7 @@ import ctypes
 import functools
 import re
 from typing import TYPE_CHECKING
+import warnings
 
 from lighthouse.execution.runner import Runner
 from lighthouse.ingress.torch.compile import TorchMemoryManager
@@ -59,8 +60,10 @@ from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
 from ..mlir_transforms.xevm_fabs import fabs_as_integer_min
 from ..mlir_transforms.xevm_lane_reductions import check_lane_reductions
 from ..mlir_transforms.xevm_nsz_minmax import nsz_minmax
+from ..mlir_transforms.xevm_tile_order import ORDER_FIRST_ABOVE
 from ..mlir_transforms.xevm_tile_order import order_tile_chunks
 from ..mlir_transforms.xevm_tile_order import spill_bytes
+from ..mlir_transforms.xevm_tile_order import tile_math_grfs
 from ..mlir_transforms.xevm_unit_clamps import unit_clamps_without_sat
 from ..mlir_transforms.xpu_math_approx import approximate_math
 from ..mlir_transforms.xpu_math_approx import fold_extended_splats
@@ -216,34 +219,102 @@ def _stages(
 
 class _ToBinary(Stage):
     """The last pass of ``gpu-lower-to-xevm-pipeline`` (run with ``binary-format=
-    skip`` before), with its options: device binaries (fatbin). A module that
+    skip`` before), with its options: device binaries (fatbin). A GPU module that
     spills is compiled again with its tile math ordered chunk by chunk, and that
-    is kept if it spills less (:mod:`xevm_tile_order`)."""
+    binary is kept if it spills less; a failure there keeps the first binary
+    (:mod:`xevm_tile_order`). A module of very long tile math is expected to spill:
+    it is compiled ordered first, and plain only if that still spills. Decided per
+    module: one kernel's spill does not change another's code."""
 
     def apply(self, module: ir.Module) -> ir.Module:
-        ordered = module.operation.clone()
         to_binary = PassManager.parse(
             "builtin.module(gpu-module-to-binary{format=fatbin "
             f"opts={{{xpu_transforms.IGC_OPTIONS}}}}})",
             module.context,
         )
-        to_binary.run(module.operation)
-        spill = spill_bytes(module.operation)
-        if spill:
-            order_tile_chunks(ordered)
-            to_binary.run(ordered)
-            if spill_bytes(ordered) < spill:
-                _replace_body(module, ordered)
+        gpu_modules = [
+            op.operation
+            for op in module.body.operations
+            if op.operation.name == "gpu.module"
+        ]
+        long_math = [m for m in gpu_modules if _expected_to_spill(m)]
+        ordered = _compile_ordered(to_binary, long_math)
+        plain = [
+            gpu_module
+            for gpu_module in gpu_modules
+            if _symbol(gpu_module) not in ordered
+            or spill_bytes(ordered[_symbol(gpu_module)])
+        ]
+        binaries = _compile(to_binary, plain)
+        spilling = [
+            gpu_module
+            for gpu_module in plain
+            if gpu_module not in long_math
+            and spill_bytes(binaries[_symbol(gpu_module)])
+        ]
+        ordered.update(_compile_ordered(to_binary, spilling))
+        for name, binary in ordered.items():
+            if name not in binaries or spill_bytes(binary) < spill_bytes(
+                binaries[name]
+            ):
+                binaries[name] = binary
+        for gpu_module in gpu_modules:
+            ir.InsertionPoint(gpu_module).insert(binaries[_symbol(gpu_module)])
+            gpu_module.erase()
         return module
 
 
-def _replace_body(module: ir.Module, replacement: ir.Operation) -> None:
-    for op in list(module.body.operations):
-        op.operation.erase()
-    point = ir.InsertionPoint(module.body)
-    for op in list(replacement.regions[0].blocks[0].operations):
-        op.operation.detach_from_parent()
-        point.insert(op.operation)
+def _expected_to_spill(gpu_module: ir.Operation) -> bool:
+    return tile_math_grfs(gpu_module) >= ORDER_FIRST_ABOVE
+
+
+def _symbol(op: ir.Operation) -> str:
+    return ir.StringAttr(op.attributes["sym_name"]).value
+
+
+def _compile(
+    to_binary: PassManager,
+    gpu_modules: Sequence[ir.Operation],
+    *,
+    ordered: bool = False,
+) -> dict[str, ir.Operation]:
+    """The ``gpu.binary`` of each of ``gpu_modules`` (left as they are), by name,
+    compiled in a module of their own."""
+    holder = ir.Module.create()
+    holder.operation.attributes["gpu.container_module"] = ir.UnitAttr.get()
+    point = ir.InsertionPoint(holder.body)
+    for gpu_module in gpu_modules:
+        point.insert(gpu_module.clone())
+    if ordered:
+        order_tile_chunks(holder)
+    to_binary.run(holder.operation)
+    binaries = {
+        _symbol(op.operation): op.operation
+        for op in holder.body.operations
+        if op.operation.name == "gpu.binary"
+    }
+    # Detached: they outlive the holder.
+    for binary in binaries.values():
+        binary.detach_from_parent()
+    return binaries
+
+
+def _compile_ordered(
+    to_binary: PassManager, gpu_modules: Sequence[ir.Operation]
+) -> dict[str, ir.Operation]:
+    """:func:`_compile` with the tile math ordered, or nothing if that fails: the
+    caller then has, or compiles, the plain binary."""
+    if not gpu_modules:
+        return {}
+    try:
+        return _compile(to_binary, gpu_modules, ordered=True)
+    except Exception as exc:
+        names = [_symbol(gpu_module) for gpu_module in gpu_modules]
+        warnings.warn(
+            f"XPU kernels {names} could not be compiled in chunk order: {exc}",
+            stacklevel=2,
+        )
+        return {}
 
 
 class _KeepRowDims(Stage):

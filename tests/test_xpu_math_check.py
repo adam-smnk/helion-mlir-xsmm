@@ -15,6 +15,7 @@ from tests.harness import lower_xpu
 from tests.harness import xpu_tensor
 
 from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
+from helion_mlir_backend._compiler.targets.xpu_checks import DEVICE_VERIFIED
 from helion_mlir_backend._compiler.targets.xpu_checks import check_math
 
 
@@ -140,6 +141,62 @@ def test_verified_forms_pass(body: str) -> None:
 def test_unverified_forms_are_rejected(body: str, match: str) -> None:
     with pytest.raises(UnsupportedOperationError, match=match):
         _check(body)
+
+
+_VERIFIED_FUNCTIONS = (
+    "absf",
+    "acos",
+    "asin",
+    "atan",
+    "atanh",
+    "ceil",
+    "cos",
+    "cosh",
+    "erf",
+    "exp",
+    "exp2",
+    "expm1",
+    "floor",
+    "fpowi",
+    "log",
+    "log1p",
+    "log2",
+    "powf",
+    "roundeven",
+    "rsqrt",
+    "sin",
+    "sinh",
+    "sqrt",
+    "tan",
+    "tanh",
+)
+"""The device-verified functions, written out: a function removed from the check's
+set fails here, off-device too. Adding one takes a device test first."""
+
+
+def _function_of(name: str, value: str, type_: str) -> str:
+    if name == "powf":
+        return (
+            f"%c = arith.constant 2.5 : {type_}\n  %t = math.powf {value}, %c : {type_}"
+        )
+    if name == "fpowi":
+        return (
+            f"%c = arith.constant 3 : i32\n  %t = math.fpowi {value}, %c : {type_}, i32"
+        )
+    return f"%t = math.{name} {value} : {type_}"
+
+
+@pytest.mark.parametrize("name", _VERIFIED_FUNCTIONS)
+def test_device_verified_function_passes(name: str) -> None:
+    """Each in the forms IGC miscompiled: rounded straight to 16 bits, on a bf16
+    value, and on 16-bit math."""
+    _check(f"{_function_of(name, '%a', 'f32')}\n  %r = arith.truncf %t : f32 to bf16")
+    _check(f"%x = arith.extf %h : bf16 to f32\n  {_function_of(name, '%x', 'f32')}")
+    _check(_function_of(name, "%g", "f16"))
+
+
+def test_the_device_verified_list_is_the_checks_set() -> None:
+    assert {f"math.{name}" for name in _VERIFIED_FUNCTIONS} == DEVICE_VERIFIED
 
 
 def _asinh(x: torch.Tensor, out: torch.Tensor) -> torch.Tensor:

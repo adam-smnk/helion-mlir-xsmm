@@ -16,13 +16,18 @@ make it: its own scheduler leaves the vector-op order spilling, with or without
 its vectorizer.
 
 The reorder only preserves values; it can also cost time when nothing spills
-(elementwise Mish at ``[128, 256]``: +7 %). So it runs only on kernels that spill:
-the XPU target's binary stage compiles first, reads ``spill_size`` from the
-binaries (:func:`spill_bytes`), and only then compiles the reordered module, and
-keeps it if it spills less. That is one more IGC compile for a spilling kernel.
+(elementwise Mish at ``[128, 256]``: about +7 %). So it applies per GPU module, to
+those that spill: the XPU target's binary stage compiles, reads ``spill_size`` from
+the binaries (:func:`spill_bytes`), compiles the spilling modules reordered, and
+keeps a reordered binary if it spills less. That is one more IGC compile for a
+spilling kernel. Modules of very long tile math (:data:`ORDER_FIRST_ABOVE`) go the
+other way round: ordered first, plain only if that still spills.
+
 A static estimate of the peak does not predict the spill: it follows the widest
 polynomial, not the chain length (estimates of 272 GRFs spilled, ``sin * cos``,
-17024 bytes; 648 did not, Softplus; Mish and Mish(Mish) estimate the same).
+17024 bytes; 648 did not, Softplus; Mish and Mish(Mish) estimate the same). The sum
+of all results (:func:`tile_math_grfs`) separates the long end only: ``sin * cos``
+spills at 3022, and the compile-first path finds that.
 
 Matched exactly: blocks of ``llvm.func``s in a ``gpu.module`` with an
 ``#xevm.target``. An op moves only if it is on the allowlist of ops without side
@@ -92,6 +97,17 @@ _PURE = frozenset(
         "llvm.intr.minimum",
     }
 )
+ORDER_FIRST_ABOVE = 12000
+"""From this :func:`tile_math_grfs` a GPU module is expected to spill, and is
+compiled ordered first: a spilling compile is the slow one (mish x6: 59 s, ordered
+7 s), so the compile-first path can hit the compile timeout. An empirical line:
+over 176 GEMM epilogues and elementwise kernels at 7 tile sizes (Arc B50, IGC 2.41),
+nothing from here up was free of spill, nothing from 10238 up either, and 9563
+was. Below it spills are found by compiling. A wrong prediction only costs run
+time: up to about 7 % measured on kernels that fit (see the module docstring)."""
+_CONSTANTS = frozenset({"llvm.mlir.constant", "llvm.mlir.undef", "llvm.mlir.poison"})
+_SIMD = 16
+_GRF_BYTES = 64
 _OPENCL_MATH = "__spirv_ocl_"
 _SPILL_SIZE = re.compile(r"spill_size:\s*(\d+)")
 
@@ -161,6 +177,51 @@ def _reorder(block: ir.Block) -> None:
     emit(terminator)
     for op in order[:-1]:
         op.move_before(terminator)
+
+
+def tile_math_grfs(gpu_module: ir.Operation) -> int:
+    """Over the blocks of ``gpu_module``'s functions, the most registers (SIMD16)
+    all results of side-effect-free ops add up to, whatever their live ranges."""
+    best = [0]
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        if op.name == "llvm.func":
+            for region in op.regions:
+                for block in region.blocks:
+                    best[0] = max(best[0], _block_math_grfs(block))
+            return ir.WalkResult.SKIP
+        return ir.WalkResult.ADVANCE
+
+    gpu_module.walk(visit, ir.WalkOrder.PRE_ORDER)
+    return best[0]
+
+
+def _block_math_grfs(block: ir.Block) -> int:
+    total = 0
+    for wrapped in block.operations:
+        op = wrapped.operation
+        if op.name in _CONSTANTS or not _is_pure(op):
+            continue
+        for result in op.results:
+            total += _value_bytes(result.type)
+    return total * _SIMD // _GRF_BYTES
+
+
+def _value_bytes(type_: ir.Type) -> int:
+    """Bytes per lane of a scalar or vector value."""
+    if not isinstance(type_, ir.VectorType):
+        return 4
+    vector = ir.VectorType(type_)
+    element = vector.element_type
+    if isinstance(element, ir.IntegerType):
+        bits = ir.IntegerType(element).width
+    elif isinstance(element, ir.F32Type):
+        bits = 32
+    elif isinstance(element, ir.F64Type):
+        bits = 64
+    else:
+        bits = 16
+    return vector.get_dim_size(0) * bits // 8
 
 
 def order_tile_chunks(module: ir.Module | ir.Operation) -> int:
