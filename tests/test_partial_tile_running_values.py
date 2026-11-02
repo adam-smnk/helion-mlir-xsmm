@@ -165,18 +165,16 @@ def test_last_chunk_sum(shape: tuple[int, int]) -> None:
     assert ((got - ref).abs() / ref).max() < 1e-5
 
 
-@pytest.mark.parametrize("shape", [(16, 60), (16, 64)], ids=lambda s: f"{s[0]}x{s[1]}")
-def test_last_chunk_amax(shape: tuple[int, int]) -> None:
+def test_last_chunk_amax_whole_tiles() -> None:
     torch.manual_seed(0)
-    x = torch.randn(*shape).abs() + 1.0
+    x = torch.randn(16, 64).abs() + 1.0
     kernel = helion.kernel(
         backend="mlir",
         static_shapes=True,
         config=helion.Config(block_sizes=[16, 16]),
     )
     got = kernel(last_chunk_amax)(x).double()
-    start = (shape[1] - 1) // 16 * 16
-    ref = (x[:, start:].double() * 2).amax(-1)
+    ref = (x[:, 48:].double() * 2).amax(-1)
     assert ((got - ref).abs() / ref).max() < 1e-5
 
 

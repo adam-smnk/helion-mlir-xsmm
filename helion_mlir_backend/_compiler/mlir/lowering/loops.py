@@ -9,8 +9,10 @@ in the terminator; an ``scf.for`` carries the tensors its body writes.
 from __future__ import annotations
 
 import logging
+import operator
 from typing import TYPE_CHECKING
 
+from helion.language import memory_ops as hl_memory
 import helion.language._tracing_ops as tracing_ops
 from mlir.dialects import affine as affine_d
 from mlir.dialects import arith as arith_d
@@ -29,6 +31,7 @@ from . import emit
 from .control_flow import carried_positions
 from .control_flow import lower_subgraph
 from .control_flow import with_carried
+from .registry import COUNTING_REDUCTIONS
 from .registry import lowers
 from .slice_plan import tile_window
 from .tensor_state import OwnedDim
@@ -56,6 +59,9 @@ def build_phase_body(
             ctx, device_ir.root_ids[position], list(device_ir.grid_block_ids[position])
         )
     return [ctx.tensors.value(name) for name in outputs]
+
+
+_SUMS = (torch.ops.aten.sum.dim_IntList, torch.ops.aten.sum.default)
 
 
 def _lower_root(ctx: BuildContext, graph_id: int, grid_ids: list[int]) -> None:
@@ -410,6 +416,7 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> emit.Result
             ),
         ):
             _refuse_unmaskable_running(ctx, block_ids[level], running, body, positions)
+            _refuse_reduced_after_loop(ctx, block_ids[level], node, running, body)
             for name, arg in zip(names, block_args[count:], strict=True):
                 ctx.tensors.rebind(name, arg)
             yields = emit_level(level + 1, block_args[:count])
@@ -538,7 +545,7 @@ def _refuse_unmaskable_running(
                 ),
                 alternatives=[
                     "the size from hl.register_block_size, for both",
-                    "block sizes that divide the sizes they tile",
+                    "block sizes that divide the sizes they tile, with static_shapes=True",
                 ],
             )
         if not any(ctx.env.resolve_block_id(size) == block_id for size in shape):
@@ -552,9 +559,105 @@ def _refuse_unmaskable_running(
                 ),
                 alternatives=[
                     "the reduction after the loop",
-                    "block sizes that divide the sizes they tile",
+                    "block sizes that divide the sizes they tile, with static_shapes=True",
                 ],
             )
+
+
+def _refuse_reduced_after_loop(
+    ctx: BuildContext,
+    block_id: int,
+    loop: torch.fx.Node,
+    running: list[torch.fx.Node | None],
+    body: torch.fx.Graph,
+) -> None:
+    """Refuse a reduction, after a loop with a partial tile, of the value of its last
+    tile: nothing masks the padding there. Only a sum of padding that stays 0 is
+    right."""
+    if block_id not in ctx.block_id_to_valid:
+        return
+    (outputs,) = next(iter(body.find_nodes(op="output"))).args
+    outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+    for index, (node, output) in enumerate(zip(running, outputs, strict=True)):
+        if node is not None:
+            continue
+        for reduction, other in _reductions_after_loop(ctx, block_id, loop, index):
+            if other == 0 and reduction.target in _SUMS and _keeps_zero(ctx, output):
+                continue
+            raise UnsupportedOperationError(
+                "a reduction after a loop of its last partial tile's value",
+                reason="the loop's tile isn't active there, so its padding counts",
+                alternatives=[
+                    "the reduction inside the loop",
+                    "block sizes that divide the sizes they tile, with "
+                    "static_shapes=True",
+                ],
+            )
+
+
+def _reductions_after_loop(
+    ctx: BuildContext, block_id: int, loop: torch.fx.Node, index: int
+) -> list[tuple[torch.fx.Node, object]]:
+    """The reductions of the loop's result ``index`` with its value in the loop's tile
+    dim, each with the value its padding is masked to (``None`` if it isn't)."""
+    found: list[tuple[torch.fx.Node, object]] = []
+    stack = [
+        user
+        for user in loop.users
+        if user.target is operator.getitem and user.args[1] == index
+    ]
+    seen: set[torch.fx.Node] = set()
+    while stack:
+        current = stack.pop()
+        value = current.meta.get("val")
+        if (
+            current in seen
+            or not isinstance(value, torch.Tensor)
+            or not any(
+                ctx.env.resolve_block_id(size) == block_id for size in value.shape
+            )
+        ):
+            continue
+        seen.add(current)
+        for user in current.users:
+            # A counting reduction reads its source through a buffer node.
+            counting = [
+                reader
+                for reader in (user, *user.users)
+                if reader.target in COUNTING_REDUCTIONS
+            ]
+            if counting:
+                found.append((counting[0], None))
+            elif current.target is tracing_ops._mask_to:
+                found.append((user, current.args[1]))
+            else:
+                stack.append(user)
+    return found
+
+
+def _keeps_zero(ctx: BuildContext, node: object) -> bool:
+    """``node``, in a loop's body, is 0 where the tiles it loads are padded."""
+    if not isinstance(node, torch.fx.Node):
+        return False
+    if node.target is hl_memory.load:
+        return True
+    if node.target is tracing_ops._phi:
+        return _keeps_zero(ctx, node.args[1])
+    if node.target is operator.getitem and _is_loop(node.args[0]):
+        inner = ctx.host_function.device_ir.graphs[node.args[0].args[0]].graph
+        (outputs,) = next(iter(inner.find_nodes(op="output"))).args
+        outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
+        return _keeps_zero(ctx, outputs[node.args[1]])
+    operands = [_keeps_zero(ctx, arg) for arg in node.args]
+    if node.target in (torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar):
+        return any(operands)
+    if node.target in (
+        torch.ops.aten.add.Tensor,
+        torch.ops.aten.sub.Tensor,
+        torch.ops.aten.neg.default,
+    ):
+        return all(operands)
+    return False
 
 
 def _tile_has_symbol(ctx: BuildContext, block_id: int, body: torch.fx.Graph) -> bool:
