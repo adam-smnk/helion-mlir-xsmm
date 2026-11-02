@@ -20,9 +20,12 @@ Limits: at most ``max_bytes`` and ``_MAX_FREE_BLOCKS`` free blocks are kept, old
 out first: :func:`set_output_pool`, ``HELION_MLIR_OUTPUT_POOL`` (bytes, read at
 import; 0 turns it off), by default the smaller of ``DEFAULT_MAX_BYTES`` and 1/8
 of the memory (RAM or the cgroup's limit). Kernels need 8-256 MiB free, in 1-2
-blocks. When a mapping fails, every free block goes and it is tried again; a
-forked child starts with none. :func:`release` frees them on request and
-:func:`output_pool_stats` shows them.
+blocks; L1/11's output is 1.5 GiB (glibc, with prefetches: 17.2 ms without the
+pool, 13.3 with it). Two sizes that do not fit together thrash, oldest out first:
+[1536, 1024] MiB at 2 GiB has no hits; no spec model does this. When a mapping
+fails, every free block goes and it is tried again; a forked child starts with
+none. :func:`release` frees them on request and :func:`output_pool_stats` shows
+them.
 
 Everything else gets torch's function: other devices, sizes or argument forms,
 wrapper tensors, active modes and transforms (:func:`_plain_dispatch`), and
@@ -64,7 +67,7 @@ OUTPUT_POOL_ENV = "HELION_MLIR_OUTPUT_POOL"
 MIN_BYTES = 4 * 1024 * 1024
 _PAGE = 4096
 _HUGE_PAGE = 2 * 1024 * 1024
-DEFAULT_MAX_BYTES = 1 << 30
+DEFAULT_MAX_BYTES = 2 << 30
 _MAX_FREE_BLOCKS = 64
 _CPU = torch.device("cpu")
 # What torch.frombuffer and resize_ were checked on.

@@ -24,6 +24,7 @@ from .matmul import pack_b_blocked_vnni
 from .matmul import pack_b_blocked_vnni_t
 from .matmul import pack_b_vnni_t
 from .matmul import supports
+from .matmul import tall_output_tiles
 from .normalization import group_norm
 from .normalization import softmax
 from .reduction import column_sum
@@ -62,4 +63,5 @@ __all__ = [
     "softmax",
     "supports",
     "supports_matvec",
+    "tall_output_tiles",
 ]

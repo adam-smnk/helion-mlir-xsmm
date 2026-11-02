@@ -222,6 +222,17 @@ def align_operand_rows() -> ir.Module:
     return schedule
 
 
+def prefetch_large_gemm() -> ir.Module:
+    """Schedule: in short-K AMX GEMMs of whole-row tiles with outputs beyond the
+    last-level cache, each register block's output lines prefetched for writing."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.prefetch_large_gemm(funcs)
+        transform.yield_()
+    return schedule
+
+
 def split_bf16_loads() -> ir.Module:
     """Schedule: every LLVM load of a bf16 vector of 8k+1 elements (k > 0) as
     loads of the first 8k and of the last."""

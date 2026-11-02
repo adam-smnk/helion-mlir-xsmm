@@ -34,6 +34,7 @@ from .partition_linalg import partition_linalg
 from .pin_amx_off_tile_sizes import AMX_OFF_ATTR_NAME
 from .pin_amx_off_tile_sizes import pin_amx_off_tile_sizes
 from .pin_transposes import pin_transposes
+from .prefetch_large_gemm import prefetch_large_gemm
 from .rank_reduce_transfers import rank_reduce_transfers
 from .schedule_amx_loads import schedule_amx_loads
 from .sink_copies_into_branches import sink_copies_into_branches
@@ -91,6 +92,7 @@ __all__ = [
     "partition_linalg",
     "pin_amx_off_tile_sizes",
     "pin_transposes",
+    "prefetch_large_gemm",
     "rank_reduce_transfers",
     "schedule_amx_loads",
     "sink_copies_into_branches",

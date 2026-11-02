@@ -1138,6 +1138,26 @@ def vnni_panel(m: int, n: int, k: int | None = None) -> int:
     return _fallback_panel(m, n, k, threads, cost)
 
 
+def tall_output_tiles(m: int, n: int, k: int) -> tuple[int, int, int] | None:
+    """``block_sizes`` of :func:`matmul` for an output of many short rows: one K
+    chunk, whole rows per tile, as many rows as a power of two allows with the f32
+    accumulator within 1 MiB. ``None`` (the default choice) unless the rows make
+    whole tiles of at least ``_MIN_SHARED_ROWS`` for every thread, the columns
+    whole register tiles, and the packed B chunk at most 1 MiB.
+
+    The default tiles are as tall and narrow as the accumulator allows, and each
+    column of tiles reads A's rows again: 1048576x768x256 on EMR reads A 6 times
+    from L3 or DRAM (2816 MiB of DRAM reads per call, 20.5 ms); whole rows read it
+    once (1846 MiB, 16.3 ms)."""
+    threads = int(os.environ.get("OMP_NUM_THREADS", torch.get_num_threads()))
+    if n <= 0 or n % BLOCK_N or k <= 0 or k % (2 * BLOCK_K) or n * k * 2 > 1 << 20:
+        return None
+    rows = 1 << (((1 << 18) // n).bit_length() - 1) if n <= 1 << 18 else 0
+    if rows < _MIN_SHARED_ROWS or m % rows or m // rows < threads:
+        return None
+    return rows, n, k
+
+
 def whole_row_tiles(
     m: int, n: int, panel: int | None = None
 ) -> tuple[int, int] | None:
