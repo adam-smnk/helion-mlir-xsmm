@@ -433,11 +433,20 @@ def _check_scalar_indices(entry: CompiledEntry, values: list[object]) -> None:
     """Raise ``IndexError`` for an access at a runtime position out of its tensor's
     bounds, as torch does: the kernels don't check, and a position out of bounds
     stores outside the tensor. Negative positions count from the end (the lowering's
-    ``_from_the_end``). A reshaped alias of another argument takes its static size."""
+    ``_from_the_end``). A reshaped alias of another argument takes its static size.
+    A tensor with no elements is skipped: nothing can be stored outside it, and
+    ``c[n - 1, t]`` at ``n = 0`` is right. Conservative: an access in a loop that runs
+    0 times, or under a guard or mask that stays false, is still checked; a position
+    out of bounds there raises, though it wouldn't run."""
     by_name = dict(zip(entry.arg_names, values, strict=True))
     for tensor, dim, size, position, operands in entry.index_checks:
+        value = by_name.get(tensor)
+        if value is not None and not value.numel():
+            continue
         if size is None:
             size = by_name[tensor].shape[dim]
+        elif not size:
+            continue
         at = (
             by_name[position]
             if operands is None

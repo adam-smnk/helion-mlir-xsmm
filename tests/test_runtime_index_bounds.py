@@ -300,3 +300,47 @@ def test_alias_size_refused_when_the_call_cannot_read_it() -> None:
     with pytest.raises(UnsupportedOperationError, match="reshaped view of a runtime"):
         signature._check_alias_size(known, access)
     signature._check_alias_size(mock.Mock(refs={"v": None}), access)
+
+
+def add_last_row(x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    n, d = x.shape
+    out = torch.empty_like(x)
+    for tm, td in hl.tile([n, d]):
+        out[tm, td] = x[tm, td] + c[n - 1, td]
+    return out
+
+
+def test_empty_tensor_is_not_checked() -> None:
+    """Regression (review): dynamic shapes at ``n = 0``: "index -1 ... size 0", where
+    the kernel is right and stores nothing."""
+    kernel = helion.kernel(
+        add_last_row,
+        backend="mlir",
+        static_shapes=False,
+        config=helion.Config(block_sizes=[1, 16]),
+    )
+    assert kernel(torch.zeros(0, 16), torch.zeros(0, 16)).shape == (0, 16)
+    x, c = torch.randn(8, 16), torch.randn(8, 16)
+    assert torch.equal(kernel(x, c), x + c[-1])
+
+
+def put_in_inner_tile(
+    x: torch.Tensor, c: torch.Tensor, s: int, pos: int
+) -> torch.Tensor:
+    m, d = x.shape
+    for tm, td in hl.tile([m, d]):
+        for ts in hl.tile(s):
+            c[tm, pos, td] = x[tm, td] * 1.0
+    return c
+
+
+def test_position_in_a_loop_of_no_iterations_is_checked() -> None:
+    """Conservative, as under a guard: the store wouldn't run at ``s = 0``, but the
+    position is out of bounds, so the call raises."""
+    kernel = helion.kernel(
+        put_in_inner_tile, backend="mlir", config=helion.Config(block_sizes=[1, 16, 8])
+    )
+    x = torch.randn(8, 16)
+    _, cache = _view()
+    with pytest.raises(IndexError, match="index 70 is out of bounds"):
+        kernel(x, cache, 0, 70)
