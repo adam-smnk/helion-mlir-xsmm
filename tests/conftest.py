@@ -87,8 +87,8 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     config.addinivalue_line(
         "markers",
-        "isolated: run the test body in a forked child process so a native crash "
-        "only fails that test",
+        "isolated(timeout=None): run the test body in a forked child process so a "
+        "native crash only fails that test; with a timeout in seconds, so does a hang",
     )
     config.addinivalue_line("markers", "slow: long-running test")
     config.addinivalue_line(
@@ -168,7 +168,8 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
-    if pyfuncitem.get_closest_marker("isolated") is None:
+    marker = pyfuncitem.get_closest_marker("isolated")
+    if marker is None:
         return None
     if pyfuncitem.cls is not None:
         raise pytest.UsageError(
@@ -191,10 +192,21 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
             ),
         )
         process.start()
-        process.join()
+        process.join(marker.kwargs.get("timeout"))
+        hung = process.is_alive()
+        if hung:
+            process.kill()
+            process.join()
         output = pathlib.Path(log).read_text()
     finally:
         os.unlink(log)
+    if hung:
+        tail = "\n".join(output.splitlines()[-25:])
+        pytest.fail(
+            f"isolated test still running after {marker.kwargs['timeout']} s, killed:\n"
+            f"{tail}",
+            pytrace=False,
+        )
     if process.exitcode == _SKIP_EXIT:
         reasons = [
             line[len(_SKIPPED) :]

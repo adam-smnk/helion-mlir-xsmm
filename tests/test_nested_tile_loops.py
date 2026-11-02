@@ -78,7 +78,7 @@ def test_two_symbols_are_right(shape: tuple[int, int]) -> None:
     assert (got - x.double().amin(-1)).abs().max() < 1e-5
 
 
-@pytest.mark.isolated
+@pytest.mark.isolated(timeout=120)
 def test_sub_tiles_of_one_block_size_are_refused() -> None:
     x = torch.randn(16, 60).abs() + 1.0
     with pytest.raises(UnsupportedOperationError, match="of one block size"):
@@ -94,7 +94,7 @@ def root_grid_of_one_symbol(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
-@pytest.mark.isolated
+@pytest.mark.isolated(timeout=120)
 @pytest.mark.parametrize("shape", [(32, 64), (20, 60)], ids=["32x64", "20x60"])
 def test_root_grid_of_one_block_size_refused(shape: tuple[int, int]) -> None:
     """The form with one ``hl.tile``: a heap corruption at 32x64 and a ``KeyError`` at

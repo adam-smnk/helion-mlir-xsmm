@@ -13,7 +13,8 @@ import torch
 
 import helion_mlir_backend  # noqa: F401
 
-pytestmark = pytest.mark.isolated
+# A corrupted heap can hang rather than abort.
+pytestmark = pytest.mark.isolated(timeout=120)
 
 
 def row_sums(x: torch.Tensor) -> torch.Tensor:
