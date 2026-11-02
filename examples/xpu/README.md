@@ -103,3 +103,74 @@ binaries.
   the diagonal needs full tiles proven, which Helion's `affine.min` + `tensor.pad` of
   a triangular loop does not give (masking is shelved on XPU).
 - A head dim other than 64: lighthouse's attention layout is written for it.
+
+## `attention_variants.py`
+
+Forward attention variants as fused flash-attention kernels: each is the plain kernel with
+a few lines changed, in full, so a diff of two kernels shows what a variant takes.
+`python examples/xpu/attention_variants.py check causal` compares one to a float64 reference.
+Kernels take `[B * H, S, D]` tiles of one stream and query rows; `as_streams` makes the view.
+Shapes: `S` a multiple of 256, `D = 64`; no masked loads and no partial tiles. Config and its
+rationale: `KV_TILE`, `QUERY_TILE`. `igc_vectorizer` stays `"off"`, the default; `check --vectorizer
+cmp` runs the other option.
+
+The source also runs through Helion's Triton backend, with another config. It uses `hl.dot`, as
+`torch.einsum` of bf16 operands rounds its result to bf16 in that backend (a larger error), and
+on 4-D tiles took two orders of magnitude longer there.
+
+Definitions used (`i` query row, `j` key row, `h` query head; scores after the scale `1 / sqrt(D)`):
+
+| Kernel | Score or mask | Source |
+|---|---|---|
+| `alibi` | `s + (j - i) * 2 ** (-8 * (h + 1) / H)` | Helion 1.4 `add_alibi_bias_t2r`; Triton-XPU's `alibi_functional` |
+| `alibi_abs` | `s - abs(i - j) * 2 ** (-8 * (h + 1) / H)` | Press et al. 2021, ALiBi |
+| `softcap` | `50 * tanh(s / 50)` | Helion 1.4 `softcap_t2r`; Triton-XPU's `tanh_softcap_functional`; Gemma 2 (the value) |
+| `sigmoid_act` | `sigmoid(s)`, then softmax | **inferred** from the name; no source found |
+| `rel_bias` | `s + (i - j) * 0.01` | Helion 1.4 `add_relative_bias_t2r`; the slope is **inferred** |
+| `causal` | `j <= i` | SDPA's `is_causal`; Triton-XPU's causal benchmark |
+| `causal_strict` | `j < i` (row 0 sees nothing) | edge case of the mask, not a slide's variant |
+| `sliding_window` | `0 <= i - j <= 256` | Helion 1.4 `sliding_window_mask_t2r`; the window is **inferred** |
+| `dilated_sw` | the same and `(i - j) % 2 == 0` | **inferred**; no source found |
+| `block_diffusion` | `j // 128 <= i // 128` | **inferred** from Block Diffusion (Arriola et al., 2025); block size chosen |
+| `document` | `j <= i` and `documents[b, i] == documents[b, j]` | Helion 1.4 `document_mask_t2r` (causal and same document) |
+| `gemma2` | `50 * tanh(s / 50)`, `j <= i`, 16 query heads on 8 K/V heads | **inferred** as the combination; `D = 64` here, see below |
+
+Masks skip the K/V tiles a query tile cannot see: the K/V loop ends at the query tile's end and,
+in the windows, starts behind it. Inside the tiles it reads, a compare and a select apply the
+mask. `hl.tile`'s bounds must then be provably multiples of the K/V tile, and within K's
+extent, or the kernel is refused as having partial tiles.
+
+### Measured
+
+Arc Pro B50, IGC 2.41, `(4, 16, 1024, 64)`, bf16, randn inputs, L2 flushed before each call, wall
+time per call in µs, median of 3 processes of 40 warm-up calls and 60 timed calls (Triton: 2 processes,
+20 and 40), against a float64 reference. Largest error per row, normalized by that row's maximum: at
+most 6.5e-3 in these rows, as rounding to bf16 gives. Default block sizes `[1, 256, 64]`.
+
+| Kernel | `"off"` | `"cmp"` | Same source, Triton 3.7.2, `[1, 32, 16]`, 4 warps | FlexAttention through Triton |
+|---|---|---|---|---|
+| plain | 775 | 557 | 1712 | 561 |
+| alibi | 862 | 652 | 2266 | 592 |
+| softcap | 2113 | 2832 | 3155 | 2254 |
+| sigmoid_act | 932 | 608 | 1928 | 665 |
+| rel_bias | 857 | 824 | 2247 | 600 |
+| causal | 618 | 508 | 1782 | 354 |
+| sliding_window | 502 | 474 | 843 | 333 |
+| dilated_sw | 560 | 496 | 927 | 304 |
+| block_diffusion | 632 | 521 | 1940 | 343 |
+| document | 580 | 580 | 1898 | 334 |
+| gemma2 (`D = 64`) | 1950 | 2515 | 17190 | not run |
+
+Not covered:
+
+- `D = 128` (Gemma 2's): lighthouse's attention layout hard-codes a head dim of 64.
+- A bias from a tensor, `bias[tm, tn]`: a third 2D load in an attention kernel has no layout (f32:
+  over the block load's limit in XeVM; bf16: a 64-element vector, LLVM's SPIR-V backend aborts).
+- A per-head runtime scalar (`slopes[th]`): a 0-D read that XeGPU's layout propagation cannot convert. The
+  slope is computed from `th.index`.
+- `masked_fill` and `torch.where` with a Python float: torch-mlir does not lower the scalar
+  tensor; the kernels use `hl.full`.
+
+Edge cases, all measured against a dense float64 reference on the device: a row with no visible key is
+NaN, as with torch's softmax. A NaN in `V` at a key a query cannot see in a skipped K/V tile
+does not reach the row in the kernel, whereas it does in a dense `P @ V` (`0 * NaN`).
