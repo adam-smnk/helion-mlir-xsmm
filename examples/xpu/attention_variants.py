@@ -8,7 +8,7 @@ group, as a mask depends on the query's row. Definitions and their
 sources: ``README.md``. Run on a node with an Arc GPU:
 
     python examples/xpu/attention_variants.py check causal
-    python examples/xpu/attention_variants.py check causal --vectorizer cmp
+    python examples/xpu/attention_variants.py check causal --vectorizer off
     python examples/xpu/attention_variants.py bench causal --seq 1024
 
 ``check`` compares a kernel to a float64 reference, per row and globally, on
@@ -45,7 +45,7 @@ def plain(
     streams, rows, dim = q.shape
     seq = k.size(1)
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, tm], dtype=torch.float32)
@@ -78,7 +78,7 @@ def alibi(
     streams, rows, dim = q.shape
     seq = k.size(1)
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         slope = torch.exp(
             -5.545177444479562 * ((tb.index % heads).to(torch.float32) + 1.0) / heads
         )
@@ -117,7 +117,7 @@ def alibi_abs(
     streams, rows, dim = q.shape
     seq = k.size(1)
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         slope = torch.exp(
             -5.545177444479562 * ((tb.index % heads).to(torch.float32) + 1.0) / heads
         )
@@ -156,7 +156,7 @@ def softcap(
     streams, rows, dim = q.shape
     seq = k.size(1)
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, tm], dtype=torch.float32)
@@ -188,7 +188,7 @@ def sigmoid_act(
     streams, rows, dim = q.shape
     seq = k.size(1)
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, tm], dtype=torch.float32)
@@ -221,7 +221,7 @@ def rel_bias(
     streams, rows, dim = q.shape
     seq = k.size(1)
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, tm], dtype=torch.float32)
@@ -255,12 +255,64 @@ def causal(
     """Causal: keys ``j <= i``; K/V tiles past the query tile are skipped."""
     streams, rows, dim = q.shape
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, tm], dtype=torch.float32)
         acc = hl.zeros([tb, tm, dim], dtype=torch.float32)
         for tn in hl.tile(tm.end):
+            scores = hl.dot(
+                q_tile, k[tb, tn, :].transpose(1, 2), out_dtype=torch.float32
+            )
+            scores = scores * scale
+            i = tm.index.to(torch.float32)[None, :, None]
+            j = tn.index.to(torch.float32)[None, None, :]
+            visible = j <= i
+            scores = torch.where(
+                visible,
+                scores,
+                hl.full([tb, tm, tn], float("-inf"), dtype=torch.float32),
+            )
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, None] + hl.dot(
+                p.to(v.dtype), v[tb, tn, :], out_dtype=torch.float32
+            )
+            row_max = new_max
+        out[tb, tm, :] = (acc / row_sum[:, :, None]).to(out.dtype)
+    return out
+
+
+def causal_split(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: hl.constexpr,
+) -> torch.Tensor:
+    """Causal in two K/V loops: tiles fully visible to the query tile, with no mask, and the tiles it needs one in. Against :func:`causal`, a few % less device time for a second copy of the loop."""
+    streams, rows, dim = q.shape
+    out = torch.empty_like(q)
+    for tm, tb in hl.tile([rows, streams]):
+        q_tile = q[tb, tm, :]
+        row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, tm, dim], dtype=torch.float32)
+        for tf in hl.tile(tm.begin):
+            scores = hl.dot(
+                q_tile, k[tb, tf, :].transpose(1, 2), out_dtype=torch.float32
+            )
+            scores = scores * scale
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, None] + hl.dot(
+                p.to(v.dtype), v[tb, tf, :], out_dtype=torch.float32
+            )
+            row_max = new_max
+        for tn in hl.tile(tm.begin, tm.end):
             scores = hl.dot(
                 q_tile, k[tb, tn, :].transpose(1, 2), out_dtype=torch.float32
             )
@@ -294,7 +346,7 @@ def causal_strict(
     """Keys strictly before the query, ``j < i``: row 0 sees no key, and gives NaN."""
     streams, rows, dim = q.shape
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, tm], dtype=torch.float32)
@@ -335,7 +387,7 @@ def sliding_window(
     """Sliding window: keys ``0 <= i - j <= window``; K/V tiles outside are skipped."""
     streams, rows, dim = q.shape
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, tm], dtype=torch.float32)
@@ -378,7 +430,7 @@ def dilated_sw(
     """Dilated sliding window: ``0 <= i - j <= window`` and ``(i - j) % dilation == 0``."""
     streams, rows, dim = q.shape
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, tm], dtype=torch.float32)
@@ -423,7 +475,7 @@ def block_diffusion(
     """Block diffusion: a query sees its block and earlier ones, ``j // block <= i // block``."""
     streams, rows, dim = q.shape
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, tm], dtype=torch.float32)
@@ -453,6 +505,37 @@ def block_diffusion(
     return out
 
 
+def block_diffusion_aligned(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    scale: hl.constexpr,
+) -> torch.Tensor:
+    """Block diffusion with the query tile as the block: its rows see the same keys, up to the tile's end, so there is nothing to mask."""
+    streams, rows, dim = q.shape
+    out = torch.empty_like(q)
+    for tm, tb in hl.tile([rows, streams]):
+        q_tile = q[tb, tm, :]
+        row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, tm, dim], dtype=torch.float32)
+        for tn in hl.tile(tm.end):
+            scores = hl.dot(
+                q_tile, k[tb, tn, :].transpose(1, 2), out_dtype=torch.float32
+            )
+            scores = scores * scale
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, None] + hl.dot(
+                p.to(v.dtype), v[tb, tn, :], out_dtype=torch.float32
+            )
+            row_max = new_max
+        out[tb, tm, :] = (acc / row_sum[:, :, None]).to(out.dtype)
+    return out
+
+
 def document(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -463,7 +546,7 @@ def document(
     """Causal same-document: ``j <= i`` and ``documents[row stream, i] == documents[row stream, j]``."""
     streams, rows, dim = q.shape
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
         row_sum = hl.zeros([tb, tm], dtype=torch.float32)
@@ -505,7 +588,7 @@ def gemma2(
     """Gemma 2: grouped query heads, causal, softcap; ``k, v: [B * Hkv, S, D]``."""
     streams, rows, dim = q.shape
     out = torch.empty_like(q)
-    for tb, tm in hl.tile([streams, rows]):
+    for tm, tb in hl.tile([rows, streams]):
         kv = tb.begin // group
         q_tile = q[tb, tm, :]
         row_max = hl.full([tb, tm], -3.4028234663852886e38, dtype=torch.float32)
@@ -547,9 +630,19 @@ query rows), the tile of ``llama_gqa_attention`` and of lighthouse's attention l
 QUERY_TILE = 256
 """Query rows of a workgroup: 16 subgroups of 16 rows, 2 workgroups on an Xe-core of a
 B50 (32 large-register threads). Every subgroup reads the K/V tile: subgroups of one
-tile share it through the L1. Streams (batch times head) tile at 1: a grid dim."""
+tile share it through the L1."""
 
-BLOCK_SIZES = [1, QUERY_TILE, KV_TILE]
+BLOCK_SIZES = [QUERY_TILE, 1, KV_TILE]
+"""Query tiles first in ``hl.tile``: the dispatch runs them fastest, so consecutive
+workgroups of a thread read the K/V of the same stream, and the L2 still holds it. With
+streams first, each workgroup reads another stream's: at (4, 16, 2048, 64) plain takes
+1632 us of device time against 1822, causal in two K/V loops 1084 against 1617."""
+
+MASK_BLOCK_SIZES = [128, 1, 32]
+"""Masks and selects (``tanh``'s polynomial) take a K/V tile of 32. IGC's vectorizer cannot
+vectorize a per-element compare and select; at 64 K/V rows that takes the whole softmax
+out of vector form, at 32 the kernel stays vectorized (softcap at S = 1024
+takes 952 us wall against 2832). Query tiles of 128 skip K/V tiles more finely."""
 
 SOFTCAP = 50.0
 """Gemma 2's ``attn_logit_softcapping``, the value of Triton-XPU's benchmark too."""
@@ -588,6 +681,7 @@ class Variant(NamedTuple):
     bias: Callable[[RowContext], torch.Tensor] | None = None
     mask: Callable[[RowContext], torch.Tensor] | None = None
     kv_heads: Callable[[int], int] = lambda heads: heads
+    block_sizes: list[int] | None = None
 
 
 def documents_of(batch: int, seq: int, device: str = "cpu") -> torch.Tensor:
@@ -666,18 +760,33 @@ def _heads_arg(_batch: int, heads: int, _seq: int, _device: str) -> list[object]
 
 VARIANTS: dict[str, Variant] = {
     "plain": Variant(plain),
-    "alibi": Variant(alibi, _heads_arg, bias=_alibi_bias),
-    "alibi_abs": Variant(alibi_abs, _heads_arg, bias=_alibi_abs_bias),
-    "softcap": Variant(softcap, lambda *_: [hl.constexpr(SOFTCAP)], score_fn=_capped),
+    "alibi": Variant(alibi, _heads_arg, bias=_alibi_bias, block_sizes=MASK_BLOCK_SIZES),
+    "alibi_abs": Variant(
+        alibi_abs, _heads_arg, bias=_alibi_abs_bias, block_sizes=MASK_BLOCK_SIZES
+    ),
+    "softcap": Variant(
+        softcap,
+        lambda *_: [hl.constexpr(SOFTCAP)],
+        score_fn=_capped,
+        block_sizes=MASK_BLOCK_SIZES,
+    ),
     "sigmoid_act": Variant(sigmoid_act, score_fn=torch.sigmoid),
     "rel_bias": Variant(
-        rel_bias, lambda *_: [hl.constexpr(RELATIVE_SLOPE)], bias=_relative_bias
+        rel_bias,
+        lambda *_: [hl.constexpr(RELATIVE_SLOPE)],
+        bias=_relative_bias,
+        block_sizes=MASK_BLOCK_SIZES,
     ),
     "causal": Variant(causal, mask=_causal_mask),
+    "causal_split": Variant(
+        causal_split,
+        mask=_causal_mask,
+        block_sizes=[*MASK_BLOCK_SIZES, MASK_BLOCK_SIZES[-1]],
+    ),
     "causal_strict": Variant(causal_strict, mask=_strict_mask),
     "sliding_window": Variant(
         sliding_window,
-        lambda *_: [hl.constexpr(WINDOW), hl.constexpr(KV_TILE)],
+        lambda *_: [hl.constexpr(WINDOW), hl.constexpr(MASK_BLOCK_SIZES[-1])],
         mask=_window_mask,
     ),
     "dilated_sw": Variant(
@@ -685,7 +794,7 @@ VARIANTS: dict[str, Variant] = {
         lambda *_: [
             hl.constexpr(WINDOW),
             hl.constexpr(DILATION),
-            hl.constexpr(KV_TILE),
+            hl.constexpr(MASK_BLOCK_SIZES[-1]),
         ],
         mask=_dilated_mask,
     ),
@@ -693,6 +802,11 @@ VARIANTS: dict[str, Variant] = {
         block_diffusion,
         lambda *_: [hl.constexpr(DIFFUSION_BLOCK)],
         mask=_diffusion_mask,
+    ),
+    "block_diffusion_aligned": Variant(
+        block_diffusion_aligned,
+        mask=_diffusion_mask,
+        block_sizes=[DIFFUSION_BLOCK, 1, KV_TILE],
     ),
     "document": Variant(
         document,
@@ -716,19 +830,25 @@ def make_kernel(
     *,
     backend: str = "mlir",
     block_sizes: list[int] | None = None,
-    vectorizer: str = "off",
+    vectorizer: str | None = None,
     **config: object,
 ) -> object:
     """The variant's kernel. ``xegpu_*`` and ``igc_vectorizer`` apply to ``mlir`` only."""
     options = dict(config)
     if backend == "mlir":
         options.setdefault("xegpu_nan_ignoring_maxima", [True])
-        options.setdefault("igc_vectorizer", [vectorizer])
+        if vectorizer is not None:
+            options.setdefault("igc_vectorizer", [vectorizer])
     return helion.kernel(
         VARIANTS[name].fn,
         backend=backend,
         static_shapes=True,
-        config=helion.Config(block_sizes=block_sizes or BLOCK_SIZES, **options),
+        config=helion.Config(
+            block_sizes=block_sizes
+            or VARIANTS[name].block_sizes
+            or (MASK_BLOCK_SIZES if VARIANTS[name].mask else BLOCK_SIZES),
+            **options,
+        ),
     )
 
 
@@ -923,7 +1043,7 @@ def main() -> None:
     parser.add_argument("--seq", type=int, default=None)
     parser.add_argument("--dim", type=int, default=64)
     parser.add_argument("--gain", type=float, default=1.0)
-    parser.add_argument("--vectorizer", choices=["off", "cmp"], default="off")
+    parser.add_argument("--vectorizer", choices=["off"], default=None)
     args = parser.parse_args()
     shape = {
         "batch": args.batch or (2 if args.command == "check" else 4),
@@ -935,10 +1055,10 @@ def main() -> None:
         result = check(
             args.variant, gain=args.gain, vectorizer=args.vectorizer, **shape
         )
-        print(args.variant, args.vectorizer, result)
+        print(args.variant, args.vectorizer or "on", result)
     else:
         time_us = bench(args.variant, vectorizer=args.vectorizer, **shape)
-        print(f"{args.variant} {args.vectorizer} {time_us:.1f} us")
+        print(f"{args.variant} {args.vectorizer or 'on'} {time_us:.1f} us")
 
 
 if __name__ == "__main__":

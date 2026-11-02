@@ -111,8 +111,7 @@ a few lines changed, in full, so a diff of two kernels shows what a variant take
 `python examples/xpu/attention_variants.py check causal` compares one to a float64 reference.
 Kernels take `[B * H, S, D]` tiles of one stream and query rows; `as_streams` makes the view.
 Shapes: `S` a multiple of 256, `D = 64`; no masked loads and no partial tiles. Config and its
-rationale: `KV_TILE`, `QUERY_TILE`. `igc_vectorizer` stays `"off"`, the default; `check --vectorizer
-cmp` runs the other option.
+rationale: `BLOCK_SIZES`, `MASK_BLOCK_SIZES`. `check --vectorizer off` runs without IGC's vectorizer.
 
 The source also runs through Helion's Triton backend, with another config. It uses `hl.dot`, as
 `torch.einsum` of bf16 operands rounds its result to bf16 in that backend (a larger error), and
@@ -128,10 +127,12 @@ Definitions used (`i` query row, `j` key row, `h` query head; scores after the s
 | `sigmoid_act` | `sigmoid(s)`, then softmax | **inferred** from the name; no source found |
 | `rel_bias` | `s + (i - j) * 0.01` | Helion 1.4 `add_relative_bias_t2r`; the slope is **inferred** |
 | `causal` | `j <= i` | SDPA's `is_causal`; Triton-XPU's causal benchmark |
+| `causal_split` | as `causal`, in two K/V loops | form of `causal` |
 | `causal_strict` | `j < i` (row 0 sees nothing) | edge case of the mask, not a slide's variant |
 | `sliding_window` | `0 <= i - j <= 256` | Helion 1.4 `sliding_window_mask_t2r`; the window is **inferred** |
 | `dilated_sw` | the same and `(i - j) % 2 == 0` | **inferred**; no source found |
 | `block_diffusion` | `j // 128 <= i // 128` | **inferred** from Block Diffusion (Arriola et al., 2025); block size chosen |
+| `block_diffusion_aligned` | as `block_diffusion`, query tile = block, no mask | form of it |
 | `document` | `j <= i` and `documents[b, i] == documents[b, j]` | Helion 1.4 `document_mask_t2r` (causal and same document) |
 | `gemma2` | `50 * tanh(s / 50)`, `j <= i`, 16 query heads on 8 K/V heads | **inferred** as the combination; `D = 64` here, see below |
 
@@ -142,27 +143,39 @@ extent, or the kernel is refused as having partial tiles.
 
 ### Measured
 
-Arc Pro B50, IGC 2.41, `(4, 16, 1024, 64)`, bf16, randn inputs, L2 flushed before each call, wall
-time per call in µs, median of 3 processes of 40 warm-up calls and 60 timed calls (Triton: 2 processes,
-20 and 40), against a float64 reference. Largest error per row, normalized by that row's maximum: at
-most 6.5e-3 in these rows, as rounding to bf16 gives. Default block sizes `[1, 256, 64]`.
+Arc Pro B50, IGC 2.41, `(4, 16, S, 64)`, bf16, randn inputs, L2 flushed before each call,
+`agent-tools/xpu_kernel_time.py`: 200 calls in 2 processes, last 50 of each, one node and session. Device time / wall
+in µs; wall minus device is the host path and differs by backend. Largest error per row against float64: at most
+6.6e-3. The vectorizer is on, its default. FlexAttention and the flash kernel of Intel's benchmarks
+(`128,32`, `128,64` with mask) go through Triton-XPU 3.7.2.
 
-| Kernel | `"off"` | `"cmp"` | Same source, Triton 3.7.2, `[1, 32, 16]`, 4 warps | FlexAttention through Triton |
-|---|---|---|---|---|
-| plain | 775 | 557 | 1712 | 561 |
-| alibi | 862 | 652 | 2266 | 592 |
-| softcap | 2113 | 2832 | 3155 | 2254 |
-| sigmoid_act | 932 | 608 | 1928 | 665 |
-| rel_bias | 857 | 824 | 2247 | 600 |
-| causal | 618 | 508 | 1782 | 354 |
-| sliding_window | 502 | 474 | 843 | 333 |
-| dilated_sw | 560 | 496 | 927 | 304 |
-| block_diffusion | 632 | 521 | 1940 | 343 |
-| document | 580 | 580 | 1898 | 334 |
-| gemma2 (`D = 64`) | 1950 | 2515 | 17190 | not run |
+| Kernel | S = 1024 | Flex | Native | S = 2048 | Flex | Native | S = 4096 | Flex | Native |
+|---|---|---|---|---|---|---|---|---|---|
+| plain | 403 / 520 | 476 / 585 | 487 / 565 | 1677 / 1943 | 2045 / 2259 | 2162 / 2325 | 7450 / 7767 | 8682 / 8900 | 8853 / 9099 |
+| causal | 307 / 441 | 299 / 365 | 308 / 367 | 1226 / 1463 | 1098 / 1242 | 1152 / 1270 | 5292 / 5536 | 4471 / 4689 | 4621 / 4796 |
+| causal_split | 285 / 409 | | | 1106 / 1348 | | | 4826 / 5102 | | |
+| sliding_window | 236 / 355 | 259 / 314 | | 483 / 640 | 483 / 556 | | 1045 / 1255 | 1024 / 1135 | |
+| dilated_sw | 266 / 398 | 248 / 301 | | 554 / 721 | 487 / 569 | | | | |
+| block_diffusion | 301 / 434 | 287 / 358 | | 1209 / 1440 | 1112 / 1258 | | | | |
+| block_diffusion_aligned | 253 / 374 | | | 933 / 1161 | | | | | |
+| document | 345 / 501 | 272 / 348 | | 1356 / 1567 | 557 / 657 | | 5452 / 5721 | 1181 / 1296 | |
+
+FlexAttention skips K/V blocks by a mask computed on the host, so `document` also skips by data there.
+
+What the numbers rest on, each measured alone:
+
+- **Query tiles first in `hl.tile`:** the dispatch runs them fastest, so consecutive workgroups
+  of a thread read one stream's K/V. `causal_split` 1617 → 1084 µs at S = 2048.
+- **K/V tile 32 under masks or selects:** IGC's vectorizer only stubs a per-element `select`; at 64
+  K/V rows that takes the softmax out of vector form, at 32 it stays. Causal asm 4395 → 1784 lines,
+  softcap 2832 → 952 µs wall. Plain itself stays at 64.
+- **Not masking fully visible tiles** (`causal_split`, about 12 more lines): 7 %. Where the
+  query tile is the block, nothing needs a mask (`block_diffusion_aligned`).
 
 Not covered:
 
+- **`document` skips only the causal part:** a loop bound read from a tensor would skip by data. It needs a
+  proof of full tiles from a tensor read, which no source form gave.
 - `D = 128` (Gemma 2's): lighthouse's attention layout hard-codes a head dim of 64.
 - A bias from a tensor, `bias[tm, tn]`: a third 2D load in an attention kernel has no layout (f32:
   over the block load's limit in XeVM; bf16: a 64-element vector, LLVM's SPIR-V backend aborts).
@@ -173,4 +186,5 @@ Not covered:
 
 Edge cases, all measured against a dense float64 reference on the device: a row with no visible key is
 NaN, as with torch's softmax. A NaN in `V` at a key a query cannot see in a skipped K/V tile
-does not reach the row in the kernel, whereas it does in a dense `P @ V` (`0 * NaN`).
+does not reach the row in the kernel, whereas it does in a dense `P @ V` (`0 * NaN`). FlexAttention
+gives 0, by its template, for a row with no key.

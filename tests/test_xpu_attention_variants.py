@@ -46,8 +46,9 @@ def _fake_args(name: str, shape: tuple[int, int, int, int] = _SHAPE) -> list[obj
 @pytest.mark.parametrize("name", _NAMES)
 def test_variant_lowers_as_a_fused_attention_kernel(name: str) -> None:
     text = lower_xpu(av.make_kernel(name), _fake_args(name))
-    assert text.count("xegpu.dpas") == 2
-    assert text.count("scf.for") == 1
+    loops = 2 if name == "causal_split" else 1
+    assert text.count("xegpu.dpas") == 2 * loops
+    assert text.count("scf.for") == loops
     assert "xegpu.prefetch_nd" in text
 
 
@@ -70,6 +71,38 @@ def test_head_dim_128_is_a_clear_error() -> None:
     args = _fake_args("gemma2", (2, 4, 512, 128))
     with pytest.raises(UnsupportedOperationError, match="head dim 128"):
         lower_xpu(av.make_kernel("gemma2"), args)
+
+
+@pytest.mark.isolated
+def test_later_kv_loops_take_the_first_ones_layouts() -> None:
+    """Every K/V loop gets the layouts of lighthouse's annotation of the first."""
+    text = lower_xpu(av.make_kernel("causal_split"), _fake_args("causal_split"))
+    bodies = [line.strip() for line in text.splitlines()]
+    dpas = [line for line in bodies if "xegpu.dpas" in line]
+    assert all("layout_a = " in line and "layout_cd = " in line for line in dpas)
+    layouts = [line[line.index("<{") :] for line in dpas]
+    assert layouts[0] == layouts[2]
+    assert layouts[1] == layouts[3]
+    loads = [line for line in bodies if "xegpu.load_nd" in line]
+    assert len(loads) == 5
+    assert all("layout = " in line for line in loads)
+
+
+@pytest.mark.isolated
+def test_kv_loops_of_different_tiles_are_refused() -> None:
+    """Negative: lighthouse's annotation has one K/V tile for a kernel."""
+    args = _fake_args("causal_split")
+    kernel = av.make_kernel("causal_split", block_sizes=[128, 1, 32, 64])
+    with pytest.raises(UnsupportedOperationError, match="different tiles"):
+        lower_xpu(kernel, args)
+
+
+@pytest.mark.isolated
+def test_row_maxima_of_all_kv_loops_may_ignore_nan() -> None:
+    """Several K/V loops are one online softmax: one chain of maxima."""
+    text = lower_xpu(av.make_kernel("causal_split"), _fake_args("causal_split"))
+    assert text.count("vector.multi_reduction <maxnumf>") == 2
+    assert "vector.multi_reduction <maximumf>" not in text
 
 
 # --- The reference itself, on the CPU --------------------------------------------------
@@ -127,7 +160,7 @@ def _ulp_bound(result: dict[str, object]) -> None:
 
 @pytest.mark.xpu_runtime
 @pytest.mark.isolated
-@pytest.mark.parametrize("vectorizer", ["off", "cmp"])
+@pytest.mark.parametrize("vectorizer", ["off", None], ids=["off", "on"])
 @pytest.mark.parametrize("name", _NAMES)
 def test_variant_against_float64(name: str, vectorizer: str) -> None:
     _ulp_bound(av.check(name, vectorizer=vectorizer))
@@ -158,7 +191,7 @@ def test_same_source_through_triton(name: str) -> None:
     own config, and is as close to the reference."""
     q, k, v = av.inputs_of(name, 2, 4, 512, 64)
     kernel = av.make_kernel(
-        name, backend="triton", block_sizes=[1, 32, 16], num_warps=4, num_stages=2
+        name, backend="triton", block_sizes=[32, 1, 16], num_warps=4, num_stages=2
     )
     args = av.call_args(name, 2, 4, 512, 64)
     if name == "sliding_window":
