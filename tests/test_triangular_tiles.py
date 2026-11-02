@@ -129,6 +129,34 @@ def test_loop_to_a_minimum_runs_no_key_past_it() -> None:
     )
 
 
+def behind_any_row(x: torch.Tensor, window: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(tm.begin - window, tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def test_a_lower_bound_that_may_be_negative_is_refused() -> None:
+    """Regression: the first row tiles read before the tensor, with no error and
+    wrong rows (the XPU refused it, as a partial tile)."""
+    with pytest.raises(UnsupportedOperationError, match="before the tensor"):
+        _kernel(behind_any_row, 16, 8)(torch.randn(64, 16), hl.constexpr(16))
+
+
+def test_a_lower_bound_proven_in_the_tensor_is_not_refused() -> None:
+    """Negative: from the second row tile on, the same window stays in the tensor."""
+    x = torch.randn(64, 16)
+
+    check_kernel(
+        _kernel(behind_window, 16, 8),
+        lambda a, *_: _expected(a, 16, lambda b, e: (max(b - 16, 0), e)),
+        [x, hl.constexpr(16), hl.constexpr(8)],
+    )
+
+
 def test_a_loop_that_spans_nothing_runs_no_tile() -> None:
     """Regression: ``ZeroDivisionError`` in the proof of full tiles: the tile of a
     loop whose span is 0 has size 0."""
@@ -191,7 +219,7 @@ def behind_without_a_clamp(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
 def test_xpu_refuses_a_lower_bound_that_may_be_negative() -> None:
     """Negative: multiples of the tile, but no proof that it stays in the tensor."""
     args = [xpu_tensor(512, 64, dtype=torch.bfloat16)] * 2
-    with pytest.raises(UnsupportedOperationError, match="partial tiles"):
+    with pytest.raises(UnsupportedOperationError, match="before the tensor"):
         lower_xpu(_kernel(behind_without_a_clamp, 128, 64), args)
 
 

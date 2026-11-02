@@ -375,6 +375,12 @@ def tile_window(
         and outer in ctx.block_id_to_bounds
     ):
         end = ctx.block_id_to_bounds[outer][1]
+    low = ctx.index_facts(begin).low
+    if low is not None and low + bias < 0:
+        raise UnsupportedOperationError(
+            "tile index",
+            reason=f"the loop may start at {low + bias}, before the tensor start",
+        )
     if bias < 0 and not (isinstance(begin, int) and begin + bias >= 0):
         raise UnsupportedOperationError(
             "tile index", reason=f"offset {bias} may index before the tensor start"
