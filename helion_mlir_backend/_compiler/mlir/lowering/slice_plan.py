@@ -383,6 +383,10 @@ def tile_window(
         return offset, size, tile
     if bias == 0 and isinstance(end, ir.Value) and end == extent:
         return offset, size, tile
+    # A loop ending at an enclosing tile's position stays inside that loop's range.
+    high = ctx.index_facts(end).high
+    if isinstance(extent, int) and high is not None and high + bias <= extent:
+        return offset, size, tile
     d0 = ir.AffineDimExpr.get(0)
     if isinstance(extent, int):
         limit, limit_operands = ir.AffineConstantExpr.get(extent), []

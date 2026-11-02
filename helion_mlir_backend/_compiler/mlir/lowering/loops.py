@@ -369,19 +369,29 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> emit.Result
             return lower_subgraph(ctx, body, with_carried(inputs, positions, carried))
         begin = _resolve_loop_bound(ctx, node, bounds[level].begin)
         end = _resolve_loop_bound(ctx, node, bounds[level].end)
+        # A lower bound that is a value counts from 0, with the offset in the body:
+        # XeGPU's prefetch insertion unrolls a loop of a constant trip count from
+        # the loop's own lower bound, which a value there does not give.
+        moved = isinstance(begin, ir.Value)
         for_op = scf_d.ForOp(
-            ctx.as_index(begin),
-            ctx.as_index(end),
+            ctx.index_const(0) if moved else ctx.as_index(begin),
+            arith_d.SubIOp(ctx.as_index(end), begin).result
+            if moved
+            else ctx.as_index(end),
             ctx.index_const(bounds[level].step),
             iter_args=[*carried, *(ctx.tensors.value(name) for name in names)],
         )
         count = len(carried)
         block_args = list(for_op.inner_iter_args)
+        with ir.InsertionPoint(for_op.body):
+            offset = for_op.induction_variable
+            if moved:
+                offset = arith_d.AddIOp(begin, offset).result
         with (
             ir.InsertionPoint(for_op.body),
             ctx.enter_for_loop(
                 block_ids[level],
-                for_op.induction_variable,
+                offset,
                 (begin, end),
                 _enclosing_span(ctx, block_ids[level]),
             ),

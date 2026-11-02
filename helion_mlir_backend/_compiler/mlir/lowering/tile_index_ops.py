@@ -65,7 +65,8 @@ def lower_get_symnode(ctx: BuildContext, node: torch.fx.Node) -> ir.Value:
                 f"the tile expression {value.node.expr} in an inner loop",
                 reason=(
                     "arithmetic on tile positions reaches an inner loop as an "
-                    "expression; +, -, * and // of tile positions and constants lower"
+                    "expression; +, -, *, //, min and max of tile positions and "
+                    "constants lower"
                 ),
                 alternatives=["compute it in the loop that uses it"],
             )
@@ -88,6 +89,10 @@ def _symbolic_value(ctx: BuildContext, expr: object) -> ir.Value | None:
         combine, operands = arith_d.AddIOp, expr.args
     elif isinstance(expr, sympy.Mul):
         combine, operands = arith_d.MulIOp, expr.args
+    elif isinstance(expr, sympy.Max):
+        combine, operands = arith_d.MaxSIOp, expr.args
+    elif isinstance(expr, sympy.Min):
+        combine, operands = arith_d.MinSIOp, expr.args
     else:
         return None
     values = [_symbolic_value(ctx, operand) for operand in operands]

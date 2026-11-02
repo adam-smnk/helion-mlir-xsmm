@@ -12,6 +12,8 @@ from mlir.dialects import arith as arith_d
 from mlir.dialects import tensor as tensor_d
 import mlir.ir as ir
 
+from .analysis.index_facts import IndexFacts
+from .analysis.index_facts import index_facts
 from .lowering.tensor_state import TensorState
 from .sizes import Sizes
 from .support import DynamicShapeError
@@ -239,9 +241,43 @@ class BuildContext:
                 [ir.AffineConstantExpr.get(size), ir.AffineConstantExpr.get(end) - d0],
                 [offset],
             )
+        first, last = self.index_facts(begin), self.index_facts(end)
+        if (
+            first.multiple % size == 0
+            and last.multiple % size == 0
+            and first.low is not None
+            and first.low >= 0
+        ):
+            return None  # A triangular loop, on tiles of the same grid.
         return emit.affine_min(
             [ir.AffineConstantExpr.get(size), d1 - d0], [offset, self.as_index(end)]
         )
+
+    def index_facts(self, value: int | ir.Value) -> IndexFacts:
+        """What is known of ``value``, as a multiple and bounds, from the loops it is
+        built from."""
+
+        def position(candidate: ir.Value) -> IndexFacts | None:
+            for block_id, offset in self.block_id_to_iv.items():
+                if offset != candidate or self.geometry.is_grid(block_id):
+                    continue
+                begin, end = self.block_id_to_bounds[block_id]
+                size = self.geometry.tile_extent(block_id)
+                if not isinstance(begin, int) or not isinstance(end, int):
+                    return (
+                        IndexFacts(size)
+                        if isinstance(begin, int) and not begin % size
+                        else None
+                    )
+                full = not (end - begin) % size
+                return IndexFacts(
+                    size if not begin % size else 1,
+                    begin,
+                    end - size if full else end - 1,
+                )
+            return None
+
+        return index_facts(value, position)
 
     @contextmanager
     def enter_for_loop(
