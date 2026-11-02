@@ -117,6 +117,18 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
     return 0 if targeted else None
 
 
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """A native extension that fails to build only logs a warning, and its tests
+    skip: fail unless it is disabled on purpose (``HELION_MLIR_NATIVE_CALL=0``)."""
+    from helion_mlir_backend._compiler import native
+
+    if native.enabled() and native.module() is None:
+        raise pytest.UsageError(
+            "the native extension could not be built (see the warning above); set "
+            "HELION_MLIR_NATIVE_CALL=0 to run without it"
+        )
+
+
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """Isolated tests last, so the fork server finishes importing meanwhile."""
     items.sort(key=lambda item: item.get_closest_marker("isolated") is not None)
