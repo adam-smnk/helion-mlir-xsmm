@@ -173,10 +173,7 @@ def _check_module_lookups(MLIRBackend: type) -> None:
     """
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.host_function import HostFunction
-    from helion._compiler.output_header import SOURCE_MODULE
     from helion._compiler.type_propagation import LocalScope
-    from helion._compiler.variable_origin import AttributeOrigin
-    from helion._compiler.variable_origin import GlobalOrigin
 
     from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 
@@ -199,22 +196,26 @@ def _check_module_lookups(MLIRBackend: type) -> None:
     global_scope_origin = HostFunction.global_scope_origin
     import_from_module = HostFunction.import_from_module
     maybe_get = LocalScope.maybe_get
-    probing = [False]
 
     def checked_global_scope_origin(self: HostFunction, name: str) -> object:
-        if probing[0]:
-            # Assigning a local looks up its name first, only to compare types: no
-            # global is read, and with no module loaded there is nothing to refuse.
-            return AttributeOrigin(GlobalOrigin(SOURCE_MODULE), name)
         check(self.fn.__globals__, name)
         return global_scope_origin(self, name)
 
-    def probing_maybe_get(self: LocalScope, name: str) -> object:
-        probing[0] = True
-        try:
+    def local_maybe_get(self: LocalScope, name: str) -> object:
+        """Assigning a local looks its name up first, to compare types with what it
+        rebinds: only a local is rebound. A global of that name isn't read: it may
+        be of a type no kernel can take, or of a module that isn't loaded. A name the
+        function declares ``global`` is no local, and goes on to Helion's checks."""
+        if not isinstance(CompileEnvironment.current().backend, MLIRBackend):
             return maybe_get(self, name)
-        finally:
-            probing[0] = False
+        scope = self
+        while isinstance(scope, LocalScope):
+            if name in scope.variables:
+                return scope.variables[name]
+            scope = scope.parent
+        if name in scope.function.fn.__code__.co_varnames:
+            return None
+        return maybe_get(self, name)
 
     def checked_import_from_module(
         self: HostFunction, module_scope: dict[str, object], name: str
@@ -222,7 +223,7 @@ def _check_module_lookups(MLIRBackend: type) -> None:
         check(module_scope, name)
         return import_from_module(self, module_scope, name)
 
-    LocalScope.maybe_get = probing_maybe_get
+    LocalScope.maybe_get = local_maybe_get
     HostFunction.global_scope_origin = checked_global_scope_origin
     HostFunction.import_from_module = checked_import_from_module
     HostFunction._helion_mlir_checked_lookups = True

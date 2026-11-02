@@ -8,6 +8,7 @@ import subprocess
 import sys
 import textwrap
 from typing import TYPE_CHECKING
+from unittest import mock
 
 import helion
 import helion.language as hl
@@ -386,3 +387,69 @@ def test_read_of_a_global_of_an_unloaded_module_is_refused(load) -> None:
     del sys.modules["shadow_unregistered_read"]
     with pytest.raises(UnsupportedOperationError, match="module global glob"):
         _kernel_of(module.read_global)(torch.randn(4, 8))
+
+
+def test_local_named_like_a_global_of_an_unsupported_type(load) -> None:
+    """Regression: a local named like a module global no kernel can take, e.g. a
+    ``torch.Generator``, failed with "unsupported argument type": assigning the
+    local looked up the global."""
+    module = load(
+        "shadow_generator",
+        """
+        import torch, helion, helion.language as hl
+
+        g = torch.Generator()
+
+        def local(x):
+            m, k = x.shape
+            out = torch.empty_like(x)
+            for tm, tn in hl.tile([m, k]):
+                g = x[tm, tn] + 1.0
+                out[tm, tn] = g
+            return out
+        """,
+    )
+    x = torch.randn(4, 8)
+    assert torch.equal(_kernel_of(module.local)(x), x + 1.0)
+
+
+def test_global_statement_assigned_on_the_device_is_refused(load) -> None:
+    """A ``global`` is no local: assigning it in a device loop stays refused (it ran
+    with the module's value unchanged while every lookup skipped globals)."""
+    module = load(
+        "global_statement",
+        """
+        import torch, helion, helion.language as hl
+
+        g = 1.0
+
+        def kernel(x):
+            global g
+            m, k = x.shape
+            out = torch.empty_like(x)
+            for tm, tn in hl.tile([m, k]):
+                g = x[tm, tn] + 1.0
+                out[tm, tn] = g
+            return out
+        """,
+    )
+    with pytest.raises(Exception, match="(?i)host variable|global"):
+        _kernel_of(module.kernel)(torch.randn(4, 8))
+    assert module.g == 1.0
+
+
+def test_other_backends_keep_helions_lookup() -> None:
+    """Only this backend's kernels skip globals: importing it changes nothing for
+    Helion on Triton."""
+    from helion._compiler.compile_environment import CompileEnvironment
+    from helion._compiler.type_propagation import GlobalScope
+    from helion._compiler.type_propagation import LocalScope
+
+    parent = mock.Mock(spec=GlobalScope)
+    parent.get.return_value = "from the global scope"
+    scope = LocalScope(parent=parent)
+    backend = mock.Mock()
+    with mock.patch.object(
+        CompileEnvironment, "current", return_value=mock.Mock(backend=backend)
+    ):
+        assert scope.maybe_get("g") == "from the global scope"
