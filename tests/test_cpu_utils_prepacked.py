@@ -128,9 +128,11 @@ def test_small_m_vnni_panel(monkeypatch: pytest.MonkeyPatch) -> None:
     assert mm._prepacked_tile_m(128, 4096 // panel, panel) == 64
     # The N = 2048 layer keeps 64-column panels (a tie: the narrower one).
     assert mm.vnni_panel(128, 2048) == 64
-    # From 256 rows on, the rule for shared rows is unchanged.
-    assert mm.vnni_panel(256, 4096) == 64
+    # From 256 rows on, panels that fit keep the rule for shared rows.
     assert mm.vnni_panel(1024, 8192) == 256
+    # None fits: a quarter fewer operand bytes per tile than 64 columns, the
+    # widest without K (with K: test_vnni_panel_without_a_fitting_panel).
+    assert mm.vnni_panel(256, 4096) == 256
 
 
 def test_linear_panel_override() -> None:
@@ -393,8 +395,50 @@ def test_vnni_panel_prefers_one_k_chunk(monkeypatch: pytest.MonkeyPatch) -> None
     # No panel runs K = 8192 as one chunk, and without K: the widest that fits.
     assert mm.vnni_panel(1024, 8192, 8192) == 256
     assert mm.vnni_panel(16384, 4096) == 256
-    # 128 columns would leave threads idle: 256 rows x 1024 columns.
+    # No panel fits, and 128 columns would save no operand bytes, whatever
+    # that is worth here: 256 rows x 1024 columns (43 us, 42 at 128 columns).
     assert mm.vnni_panel(256, 1024, 4096) == 64
+
+
+@pytest.mark.parametrize(
+    "threads,m,n,k,panel",
+    [
+        # A quarter fewer operand bytes, nothing added: L3/3's layers and others.
+        (64, 1024, 1024, 1024, 256),
+        (64, 1000, 1000, 1000, 256),
+        (64, 1024, 700, 700, 256),
+        (56, 1024, 1024, 1024, 256),
+        (8, 256, 512, 512, 256),
+        (2, 256, 128, 128, 128),
+        (32, 1024, 512, 8192, 128),
+        # The fewest K chunks first (L3/3's first layer).
+        (64, 1024, 1024, 8192, 128),
+        (64, 256, 4096, 4096, 128),
+        (64, 384, 4096, 4096, 128),
+        # Removes 64 columns' rest rows, whatever it saves (L2/98 at 56 threads).
+        (64, 768, 768, 768, 128),
+        (64, 448, 1024, 1024, 128),
+        (56, 1024, 512, 8192, 256),
+        # 256 columns would add padding or rest rows: 128.
+        (64, 320, 4096, 1024, 128),
+        # K in chunks where 64 columns run one, with even tiles: 64 columns stay.
+        (64, 288, 4096, 4096, 64),
+        # Uneven tiles at 64 columns: chunks pay.
+        (3, 288, 256, 4096, 256),
+        # Less than a quarter saved: 64 columns stay, though some would gain
+        # (128 threads, 1024x1024x1024: 98 us, 83 at 128 columns).
+        (64, 1024, 512, 8192, 64),
+        (64, 512, 1024, 1024, 64),
+        (64, 300, 1000, 1000, 64),
+        (3, 256, 256, 256, 64),
+        (128, 1024, 1024, 1024, 64),
+    ],
+)
+def test_vnni_panel_without_a_fitting_panel(
+    monkeypatch: pytest.MonkeyPatch, threads: int, m: int, n: int, k: int, panel: int
+) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", str(threads))
+    assert mm.vnni_panel(m, n, k) == panel
 
 
 @pytest.mark.parametrize(

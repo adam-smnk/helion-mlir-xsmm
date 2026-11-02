@@ -1042,6 +1042,58 @@ def _one_tile_per_thread_panel(n: int, threads: int) -> int | None:
     return None
 
 
+def _fallback_panel(
+    m: int, n: int, k: int | None, threads: int, cost: Callable[[int], int]
+) -> int:
+    """:func:`vnni_panel` where no panel gives every thread tiles of
+    ``_MIN_SHARED_ROWS`` rows: ``_VNNI_PANEL``, unless a wider panel saves a
+    quarter of its operand bytes per tile (``cost``) or removes its rest rows.
+
+    A wider panel must not add rest rows (a second kernel after the bulk, each
+    with few tiles) or padding (a strided view for the next layer's input):
+    those cost more than operand bytes save. Both inferred as the mechanism
+    from forced panels, us per call on 64 threads: 320x4096x1024 63 at 64
+    columns, 138 at 256 with rest rows; 896x896 layers 78, 136 with padding.
+    Among the rest: no rest rows, the fewest K chunks (256x4096x4096: 128 columns
+    in one chunk 138-142, 256 in chunks 212), the fewest bytes, the widest
+    (L3/3's hidden layers: 64 x 256 tiles 80-84, 128 x 128 89-95, 256 x 64 110-
+    118).
+    Nor does K in chunks pay when 64 columns run it as one and already give the
+    threads even tiles (288x4096x4096: 213 at 64 columns, 276 at 256 in chunks);
+    with uneven tiles it can (3 threads, 288x256x4096: 0.68x).
+    """
+
+    def rest(panel: int) -> bool:
+        return m % _prepacked_tile_m(m, -(-n // panel), panel) != 0
+
+    def chunks(panel: int) -> int:
+        if k is None:
+            return 1
+        pairs = max(k // 2 // BLOCK_K * BLOCK_K, BLOCK_K)
+        tile_m = _prepacked_tile_m(m, -(-n // panel), panel)
+        return -(-pairs // _prepacked_k_chunk(pairs, panel, tile_m))
+
+    narrow_rest, narrow_pad = rest(_VNNI_PANEL), n % _VNNI_PANEL != 0
+    wider = [
+        panel
+        for panel in (256, 128)
+        if (narrow_rest or not rest(panel))
+        and (narrow_pad or not n % panel)
+        and (
+            (narrow_rest and not rest(panel))
+            or 4 * cost(panel) <= 3 * cost(_VNNI_PANEL)
+        )
+    ]
+    if not wider:
+        return _VNNI_PANEL
+    best = min(wider, key=lambda p: (rest(p), chunks(p), cost(p), -p))
+    tile_m = _prepacked_tile_m(m, -(-n // _VNNI_PANEL), _VNNI_PANEL)
+    even_tiles = not (-(-n // _VNNI_PANEL) * -(-m // tile_m)) % threads
+    if even_tiles and chunks(_VNNI_PANEL) == 1 < chunks(best):
+        return _VNNI_PANEL
+    return best
+
+
 def vnni_panel(m: int, n: int, k: int | None = None) -> int:
     """Columns of :func:`pack_b_vnni_t` panels for ``m`` rows: the widest (up to
     256) that still gives every thread a tile of at least ``_MIN_SHARED_ROWS``
@@ -1050,8 +1102,21 @@ def vnni_panel(m: int, n: int, k: int | None = None) -> int:
     those whose K runs as one chunk (:func:`_single_k_chunk`) comes first
     (16384x4096x4096: 128 columns in one chunk 8.8-9.0 ms, 256 in chunks 9.8).
     Few rows with a large K and at least 1.5 MiB of A: one tile per thread
-    (:func:`_one_tile_per_thread_panel`)."""
+    (:func:`_one_tile_per_thread_panel`). Where no panel gives every thread
+    tiles of ``_MIN_SHARED_ROWS`` rows: 64 columns, unless a wider panel that
+    adds no rest rows and no padding saves a quarter of the operand bytes per
+    tile, or removes 64 columns' rest rows."""
     threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+
+    # Each tile reads all K of its rows of A and of its panel, so its operand
+    # bytes grow with rows + columns; rows count twice, as A is read by every
+    # tile of its rows and is usually the previous layer's output, still in
+    # other cores' caches. 128x4096x4096 (MLP layers): 64-row x 128-column tiles
+    # 133 us per layer end to end, 128 x 64 (the rule for few rows) 145 us,
+    # 32 x 256 156 us.
+    def cost(panel: int) -> int:
+        return 2 * _prepacked_tile_m(m, -(-n // panel), panel) + panel
+
     if m < _MIN_SHARED_ROWS:
         # 2 bytes per element: these panels are bf16 VNNI by construction.
         if (
@@ -1063,20 +1128,14 @@ def vnni_panel(m: int, n: int, k: int | None = None) -> int:
             if panel is not None:
                 return panel
         # One row tile does not give every thread a tile, so the threads split
-        # the rows too. Each tile reads all K of its rows of A and of its panel,
-        # so its operand bytes grow with rows + columns; rows count twice, as A
-        # is read by every tile of its rows and is usually the previous layer's
-        # output, still in other cores' caches. 128x4096x4096 (MLP layers):
-        # 64-row x 128-column tiles 133 us per layer end to end, 128 x 64 (the
-        # rule below) 145 us, 32 x 256 156 us.
-        def cost(panel: int) -> int:
-            return 2 * _prepacked_tile_m(m, -(-n // panel), panel) + panel
-
+        # the rows too.
         return min((_VNNI_PANEL, 128, 256), key=cost)
     row_tiles = max(1, m // _MIN_SHARED_ROWS)
     fits = [panel for panel in (256, 128) if -(-n // panel) * row_tiles >= threads]
     single = [panel for panel in fits if k is not None and _single_k_chunk(panel, k)]
-    return (single or fits or [_VNNI_PANEL])[0]
+    if single or fits:
+        return (single or fits)[0]
+    return _fallback_panel(m, n, k, threads, cost)
 
 
 def whole_row_tiles(
