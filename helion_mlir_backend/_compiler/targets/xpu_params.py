@@ -684,7 +684,11 @@ def _elementwise_shape(loop: ir.Operation) -> ElementwiseShape | None:
     ``tensor.parallel_insert_slice`` ops store and the slices of that shape it
     loads (``None`` if it stores nothing)."""
     ops = _walk(loop)
-    stored = [op.operands[0] for op in ops if op.name == "tensor.parallel_insert_slice"]
+    stored = [
+        _stored_tile(op.operands[0])
+        for op in ops
+        if op.name == "tensor.parallel_insert_slice"
+    ]
     shapes = {tuple(ir.ShapedType(value.type).shape) for value in stored}
     if not shapes:
         return None
@@ -694,7 +698,7 @@ def _elementwise_shape(loop: ir.Operation) -> ElementwiseShape | None:
     loaded = [
         op.results[0]
         for op in ops
-        if op.name == "tensor.extract_slice"
+        if op.name in ("tensor.extract_slice", "vector.transfer_read")
         and tuple(ir.ShapedType(op.results[0].type).shape) == wg_tile
     ]
     return ElementwiseShape(
@@ -702,6 +706,14 @@ def _elementwise_shape(loop: ir.Operation) -> ElementwiseShape | None:
         tuple(sorted({_bit_width(value) for value in loaded})),
         tuple(sorted({_bit_width(value) for value in stored})),
     )
+
+
+def _stored_tile(value: ir.Value) -> ir.Value:
+    """What a grid loop stores as ``value``: for a partial tile, a region of the
+    output written by an out-of-bounds transfer, the transfer's vector."""
+    if isinstance(value, ir.OpResult) and value.owner.name == "vector.transfer_write":
+        return value.owner.operands[0]
+    return value
 
 
 def _bit_width(value: ir.Value) -> int:
@@ -741,6 +753,12 @@ def _source_shape(value: ir.Value) -> list[int] | None:
     rank-reducing slice drops (e.g. the batch dim of a tile of one batch)."""
     sliced = False
     kept: list[int] | None = None
+    # A partial tile: an out-of-bounds read of the tensor, written into a tile.
+    if isinstance(value, ir.OpResult) and value.owner.name == "vector.transfer_write":
+        read = value.owner.operands[0]
+        if isinstance(read, ir.OpResult) and read.owner.name == "vector.transfer_read":
+            shape = ir.ShapedType(read.owner.operands[0].type).shape
+            return list(shape[len(shape) - ir.ShapedType(read.type).rank :])
     while isinstance(value, ir.OpResult) and value.owner.name == "tensor.extract_slice":
         dims = _kept_dims(value.owner.opview)
         kept = dims if kept is None else [dims[dim] for dim in kept]
@@ -783,7 +801,11 @@ def _gemm_shape(op: ir.Operation, maps: list[ir.AffineMap]) -> GemmShape | None:
             for dim, size in zip(dims, shape, strict=True)
         }
         if {m, n, k} <= global_sizes.keys():
-            mnk = (global_sizes[m], global_sizes[n], global_sizes[k])
+            # A partial tile is a whole tile on the XPU: parameters of the shape
+            # rounded up to whole tiles, which is what the kernel computes.
+            mnk = tuple(
+                -(-global_sizes[dim] // sizes[dim]) * sizes[dim] for dim in (m, n, k)
+            )
     return GemmShape(
         mnk=mnk,
         wg_tile=(sizes[m], sizes[n]),

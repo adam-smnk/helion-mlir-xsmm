@@ -23,8 +23,7 @@ Matched exactly: a ``vector.transfer_write`` without a mask of a rank-1 vector
 derived from a ``vector.multi_reduction`` of the innermost dim of a 2D vector
 (through elementwise ``arith``/``math`` ops and the results of ``scf.for`` loops
 that carry it), into a rank-1, static, contiguous memref (identity layout, or
-strided with stride 1: a rank-3+ kernel's row of a collapsed unit tile), in
-bounds, with the identity permutation map, in a ``gpu.func``. Everything else
+strided with stride 1: a rank-3+ kernel's row of a collapsed unit tile), with the identity permutation map, in a ``gpu.func``. Everything else
 is left alone.
 """
 
@@ -97,8 +96,7 @@ def matches(op: ir.Operation) -> bool:
         return False
     if not _contiguous(buffer):
         return False
-    in_bounds = op.attributes.get("in_bounds")
-    if in_bounds is None or [ir.BoolAttr(b).value for b in in_bounds] != [True]:
+    if op.attributes.get("in_bounds") is None:
         return False
     permutation = ir.AffineMapAttr(op.attributes["permutation_map"]).value
     return permutation == identity and _row_result(value)
@@ -109,6 +107,7 @@ def _rewrite(op: ir.Operation) -> None:
     rows = ir.VectorType(value.type)
     buffer = ir.MemRefType(base.type)
     column = ir.VectorType.get([rows.shape[0], 1], rows.element_type)
+    in_rows = ir.BoolAttr(op.attributes["in_bounds"][0]).value
     layout = None
     if isinstance(buffer.layout, ir.StridedLayoutAttr):
         layout = ir.StridedLayoutAttr.get(buffer.layout.offset, [1, 1])
@@ -130,7 +129,7 @@ def _rewrite(op: ir.Operation) -> None:
             target,
             [index, zero],
             ir.AffineMap.get_identity(2),
-            [True, True],
+            [in_rows, True],
         )
     op.erase()
 

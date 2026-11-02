@@ -51,6 +51,7 @@ from ..mlir.support.debug import DebugOptions
 from ..mlir.support.debug import xpu_stop_at
 from ..mlir.support.errors import UnsupportedOperationError
 from ..mlir.support.errors import UnsupportedTargetError
+from ..mlir_transforms import partial_tiles
 from ..mlir_transforms import xegpu_layouts
 from ..mlir_transforms.keep_row_dims import keep_row_dims
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
@@ -73,6 +74,7 @@ from ..mlir_transforms.xevm_unit_clamps import unit_clamps_without_sat
 from ..mlir_transforms.xpu_math_approx import approximate_math
 from ..mlir_transforms.xpu_math_approx import fold_extended_splats
 from .base import MLIRTarget
+from .xpu_checks import check_partial_gemms
 from .xpu_checks import check_xegpu_capabilities
 from .xpu_params import XPU_CONFIG_KEYS
 from .xpu_params import KernelParams
@@ -151,6 +153,25 @@ def _translated(exc: Exception, stage: str) -> Exception:
             ),
             alternatives=[_CPU],
         )
+    if "2D block surface pitch must be" in message:
+        return UnsupportedOperationError(
+            "a tensor's rows as a surface of 2D block accesses",
+            reason="its row size in bytes is no multiple of 16, the pitch they need",
+            alternatives=[
+                "row sizes that are a multiple of 16 bytes",
+                "one-row tiles of an elementwise kernel (block size 1 on rows)",
+                _CPU,
+            ],
+        )
+    if "failed to legalize operation 'xegpu.load'" in message:
+        return UnsupportedOperationError(
+            "a read as one of XeGPU's gathers",
+            reason=(
+                "the gather has no legal lowering here; a 1D tensor read per tile at "
+                "a partial tile is such a form"
+            ),
+            alternatives=["block sizes that divide the sizes they tile", _CPU],
+        )
     exc.add_note(f"Helion MLIR backend: failed in the XPU stage '{stage}'")
     return exc
 
@@ -176,6 +197,7 @@ def _stages(
         # Undoes lighthouse's maxnumf reductions: see row_maxima.
         ("nan-maxima", _NanMaxima(kernels)),
         ("bufferized", xegpu.bufferize_schedule(entry)),
+        ("partial-tiles", _FoldTileViews()),
         ("host-legalized", xpu_transforms.legalize_host_ops()),
         ("grid-mappings", _StripGridMappings()),
         # Lighthouse's outline_gpu_func and annotate_layouts schedules, per kernel.
@@ -380,6 +402,15 @@ def _compile_ordered(
             stacklevel=2,
         )
         return {}
+
+
+class _FoldTileViews(Stage):
+    """Out-of-bounds transfers of partial tiles on the true surface:
+    :func:`partial_tiles.fold_tile_views`."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        partial_tiles.fold_tile_views(module)
+        return module
 
 
 class _StripGridMappings(Stage):
@@ -734,6 +765,10 @@ class XpuTarget(MLIRTarget):
         dump = DebugOptions.from_env().dump_stages
         # Loads lighthouse's dialects, which building the schedules needs.
         BackendDriver(module, entry, result_to_args=False, benchmark=False)
+        if partial_tiles.to_transfers(module):
+            PassManager.parse(
+                "builtin.module(canonicalize,cse)", ir.Context.current
+            ).run(module.operation)
         prepare = TransformStage(xpu_transforms.prepare_for_xegpu(), ir.Context.current)
         _apply_stage("prepare", prepare, module, dump)
         params = take_params(module)
@@ -742,6 +777,15 @@ class XpuTarget(MLIRTarget):
             entry,
             [kernel.derives_layouts for kernel in params],
             KernelParams().derives_layouts,
+        )
+        check_partial_gemms(
+            loops,
+            [
+                (
+                    params[index] if index < len(params) else KernelParams()
+                ).derives_layouts
+                for index in range(len(loops))
+            ],
         )
         shapes = [kernel_shape(loop) for loop in loops]
         check_params(params, shapes)

@@ -477,9 +477,11 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> emit.Result
         step = bounds[level].step
         # Whole tiles first, as if no tile were partial, so that a running value
         # is updated in place; only the partial tile keeps elements of the old one.
+        # Not on the XPU: running values are in registers there, and a loop of one
+        # tile gets a constant mask, on which ocloc crashes (IGC 2.41).
         whole_end = (
             _whole_tiles_end(begin, end, step)
-            if _tile_dims(ctx, block_ids[level], running)
+            if _tile_dims(ctx, block_ids[level], running) and not _on_xpu(ctx)
             else end
         )
         if whole_end is not end:
@@ -841,8 +843,9 @@ def _keep_past_tile(
     if valid is None:
         return yields
     dims = _tile_dims(ctx, block_id, nodes) or [[] for _ in nodes]
+    keep_past = emit.keep_past_by_element if _on_xpu(ctx) else emit.keep_past
     return [
-        emit.keep_past(value, old, dict.fromkeys(tile_dims, ctx.as_index(valid)))
+        keep_past(value, old, dict.fromkeys(tile_dims, ctx.as_index(valid)))
         if tile_dims
         else value
         for value, old, tile_dims in zip(yields, carried, dims, strict=True)

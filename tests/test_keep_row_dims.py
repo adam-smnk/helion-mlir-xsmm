@@ -246,12 +246,6 @@ def test_contiguous_strided_buffer_is_stored_as_a_column() -> None:
       vector.transfer_write %s, %out[%i], %m {{in_bounds = [true]}} : vector<64xf32>, memref<128xf32>""",
             "%out: memref<128xf32>, %m: vector<64xi1>",
         ),
-        # Not in bounds.
-        (
-            f"""{_SUM}
-      vector.transfer_write %s, %out[%i] {{in_bounds = [false]}} : vector<64xf32>, memref<128xf32>""",
-            "%out: memref<128xf32>",
-        ),
         # A strided buffer.
         (
             f"""{_SUM}
@@ -277,7 +271,6 @@ def test_contiguous_strided_buffer_is_stored_as_a_column() -> None:
         "not-reduced",
         "column-reduction",
         "masked",
-        "out-of-bounds",
         "strided",
         "dynamic",
         "rank-2",
@@ -287,6 +280,15 @@ def test_other_stores_are_untouched(body: str, args: str) -> None:
     count, before, after = _rewrite(_gpu_module(body, args))
     assert count == 0
     assert after == before
+
+
+def test_out_of_bounds_stays_out_of_bounds() -> None:
+    """A partial tile's row results past the output's end are not stored."""
+    body = f"""{_SUM}
+    vector.transfer_write %s, %out[%i] {{in_bounds = [false]}} : vector<64xf32>, memref<125xf32>"""
+    count, _, after = _rewrite(_gpu_module(body, "%out: memref<125xf32>"))
+    assert count == 1
+    assert "in_bounds = [false, true]" in after
 
 
 def test_host_functions_are_untouched() -> None:

@@ -4,8 +4,9 @@ naming the gap, not a transform failure deep in lighthouse.
 
 The gates are conservative, by IR property (not by kernel):
 
-- static shapes, and full static tiles in every grid loop (no masking: block
-  sizes divide the sizes they tile);
+- static shapes, and computation on static tiles in every grid loop: a partial
+  tile is a full tile with out-of-bounds accesses (``partial_tiles``), on rows
+  of a multiple of 16 bytes if it is 2D;
 - 1D or 2D tiles: the checks run after ``prepare`` folded unit tile dims away,
   so a rank-3+ tile with block size 1 on its leading (e.g. batch) dims is 2D
   here, and only tiles with more than two non-unit dims are rejected;
@@ -42,6 +43,7 @@ from .xpu_params import kernel_shape
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+_PITCH_ALIGNMENT = 16
 _DPAS_OPERANDS = frozenset({"f16", "bf16"})
 _DPAS_ACCUMULATOR = "f32"
 _CPU = "target='cpu' (CPU tensors)"
@@ -240,22 +242,126 @@ def _check_static_arguments(func: ir.Operation) -> None:
         )
 
 
+_RUNTIME_SIZED_REGION_OPS = frozenset(
+    {
+        "tensor.extract_slice",
+        "tensor.parallel_insert_slice",
+        "tensor.cast",
+        "tensor.dim",
+        "vector.transfer_read",
+        "vector.transfer_write",
+        "scf.for",
+        "scf.yield",
+    }
+)
+"""Ops that may hold runtime-sized tensors in a grid loop: a partial tile's region
+of an output, written and read by out-of-bounds transfers
+(:mod:`~..mlir_transforms.partial_tiles`). All computation is on static tiles."""
+
+
 def _check_full_tiles(loop: ir.Operation) -> None:
+    """Every computation in a grid loop is on static tiles. A partial tile needs
+    its accesses as out-of-bounds transfers (``partial_tiles.to_transfers``):
+    other pads, runtime-sized math or a runtime-sized tile are refused."""
     for op in _walk(loop):
-        values = [*op.operands, *op.results]
-        if op.name == "tensor.pad" or any(
-            isinstance(value.type, ir.ShapedType)
-            and not ir.ShapedType(value.type).has_static_shape
-            for value in values
+        if op.name == "tensor.pad" or (
+            op.name not in _RUNTIME_SIZED_REGION_OPS
+            and any(
+                isinstance(value.type, ir.ShapedType)
+                and not ir.ShapedType(value.type).has_static_shape
+                for value in [*op.operands, *op.results]
+            )
         ):
             raise UnsupportedOperationError(
                 "partial tiles on XPU",
                 reason=(
-                    f"'{op.name}' works on a partial or runtime-sized tile; the "
-                    "XeGPU pipeline has no masked loads and stores, so every tile "
-                    "must be full and static"
+                    f"'{op.name}' works on a partial or runtime-sized tile that "
+                    "the XeGPU pipeline cannot express as out-of-bounds block "
+                    "accesses of a full tile"
                 ),
                 alternatives=["block sizes that divide the sizes they tile", _CPU],
+            )
+    _check_partial_pitches(loop)
+
+
+def check_partial_gemms(loops: Sequence[ir.Operation], derived: Sequence[bool]) -> None:
+    """A GEMM with partial tiles needs layouts derived from the IR: lighthouse's
+    parameter selection, used by its annotation, takes tiles that divide the
+    matrix."""
+    for loop, from_ir in zip(loops, derived, strict=True):
+        if from_ir or not isinstance(kernel_shape(loop), GemmShape):
+            continue
+        for op in _walk(loop):
+            in_bounds = (
+                op.attributes.get("in_bounds")
+                if op.name in ("vector.transfer_read", "vector.transfer_write")
+                else None
+            )
+            if in_bounds and not all(ir.BoolAttr(flag).value for flag in in_bounds):
+                raise UnsupportedOperationError(
+                    "a GEMM with partial tiles on lighthouse's parameter selection",
+                    reason=(
+                        "lighthouse's selection takes workgroup and K tiles that "
+                        "divide the matrix"
+                    ),
+                    alternatives=[
+                        'xegpu_layouts="ir" (the default)',
+                        "block sizes that divide the sizes they tile",
+                    ],
+                )
+
+
+def _surface_columns(value: ir.Value) -> int | None:
+    """The row size of the surface ``value`` is a region of: through slices and the
+    values loops carry, to the first value that is neither. ``None``: runtime-sized
+    there, refused elsewhere."""
+    while True:
+        owner = value.owner
+        if isinstance(owner, ir.Block):
+            loop = owner.owner
+            carried = ir.BlockArgument(value).arg_number - 1
+            if loop.name != "scf.for" or carried < 0:
+                break
+            value = loop.operands[3 + carried]
+        elif owner.name == "tensor.extract_slice":
+            value = owner.operands[0]
+        else:
+            break
+    columns = ir.ShapedType(value.type).shape[-1]
+    return None if columns == ir.ShapedType.get_dynamic_size() else columns
+
+
+def _check_partial_pitches(loop: ir.Operation) -> None:
+    """A partial tile in 2D is a block access running off its surface, and a
+    surface's pitch must be a multiple of 16 bytes: the B50 rounds any other pitch
+    up, silently, so rows come out wrong (upstream's check also refuses it, deep
+    in the lowering). One-row tiles use gathers and scatters, on any row size."""
+    for op in _walk(loop):
+        if op.name not in ("vector.transfer_read", "vector.transfer_write"):
+            continue
+        read = op.name == "vector.transfer_read"
+        vector_type = ir.ShapedType(op.results[0].type if read else op.operands[0].type)
+        flags = [ir.BoolAttr(flag).value for flag in op.attributes["in_bounds"]]
+        if all(flags) or vector_type.rank < 2:
+            continue
+        columns = _surface_columns(op.operands[0 if read else 1])
+        if columns is None:
+            continue
+        # Narrower than a byte (i1) is stored in a byte each.
+        bytes_per_row = columns * ((vector_type.element_type.width + 7) // 8)
+        if bytes_per_row % _PITCH_ALIGNMENT != 0:
+            raise UnsupportedOperationError(
+                f"partial tiles on rows of {columns} elements on XPU",
+                reason=(
+                    f"its rows of {bytes_per_row} bytes are no multiple of "
+                    f"{_PITCH_ALIGNMENT}, the pitch 2D block accesses need; "
+                    "the hardware rounds another pitch up, with wrong rows"
+                ),
+                alternatives=[
+                    f"row sizes that are a multiple of {_PITCH_ALIGNMENT} bytes",
+                    "one-row tiles of an elementwise kernel (block size 1 on rows)",
+                    _CPU,
+                ],
             )
 
 
@@ -270,6 +376,11 @@ def _check_tile_ranks(loop: ir.Operation) -> None:
         else:
             continue
         shape = ir.ShapedType(tile.type).shape
+        # A partial tile's region of an output: its leading unit dims are not in
+        # the transfer's vector.
+        if not ir.ShapedType(tile.type).has_static_shape:
+            while len(shape) > 2 and shape[0] == 1:
+                shape = shape[1:]
         if len(shape) > 2:
             raise UnsupportedOperationError(
                 f"{len(shape)}D tiles on XPU",

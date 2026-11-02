@@ -270,6 +270,37 @@ def keep_past(value: ir.Value, old: ir.Value, bounds: dict[int, ir.Value]) -> ir
     return insert_slice(extract_slice(value, offsets, extents), old, offsets, extents)
 
 
+def keep_past_by_element(
+    value: ir.Value, old: ir.Value, bounds: dict[int, ir.Value]
+) -> ir.Value:
+    """:func:`keep_past` for a tile of static shape: a slice of a runtime size is what
+    the XPU lowering reads as an access running off its surface, and doesn't keep
+    ``old`` in a local value."""
+    value_type = ir.RankedTensorType(value.type)
+    shape, element_type = list(value_type.shape), value_type.element_type
+    identity = ir.AffineMapAttr.get(ir.AffineMap.get_identity(len(shape)))
+    parallel = ir.Attribute.parse("#linalg.iterator_type<parallel>")
+    generic = linalg_d.GenericOp(
+        [value_type],
+        [value, old],
+        [empty(sizes(value), element_type)],
+        ir.ArrayAttr.get([identity, identity, identity]),
+        ir.ArrayAttr.get([parallel] * len(shape)),
+    )
+    body = generic.regions[0].blocks.append(element_type, element_type, element_type)
+    with ir.InsertionPoint(body):
+        inside = None
+        for dim, bound in bounds.items():
+            below = arith_d.CmpIOp(
+                arith_d.CmpIPredicate.ult, linalg_d.IndexOp(dim).result, bound
+            ).result
+            inside = below if inside is None else arith_d.AndIOp(inside, below).result
+        linalg_d.YieldOp(
+            [arith_d.SelectOp(inside, body.arguments[0], body.arguments[1])]
+        )
+    return generic.result
+
+
 def mask(value: ir.Value, bounds: dict[int, ir.Value], other: float) -> ir.Value:
     """``value`` where every ``index(dim) < bounds[dim]``, else ``other``."""
     value_type = ir.RankedTensorType(value.type)

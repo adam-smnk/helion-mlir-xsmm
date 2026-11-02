@@ -1410,6 +1410,7 @@ def test_stage_dumps(monkeypatch: pytest.MonkeyPatch) -> None:
         "vectorized",
         "nan-maxima",
         "bufferized",
+        "partial-tiles",
         "host-legalized",
         "grid-mappings",
         "gpu-outlining",
@@ -1708,9 +1709,10 @@ def test_elementwise_tile_columns_must_fit_block_loads() -> None:
 
 
 @pytest.mark.isolated
-def test_partial_tiles_are_unsupported() -> None:
-    with pytest.raises(UnsupportedOperationError, match="partial tiles on XPU"):
-        lower_xpu(matmul, _gemm_args(size=1000))
+def test_partial_tiles_on_unaligned_rows_are_unsupported() -> None:
+    """Other partial tiles: ``test_xpu_partial_tiles.py``."""
+    with pytest.raises(UnsupportedOperationError, match="partial tiles on rows of"):
+        lower_xpu(matmul, _gemm_args(size=1001))
 
 
 @pytest.mark.isolated

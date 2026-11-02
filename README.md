@@ -96,7 +96,7 @@ A launch has three grid dims: a fourth leading dim with more than one tile becom
 loop in each workgroup.
 
 Kernels outside them raise `UnsupportedOperationError` before lowering (e.g. dynamic
-shapes, partial tiles, f32 matmuls, two matmuls in one grid loop, elementwise tiles of
+shapes, partial tiles on rows that are not a multiple of 16 bytes (2D), f32 matmuls, two matmuls in one grid loop, elementwise tiles of
 8 or 64-bit elements or with columns that are not a multiple of 16, rank-3 tiles with a
 leading block size above 1, reductions over a dim other than the last).
 
