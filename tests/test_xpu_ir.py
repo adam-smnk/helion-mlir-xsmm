@@ -1670,8 +1670,9 @@ def test_partial_tiles_are_unsupported() -> None:
 @pytest.mark.isolated
 def test_matmul_without_k_loop_is_unsupported() -> None:
     config = helion.Config(block_sizes=[256, 256, N])
-    with pytest.raises(UnsupportedOperationError, match="without a K loop"):
+    with pytest.raises(UnsupportedOperationError, match="without a K loop") as refused:
         lower_mlir(matmul, _gemm_args(), config=config, target="xpu", stop_at="xevm")
+    assert "padded with zeros" in str(refused.value)
 
 
 @pytest.mark.isolated

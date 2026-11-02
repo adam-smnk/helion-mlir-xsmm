@@ -436,7 +436,11 @@ def _check_contraction(op: ir.OpView, loop: ir.Operation) -> None:
                 "the XeGPU GEMM schedule pipelines loads over a K loop; tile the "
                 "reduction dim with an inner hl.tile whose block size is below K"
             ),
-            alternatives=["a K block size below K", _CPU],
+            alternatives=[
+                "a K block size below K",
+                "K padded with zeros beyond its block size, in the model",
+                _CPU,
+            ],
         )
     operands = list(operation.operands)
     inputs = _operand_types(operation)
