@@ -16,6 +16,7 @@ import torch
 
 import helion_mlir_backend  # noqa: F401
 from helion_mlir_backend._compiler import native
+from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -337,3 +338,51 @@ def test_epilogue_global_of_a_retaken_module_name_raises_under_O(
     )
     assert done.returncode == 0, done.stderr
     assert "raised" in done.stdout and "another module" in done.stdout, done.stdout
+
+
+LOCAL_NAMED_LIKE_A_GLOBAL = """
+import torch, helion, helion.language as hl
+
+n = 99
+glob = 3.0
+
+def local(x):
+    n, k = x.shape
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile([n, k]):
+        out[tm, tn] = x[tm, tn] + 1.0
+    return out
+
+def read_global(x):
+    m, k = x.shape
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile([m, k]):
+        out[tm, tn] = x[tm, tn] * glob
+    return out
+"""
+
+
+def _kernel_of(fn: object) -> helion.Kernel:
+    return helion.kernel(
+        fn,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[2, 8]),
+    )
+
+
+def test_local_named_like_a_global_of_an_unloaded_module(load) -> None:
+    """Regression: a local's assignment looks its name up, only to compare types, and
+    that lookup was refused as a read of a module global ("module global n") when
+    the kernel's module isn't in ``sys.modules``."""
+    module = load("shadow_unregistered", LOCAL_NAMED_LIKE_A_GLOBAL)
+    del sys.modules["shadow_unregistered"]
+    x = torch.randn(4, 8)
+    assert torch.equal(_kernel_of(module.local)(x), x + 1.0)
+
+
+def test_read_of_a_global_of_an_unloaded_module_is_refused(load) -> None:
+    module = load("shadow_unregistered_read", LOCAL_NAMED_LIKE_A_GLOBAL)
+    del sys.modules["shadow_unregistered_read"]
+    with pytest.raises(UnsupportedOperationError, match="module global glob"):
+        _kernel_of(module.read_global)(torch.randn(4, 8))
