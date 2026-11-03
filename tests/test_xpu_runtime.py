@@ -2234,13 +2234,14 @@ def test_callers_view_sees_the_write() -> None:
     [
         ("U2_range_read_then_store", "two kernel calls"),
         ("U5_dynamic_while_read_then_store", "bufferization"),
-        ("U6_range_second_phase", "XPU"),
+        ("U6_range_second_phase", "a tensor read after the kernel wrote"),
     ],
 )
 def test_next_iteration_reads_are_refused(name: str, refusal: str) -> None:
     """Regression: a nested loop's next iteration reads what this one stored, so the
-    copy was stale: U2's every element wrong on the B50, silently. U5 and U6 don't
-    reach the read order on XPU: they fail to lower, with no result to be wrong."""
+    copy was stale: U2's every element wrong on the B50, silently. U5 doesn't reach
+    the read order on XPU: it fails to lower, with no result to be wrong. U6 is refused
+    for the read order itself."""
     from tests.view_read_cases import CASES
 
     case = CASES[name]

@@ -104,13 +104,13 @@ Other kernels and other builds are not proven: ``agent-tools/igc_binary_check.py
 helion-mlir-dev checks a kernel's binaries, and ``igc_vectorizer="off"`` is the escape
 hatch."""
 LAYOUTS = "xegpu_layouts"
-"""Per GPU kernel, who decides its XeGPU layouts: ``"ir"`` (derived from
+"""Per GPU kernel, who decides its XeGPU layouts: ``"ir"``, the default (derived from
 the kernel's IR by :mod:`~..mlir_transforms.xegpu_layouts`, the other keys being hints it
-drops with a log line if they don't fit), or ``"lighthouse"``, the default (lighthouse's
-annotation, by kernel class, the other keys checked strictly). ``HELION_MLIR_XPU_LAYOUTS`` changes the
+drops with a log line if they don't fit), or ``"lighthouse"`` (lighthouse's annotation, by
+kernel class, the other keys checked strictly). ``HELION_MLIR_XPU_LAYOUTS`` changes the
 default: an escape hatch. Not searched by the autotuner."""
 LAYOUT_VALUES = {"lighthouse": 0, "ir": 1}
-DEFAULT_LAYOUTS = "lighthouse"
+DEFAULT_LAYOUTS = "ir"
 """What a kernel without an ``xegpu_layouts`` entry takes."""
 DEFAULT_LAYOUTS_ATTR = "helion.xegpu_default_layouts"
 """Module attribute: the default ``HELION_MLIR_XPU_LAYOUTS`` asks for, so that

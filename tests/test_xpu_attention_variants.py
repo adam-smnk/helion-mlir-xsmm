@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import os
+import re
+from unittest import mock
+
 import helion.language as hl
 import pytest
 import torch
@@ -16,6 +20,7 @@ from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 av = load_example("xpu/attention_variants.py")
 
 BF16 = torch.bfloat16
+_LIGHTHOUSE = {"HELION_MLIR_XPU_LAYOUTS": "lighthouse"}
 _SHAPE = (2, 4, 512, 64)
 _MASKS = [
     "causal",
@@ -69,14 +74,19 @@ def test_head_dim_128_is_a_clear_error() -> None:
     """Lighthouse's attention layout is written for a head dim of 64 (the blocker of
     Gemma 2's D = 128)."""
     args = _fake_args("gemma2", (2, 4, 512, 128))
-    with pytest.raises(UnsupportedOperationError, match="head dim 128"):
+    with (
+        mock.patch.dict(os.environ, _LIGHTHOUSE),
+        pytest.raises(UnsupportedOperationError, match="head dim 128"),
+    ):
         lower_xpu(av.make_kernel("gemma2"), args)
+    assert "xegpu.dpas" in lower_xpu(av.make_kernel("gemma2"), args)
 
 
 @pytest.mark.isolated
 def test_later_kv_loops_take_the_first_ones_layouts() -> None:
     """Every K/V loop gets the layouts of lighthouse's annotation of the first."""
-    text = lower_xpu(av.make_kernel("causal_split"), _fake_args("causal_split"))
+    with mock.patch.dict(os.environ, _LIGHTHOUSE):
+        text = lower_xpu(av.make_kernel("causal_split"), _fake_args("causal_split"))
     bodies = [line.strip() for line in text.splitlines()]
     dpas = [line for line in bodies if "xegpu.dpas" in line]
     assert all("layout_a = " in line and "layout_cd = " in line for line in dpas)
@@ -90,11 +100,22 @@ def test_later_kv_loops_take_the_first_ones_layouts() -> None:
 
 @pytest.mark.isolated
 def test_kv_loops_of_different_tiles_are_refused() -> None:
-    """Negative: lighthouse's annotation has one K/V tile for a kernel."""
+    """Negative: lighthouse's annotation has one K/V tile for a kernel. The default lays
+    out each loop by its own tiles."""
     args = _fake_args("causal_split")
     kernel = av.make_kernel("causal_split", block_sizes=[128, 1, 32, 64])
-    with pytest.raises(UnsupportedOperationError, match="different tiles"):
+    with (
+        mock.patch.dict(os.environ, _LIGHTHOUSE),
+        pytest.raises(UnsupportedOperationError, match="different tiles"),
+    ):
         lower_xpu(kernel, args)
+    text = lower_xpu(kernel, args)
+    loads = {
+        re.search(r"sg_data = \[(\d+), \d+\]", line).group(1)
+        for line in text.splitlines()
+        if "xegpu.load_nd" in line and "sg_layout = [1, 1]" in line
+    }
+    assert loads == {"32", "64"}
 
 
 @pytest.mark.isolated
@@ -164,6 +185,29 @@ def _ulp_bound(result: dict[str, object]) -> None:
 @pytest.mark.parametrize("name", _NAMES)
 def test_variant_against_float64(name: str, vectorizer: str) -> None:
     _ulp_bound(av.check(name, vectorizer=vectorizer))
+
+
+@pytest.mark.xpu_runtime
+@pytest.mark.isolated
+def test_gemma_head_dim_128_against_float64() -> None:
+    """The real blocker of lighthouse's path: Gemma 2's D = 128, under the default."""
+    _ulp_bound(av.check("gemma2", dim=128))
+
+
+@pytest.mark.xpu_runtime
+@pytest.mark.isolated
+def test_kv_loops_of_different_tiles_against_float64() -> None:
+    """Each K/V loop laid out by its own tiles, under the default."""
+    _ulp_bound(av.check("causal_split", block_sizes=[128, 1, 32, 64]))
+
+
+@pytest.mark.xpu_runtime
+@pytest.mark.isolated
+@pytest.mark.parametrize("name", ["causal_split", "document"])
+def test_variant_on_lighthouses_path(name: str) -> None:
+    """Lighthouse's annotation stays a supported option, masks and two loops included."""
+    with mock.patch.dict(os.environ, _LIGHTHOUSE):
+        _ulp_bound(av.check(name))
 
 
 @pytest.mark.xpu_runtime
