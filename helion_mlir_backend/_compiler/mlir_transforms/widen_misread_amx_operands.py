@@ -46,12 +46,15 @@ so also matched:
 VNNI operands (``... x 2``) are loaded with tile loads at the read's
 indices, so only the first applies to them.
 
-The rewrite loads an operand at the contraction, not at its read. Also matched:
-a read above the contraction of a memref written between the two, in a loop
-around the contraction too. One-shot bufferization may give two pads of one shape
-one buffer, as a read vector needs no memory once it's read: a query tile read
-above a key loop whose tile lands there would load the keys, silently (a 32x32
-query and key tile of padded columns, ``tests/test_amx_stale_reads.py``).
+The rewrite loads an operand, and the accumulator, at the contraction, not at
+its read. Also matched: a read above the contraction of a memref written between
+the two, in a loop around the contraction too, or of memory that can't be told
+apart from what is written: a root other than an allocation or a function
+argument, read or written (e.g. through an ``scf.if``). One-shot bufferization may
+give two pads of one shape one buffer, as a read vector needs no memory once it's
+read: a query tile read above a key loop whose tile lands there would load the
+keys, silently (a 32x32 query and key tile of padded columns,
+``tests/test_amx_stale_reads.py``).
 
 Left alone: contractions with only plain operand reads the rewrite reads
 right, of other element types, and every contraction on a target without
@@ -86,7 +89,15 @@ _VIEWS = (
     "memref.cast",
     "memref.reinterpret_cast",
 )
-_NOT_WRITING = (*_VIEWS, "vector.transfer_read", "memref.dim", "memref.load")
+_NOT_WRITING = (
+    *_VIEWS,
+    "vector.transfer_read",
+    "vector.load",
+    "vector.maskedload",
+    "memref.dim",
+    "memref.load",
+    "memref.extract_aligned_pointer_as_index",
+)
 
 
 def _element_type(value: ir.Value) -> ir.Type | None:
@@ -179,7 +190,15 @@ def _root(value: ir.Value) -> ir.Value:
     return value
 
 
-def _touches(op: ir.Operation, root: ir.Value) -> bool:
+def _is_distinct_root(root: ir.Value) -> bool:
+    """Whether memory of ``root`` can be told apart from that of other roots: an
+    allocation or a function argument."""
+    if isinstance(root, ir.OpResult):
+        return root.owner.name in ("memref.alloca", "memref.alloc")
+    return root.owner.owner.operation.name == "func.func"
+
+
+def _may_write(op: ir.Operation, root: ir.Value) -> bool:
     """Whether ``op`` or an op nested in it may write ``root`` or a view of it."""
     found = False
 
@@ -187,9 +206,16 @@ def _touches(op: ir.Operation, root: ir.Value) -> bool:
         nonlocal found
         if nested.name in _NOT_WRITING:
             return ir.WalkResult.ADVANCE
-        if any(_root(operand) == root for operand in nested.operands):
-            found = True
-            return ir.WalkResult.INTERRUPT
+        operands = list(nested.operands)
+        if nested.name == "memref.copy":
+            operands = operands[1:]
+        for operand in operands:
+            if not isinstance(operand.type, ir.MemRefType):
+                continue
+            written = _root(operand)
+            if written == root or not _is_distinct_root(written):
+                found = True
+                return ir.WalkResult.INTERRUPT
         return ir.WalkResult.ADVANCE
 
     op.walk(visit)
@@ -198,20 +224,26 @@ def _touches(op: ir.Operation, root: ir.Value) -> bool:
 
 def _is_stale_read(value: ir.Value, op: vector.ContractionOp) -> bool:
     """Whether the read ``value`` of ``op`` is of memory written after it, before
-    ``op`` or in a loop around it."""
+    ``op`` or in a loop around it, or of memory that can't be told apart."""
+    if not isinstance(value, ir.OpResult):
+        return False
     read = opview(value.owner)
+    if not isinstance(read, vector.TransferReadOp):
+        return False
+    root = _root(read.base)
+    if not _is_distinct_root(root):
+        return True
     block = read.operation.block
     ancestor = op.operation
     while ancestor.block != block:
         ancestor = ancestor.parent
         if ancestor is None or not isinstance(ancestor, ir.Operation):
             return False
-    root = _root(read.base)
     after = False
     for between in block.operations:
         if between == read.operation:
             after = True
-        elif after and _touches(between, root):
+        elif after and _may_write(between, root):
             return True
         if between == ancestor:
             return False
@@ -229,8 +261,8 @@ def _is_misread(op: vector.ContractionOp) -> bool:
         return False
     if not (_is_plain_read(lhs) and _is_plain_read(rhs)):
         return True
-    return (
-        _is_misread_in_k_loop(op) or _is_stale_read(lhs, op) or _is_stale_read(rhs, op)
+    return _is_misread_in_k_loop(op) or any(
+        _is_stale_read(value, op) for value in (lhs, rhs, acc)
     )
 
 
