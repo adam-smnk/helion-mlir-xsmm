@@ -8,6 +8,7 @@ vector in flight: in bounds too, as a copy between a contiguous and a strided
 memref is otherwise flattened on one side, unrolled to rows on the other, and
 rebuilt element by element in between."""
 
+from collections.abc import Callable
 import itertools
 import math
 
@@ -24,9 +25,10 @@ from .dialect import HelionTransformDialect
 from .dialect import transform_op
 from .utils import payload_ops
 
-# Rows a copy is unrolled to at most: a copy of more (narrower) rows is left
-# to split_transfers.
-_MAX_ROWS = 64
+# Rows a copy is unrolled to at most; one of more runs them in a loop nest. Left
+# as an n-D transfer, each row of an edge tile's read threads the whole vector
+# through an ``scf.if``: 128x4 is 139 MB of LLVM IR, compiled for over 20 minutes.
+_MAX_UNROLLED_ROWS = 64
 # Views of memory: a copy's read is from the memref they view.
 _VIEWS = (
     "memref.subview",
@@ -61,7 +63,6 @@ def _write_of(read: vector.TransferReadOp) -> vector.TransferWriteOp | None:
     vector_type = ir.VectorType(read.result.type)
     if (
         vector_type.rank < 2
-        or math.prod(vector_type.shape[:-1]) > _MAX_ROWS
         or not isinstance(read.base.type, ir.MemRefType)
         or read.mask is not None
         or not _is_minor_identity(read, vector_type.rank)
@@ -148,15 +149,19 @@ class _Side:
         mask_type = ir.VectorType.get([width], ir.IntegerType.get_signless(1))
         return vector.CreateMaskOp(mask_type, [lanes]).result
 
-    def row(self, position: tuple[int, ...]) -> tuple[list[ir.Value], ir.Value | None]:
-        """The indices of row ``position`` and whether it is in bounds (None:
-        it always is)."""
+    def row(
+        self, position: tuple[int | ir.Value, ...]
+    ) -> tuple[list[ir.Value], ir.Value | None]:
+        """The indices of row ``position`` (constants or loop values) and whether
+        it is in bounds (None: it always is)."""
         index = ir.IndexType.get()
         indices = list(self.indices)
         inside = None
         for dim, offset in enumerate(position):
             start = indices[self.leading + dim]
-            if offset:
+            if isinstance(offset, ir.Value):
+                start = arith.AddIOp(start, offset).result
+            elif offset:
                 start = arith.AddIOp(start, arith.ConstantOp(index, offset)).result
             indices[self.leading + dim] = start
             if self.in_bounds[dim]:
@@ -180,7 +185,8 @@ def _copy_rows(
     width = vector_type.shape[-1]
     row_type = ir.VectorType.get([width], vector_type.element_type)
     read_mask, write_mask = source.row_mask(width), dest.row_mask(width)
-    for position in itertools.product(*map(range, vector_type.shape[:-1])):
+
+    def copy_row(position: tuple[int | ir.Value, ...]) -> None:
         indices, inside = source.row(position)
         if inside is None:
             row = _read_row(source, indices, padding, row_type, read_mask)
@@ -199,6 +205,27 @@ def _copy_rows(
             with ir.InsertionPoint(guard.then_block):
                 _write_row(row, dest, indices, write_mask)
                 scf.YieldOp([])
+
+    leading = vector_type.shape[:-1]
+    if math.prod(leading) <= _MAX_UNROLLED_ROWS:
+        for position in itertools.product(*map(range, leading)):
+            copy_row(position)
+    else:
+        _in_loops(leading, copy_row)
+
+
+def _in_loops(sizes: list[int], body: Callable, outer: tuple = ()) -> None:
+    """``body(position)`` in a nest of loops over ``sizes``."""
+    if not sizes:
+        body(outer)
+        return
+    index = ir.IndexType.get()
+    zero = arith.ConstantOp(index, 0).result
+    one = arith.ConstantOp(index, 1).result
+    loop = scf.ForOp(zero, arith.ConstantOp(index, sizes[0]).result, one, [])
+    with ir.InsertionPoint(loop.body):
+        _in_loops(sizes[1:], body, (*outer, loop.induction_variable))
+        scf.YieldOp([])
 
 
 def _read_row(

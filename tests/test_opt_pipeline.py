@@ -361,6 +361,25 @@ def test_split_copies_copies_edge_tiles_by_rows() -> None:
     assert text.count("scf.if %") == 2 + 32 + 32
 
 
+def test_split_copies_copies_many_rows_in_a_loop() -> None:
+    # 128x4 of a padded tile: no unrolled row, and no n-D vector left.
+    text = _apply(
+        split_copies,
+        """
+func.func @f(%src: memref<?x?xf32>, %dst: memref<128x?xf32>) {
+  %c0 = arith.constant 0 : index
+  %z = arith.constant 0.0 : f32
+  %r = vector.transfer_read %src[%c0, %c0], %z : memref<?x?xf32>, vector<128x4xf32>
+  vector.transfer_write %r, %dst[%c0, %c0] {in_bounds = [true, false]} : vector<128x4xf32>, memref<128x?xf32>
+  return
+}
+""",
+    )
+    assert "vector<128x4xf32>" not in text
+    assert text.count("scf.for") == 2  # the in-bounds and the edge path
+    assert text.count("vector.transfer_read") == 2
+
+
 def test_unroll_split_copies_keeps_rows() -> None:
     # Unrolled, no copy is rebuilt from its rows (element by element).
     text = _apply(unroll_transfers, _apply(split_copies, PARTIAL_TILE_COPIES))
