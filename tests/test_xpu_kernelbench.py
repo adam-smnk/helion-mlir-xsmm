@@ -32,6 +32,7 @@ from tests.kernelbench_xpu import ELEMENTWISE_BLOCKS
 from tests.kernelbench_xpu import GEMM_SMALL_K
 from tests.kernelbench_xpu import GEMM_SPLIT_K
 from tests.kernelbench_xpu import LEVEL2_PROBLEMS
+from tests.kernelbench_xpu import LINEAR_BLOCKS
 from tests.kernelbench_xpu import PROBLEMS
 from tests.kernelbench_xpu import RANK3_PROBLEMS
 from tests.kernelbench_xpu import ROW_REDUCTIONS
@@ -208,9 +209,19 @@ _CHECKS = {
 @pytest.mark.parametrize("name", list(_ALL))
 def test_kernelbench_problem_lowers_for_xpu(name: str) -> None:
     problem = _ALL[name]
+    if 0 in next(iter(problem.xegpu.get("xegpu_prefetch_depths", [()])), ()):
+        # Depths of 0 lower under derived layouts only (test_xpu_layouts).
+        os.environ["HELION_MLIR_XPU_LAYOUTS"] = "ir"
     text, lowered = lower_xpu_stages(problem.kernel, _args(problem))
     _check_launch(text, problem.grid)
-    _CHECKS[problem.kind](text)
+    if problem.kind == "linear" and problem.block_sizes != LINEAR_BLOCKS:
+        # 40's and 59's own tiles: the GEMM, with the bias row of the N tile. 59's
+        # prefetches depend on the card.
+        assert "xegpu.dpas" in text
+        columns = problem.block_sizes[1]
+        assert re.search(rf"xegpu\.load [^\n]*-> vector<{columns}xbf16>", text)
+    else:
+        _CHECKS[problem.kind](text)
     # Every tile is 2D, also of rank-3+ problems (unit leading dims folded);
     # the one-row elementwise tiles are 1D (gathers and scatters: no tensor
     # descriptors).
@@ -232,9 +243,12 @@ def test_kernelbench_problem_lowers_for_xpu(name: str) -> None:
         # K read transposed, V VNNI-transformed (the DPAS B operands).
         assert "intel_sub_group_2d_block_read_transpose_32b_16r8x1c" in lowered
         assert "intel_sub_group_2d_block_read_transform_16b_32r16x2c" in lowered
-    if problem.kind == "linear":
-        # Per subgroup and K step of 32: 32x64 (16x64 for 59's 128-row tiles)
-        # in 8x16 DPAS blocks, two K steps of 16.
+    if problem.kind == "linear" and problem.block_sizes != LINEAR_BLOCKS:
+        # 40's and 59's own tiles: laid out by the rule, on DPAS.
+        assert _DPAS_CALL.search(lowered)
+        assert "intel_sub_group_2d_block_read_transpose_32b_16r8x1c" in lowered
+    elif problem.kind == "linear":
+        # Per subgroup and K step of 32: 32x64 in 8x16 DPAS blocks, two K steps of 16.
         sg_rows = problem.block_sizes[0] // 8
         assert len(_DPAS_CALL.findall(lowered)) == sg_rows // 8 * 4 * 2
         # A: the subgroup's whole 32-column tile in one 2D block read; the

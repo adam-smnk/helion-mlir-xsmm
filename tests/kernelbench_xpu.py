@@ -1030,20 +1030,35 @@ rationale and the measurements).
 - Measured 2026-10-31 on the B50 (e2e): 15.1 ms, 142.7 GB/s (torch 18.4 ms,
   117 GB/s; was 43.5 ms). Bit-identical to ``torch.matmul``.
 """
+MANY_XE_CORES = 32
+"""Xe cores from which a config takes the B70's choices. As in AI-bench's
+``backends/utils/helion_mlir_xpu_utils/device.py``."""
+DEFAULT_XE_CORES = 16
+"""Without an XPU (IR-level tests): the B50's configs."""
+
+
+def xe_cores() -> int:
+    """Xe cores of the first XPU device, or :data:`DEFAULT_XE_CORES` without one."""
+    if not torch.xpu.is_available():
+        return DEFAULT_XE_CORES
+    return torch.xpu.get_device_properties(0).gpu_subslice_count
+
+
 GEMM_SPLIT_K = (
     32,
     [1, 256, 256, 32],
     {
         "xegpu_sg_tiles": [[32, 64]],
         "xegpu_load_tiles": [[32, 32, 16, 32]],
-        "xegpu_prefetch_depths": [[4, 2]],
+        **({} if xe_cores() >= MANY_XE_CORES else {"xegpu_prefetch_depths": [[4, 2]]}),
     },
     [8, 256],
 )
 """6_Matmul_with_large_K_dimension_ (256x256x524288) on the Arc B50 as a split
 K: ``(splits, GEMM block sizes, its xegpu config, reduction block sizes)``.
 Keep in sync with ``GEMM_SPLIT_K`` in AI-bench's
-``backends/utils/helion_mlir_xpu_utils/matmul.py`` (full rationale).
+``backends/utils/helion_mlir_xpu_utils/matmul.py`` (full rationale). 32 Xe cores
+drop the prefetch depths (``gemm_split_k`` there).
 
 - 32 K chunks of 16384 (contiguous views, :func:`split_k_views`): 32
   workgroups of 256x256 (32 subgroups of 32x64, A read 32x32 per block read,
@@ -1368,14 +1383,29 @@ workgroup and subgroup tiles; the K step and A loads of AI-bench's tuned
   registers the K loop leaves); the bias row is a gather of the subgroup's 64
   columns (4 elements per lane), once per workgroup.
 """
-LINEAR_SKINNY_BLOCKS = [128, 256, 32]
-"""59's ``M = 128`` (128 x 32768 x 32768): one 128-row workgroup tile, so the
-weight (2 GiB of bf16, the dominant traffic at 128 flops per byte) is read
-exactly once over the 1x128 grid (128 workgroups). 32 subgroups of 16x64
-(inferred ``[8, 4]``, as lighthouse's selector and tuned parameters), A tiles
-16x32 in one 2D block read (the tuned parameters read 8x16)."""
+LINEAR_SKINNY_BLOCKS = [64, 512, 32]
+LINEAR_SKINNY_MANY_CORES_BLOCKS = [128, 128, 32]
+"""59's ``M = 128`` (128 x 32768 x 32768): 64x512 without prefetch (depths ``[0, 0]``)
+below :data:`MANY_XE_CORES`, 128x128 with inferred prefetch from there. Depth 0 needs
+derived layouts: ``xegpu_layouts="lighthouse"`` refuses it. Keep in sync with
+``LINEAR_SKINNY_BLOCKS`` in AI-bench's ``helion_mlir_xpu_utils/linear.py``
+(measurements)."""
+LINEAR_TALL_BLOCKS = [128, 512, 32]
+"""40's 16384 x 4096 x 4096 (rows at least 4x columns), both cards, inferred layouts.
+Keep in sync with ``LINEAR_TALL_BLOCKS`` in AI-bench's ``linear.py``."""
 _A_LOAD = {"xegpu_load_tiles": [[32, 32, 16, 16]]}
-_SKINNY_A_LOAD = {"xegpu_load_tiles": [[16, 32, 16, 16]]}
+_NO_PREFETCH = {"xegpu_prefetch_depths": [[0, 0]]}
+
+
+def _linear_config(m: int, n: int) -> tuple[list[int], dict[str, object]]:
+    """Block sizes and keys of ``[M, K] @ [N, K].T``, as AI-bench's ``linear._config``."""
+    if m < LINEAR_BLOCKS[0]:
+        if xe_cores() >= MANY_XE_CORES:
+            return LINEAR_SKINNY_MANY_CORES_BLOCKS, {}
+        return LINEAR_SKINNY_BLOCKS, _NO_PREFETCH
+    if m >= 4 * n:
+        return LINEAR_TALL_BLOCKS, {}
+    return LINEAR_BLOCKS, _A_LOAD
 
 
 def _linear(
@@ -1386,11 +1416,9 @@ def _linear(
 ) -> Problem:
     """``fn`` of ``x: [M, K]``, ``weight: [N, K]`` and ``bias: [N]``."""
     m, n, k = mnk
-    blocks, xegpu = (
-        (LINEAR_SKINNY_BLOCKS, _SKINNY_A_LOAD) if m < 256 else (LINEAR_BLOCKS, _A_LOAD)
-    )
+    blocks, xegpu = _linear_config(m, n)
     shapes = ((m, k), (n, k), (n,))
-    # A dim of one tile is no grid dim (59: 1x128 launches 128 workgroups).
+    # A dim of one tile is no grid dim.
     grid = tuple(tiles for tiles in (m // blocks[0], n // blocks[1]) if tiles > 1)
     return Problem(
         name,

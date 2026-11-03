@@ -34,6 +34,7 @@ DIFFERS_FROM_LIGHTHOUSE = {
     "17_Matmul_with_transposed_B",
     "3_Batched_matrix_multiplication",
     "10_3D_tensor_matrix_multiplication",
+    "40_Matmul_Scaling_ResidualAdd",
     "59_Matmul_Swish_Scaling",
     "97_ScaledDotProductAttention",
 }
@@ -880,6 +881,18 @@ def test_tiles_over_the_register_file_are_dropped(
 
 _TRANSPOSED_32_ROWS = "transpose_32b_32r8x1c"
 _TRANSPOSED_16_ROWS = "transpose_32b_16r8x1c"
+
+
+def test_no_prefetch_of_level2_59_is_refused_on_lighthouses_path() -> None:
+    """Depths of 0, the B50's config of 59, lower only under derived layouts: on
+    lighthouse's path they are a clean refusal, as its parameters have no such value."""
+    problem = next(p for p in PROBLEMS if p.name.startswith("59_"))
+    no_prefetch = {"xegpu_prefetch_depths": [[0, 0]]}
+    assert "xegpu.prefetch_nd" not in _lower(
+        problem, xegpu_layouts=["ir"], **no_prefetch
+    )
+    with pytest.raises(XeGPUConfigError, match="prefetch depths are positive"):
+        _lower(problem, xegpu_layouts=["lighthouse"], **no_prefetch)
 
 
 @pytest.mark.parametrize("layouts", ["lighthouse", "ir"])
