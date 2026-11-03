@@ -23,6 +23,7 @@ import torch
 import torch.fx
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 
+from ..support.block_ids import SCALAR_SYMBOL_KINDS
 from ..support.block_ids import block_id_from_key
 from ..support.block_ids import symbol_origin_info
 from ..support.errors import UnsupportedOperationError
@@ -36,6 +37,7 @@ if TYPE_CHECKING:
     from collections.abc import Mapping
 
     from helion._compiler.host_function import HostFunction
+    import sympy
 
     from ..build_context import BuildContext
     from .tensor_effects import TensorEffects
@@ -364,6 +366,7 @@ def _runtime_scalar(hf: HostFunction, node: torch.fx.Node) -> ScalarArg | None:
         or not value.node.expr.free_symbols
         or block_id_from_key(key) is not None
         or symbol_origin_info(hf, value) is not None
+        or _on_tile_positions(hf, value.node.expr)
     ):
         return None
     symbol_origin = hf.expr_to_origin.get(value.node.expr)
@@ -374,6 +377,16 @@ def _runtime_scalar(hf: HostFunction, node: torch.fx.Node) -> ScalarArg | None:
     if isinstance(value, torch.SymBool):
         return ScalarArg(key, symbol_origin.origin.host_str(), torch.bool)
     return ScalarArg(key, symbol_origin.origin.host_str(), torch.int64, value.node.expr)
+
+
+def _on_tile_positions(hf: HostFunction, expr: sympy.Basic) -> bool:
+    """Whether ``expr`` depends on a loop's position. Such a value exists on the device
+    alone, though Helion names it by a host local when host code follows its loop."""
+    return any(
+        info[1] in SCALAR_SYMBOL_KINDS
+        for symbol in expr.free_symbols
+        if (info := symbol_origin_info(hf, symbol)) is not None
+    )
 
 
 def _declared_base(

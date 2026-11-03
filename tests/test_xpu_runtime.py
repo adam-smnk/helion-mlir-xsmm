@@ -1875,6 +1875,17 @@ def test_attention_head_index_from_outer_loop() -> None:
     _check(out, _llama_torch(q, k, v), 2**-6)
 
 
+def test_attention_head_index_then_a_later_phase() -> None:
+    """Regression (the head index and later phase of a Llama step's entry): host code
+    after the loop made ``k_head`` an argument, which failed with "name 'k_head' is not
+    defined"."""
+    q, k, v = _llama_inputs()
+    out = _kernel(ir_kernels.attention_head_index_then_phase, [256, 64, 1, 1, 256, 64])(
+        q, k, v
+    )
+    _check(out, _llama_torch(q, k, v), 2**-6)
+
+
 @pytest.mark.parametrize("expression", list(ir_kernels.TILE_EXPRESSIONS))
 def test_tile_expression_in_an_inner_loop(
     expression: str, tmp_path: pathlib.Path

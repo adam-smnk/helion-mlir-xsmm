@@ -1252,6 +1252,44 @@ def attention_head_index(
     return out
 
 
+def attention_head_index_then_phase(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """:func:`attention_head_index`, then a later phase: as a Llama step's entry, with
+    host code following the loop of the head index. Block sizes: query rows, K/V rows,
+    then the tiles of the copy."""
+    batch, heads, m, d = q.shape
+    group = heads // k.size(1)
+    n = k.size(2)
+    att = torch.empty_like(q)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m], block_size=[1, 1, None]):
+        k_head = th.begin // group
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum(
+                "bhmd,bnd->bhmn", q_tile, k[tb, k_head, tn, :]
+            )
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bnd->bhmd", p.to(v.dtype), v[tb, k_head, tn, :]
+            )
+            row_max = new_max
+        att[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(att.dtype)
+    hl.barrier()
+    for t0, t1, t2, td in hl.tile([batch, heads, m, d]):
+        out[t0, t1, t2, td] = att[t0, t1, t2, td].to(torch.float32).to(out.dtype)
+    return out
+
+
 def matmul_and_row_maximum(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     """A GEMM and the maximum of its rows in one grid loop."""
     m, k = a.shape
