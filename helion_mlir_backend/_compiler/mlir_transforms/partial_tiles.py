@@ -336,12 +336,11 @@ def _drop_row_masks(module: ir.Module) -> None:
     an old value (a block argument) past the tile says what a running value
     holds there."""
     i1 = ir.IntegerType.get_signless(1)
-    for loop in _walk(module.operation):
-        if loop.name != "scf.forall" or not _reduces_only_innermost(loop):
+    loops = [op for op in _walk(module.operation) if op.name == "scf.forall"]
+    for loop in loops:
+        if not _reduces_only_innermost(loop):
             continue
-        for op in _walk(loop):
-            if op.name != "arith.cmpi":
-                continue
+        for op in [op for op in _walk(loop) if op.name == "arith.cmpi"]:
             generic = _in_linalg_body(op)
             lhs = _owner(op.operands[0])
             if generic is None or lhs is None or lhs.name != "linalg.index":
@@ -361,12 +360,14 @@ def to_transfers(module: ir.Module) -> bool:
     """See the module's docstring. Whether ``module`` has partial tiles."""
     _inline_general_versions(module)
     found = False
-    for op in _walk(module.operation):
-        if op.name == "tensor.pad":
-            found = _pad_to_read(op.opview) or found
-    for op in _walk(module.operation):
-        if op.name == "tensor.insert_slice":
-            found = _insert_to_write(op.opview) or found
+    # Picked before any rewrite: erasing a pad erases what is in its region, and a
+    # wrapper of an erased op dangles (the bindings have no live-operation map).
+    for op in [op for op in _walk(module.operation) if op.name == "tensor.pad"]:
+        found = _pad_to_read(op.opview) or found
+    for op in [
+        op for op in _walk(module.operation) if op.name == "tensor.insert_slice"
+    ]:
+        found = _insert_to_write(op.opview) or found
     if found:
         _drop_row_masks(module)
     return found

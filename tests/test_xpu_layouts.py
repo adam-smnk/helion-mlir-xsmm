@@ -18,6 +18,7 @@ import torch
 
 from tests import kernelbench_xpu as kb
 from tests import xpu_layout_forms as forms
+from tests import xpu_tile_form_kernels as tile_forms
 from tests.harness import xpu_tensor
 
 from helion_mlir_backend import lower_mlir
@@ -300,6 +301,55 @@ def test_unknown_op_on_tiles_is_refused() -> None:
         xl.analyze(_func(module))
 
 
+def test_transpose_of_anything_but_a_read_or_broadcast_is_refused() -> None:
+    """A DPAS result, here: upstream's lane distribution asserts on it, so the annotator
+    can't let it through, whatever grid it would pick."""
+    body = _gemm_body(256, 256, 32).replace(
+        "%t = arith.truncf %acc : vector<256x256xf32> to vector<256x256xbf16>",
+        """%tr = vector.transpose %acc, [1, 0] : vector<256x256xf32> to vector<256x256xf32>
+      %t = arith.truncf %tr : vector<256x256xf32> to vector<256x256xbf16>""",
+    )
+    module = _parse(body)
+    with pytest.raises(xl.LayoutError, match="vector.transpose.*xegpu.dpas|scf.for"):
+        xl.annotate_layouts(module.operation, _func(module))
+
+
+def test_same_read_of_a_stored_buffer_stays_tied() -> None:
+    """Two reads of one tile are untied only where nothing stores: with a store between them,
+    each subgroup must read what it stored."""
+    tdesc = _TDESC.format("64x64")
+    module = _parse(f"""
+      %d = xegpu.create_nd_tdesc %a : memref<1024x1024xbf16> -> {tdesc}
+      %l1 = xegpu.load_nd %d[%c0, %c0] : {tdesc} -> vector<64x64xbf16>
+      xegpu.store_nd %l1, %d[%c0, %c0] : vector<64x64xbf16>, {tdesc}
+      %l2 = xegpu.load_nd %d[%c0, %c0] : {tdesc} -> vector<64x64xbf16>
+      %b1 = "test.use"(%l2) : (vector<64x64xbf16>) -> vector<64x64xbf16>
+    """)
+    kernel = xl.DimClasses()
+    loads = [op for op in xl._walk(_func(module)) if op.name == "xegpu.load_nd"]
+    accesses = [
+        xl._access(op)
+        for op in xl._walk(_func(module))
+        if op.name in ("xegpu.load_nd", "xegpu.store_nd")
+    ]
+    xl._tie_accesses(kernel, accesses, _func(module))
+    assert kernel.same((loads[0].results[0], 0), (loads[1].results[0], 0))
+
+
+def test_same_read_of_an_unstored_buffer_is_not_tied() -> None:
+    tdesc = _TDESC.format("64x64")
+    module = _parse(f"""
+      %d = xegpu.create_nd_tdesc %a : memref<1024x1024xbf16> -> {tdesc}
+      %l1 = xegpu.load_nd %d[%c0, %c0] : {tdesc} -> vector<64x64xbf16>
+      %l2 = xegpu.load_nd %d[%c0, %c0] : {tdesc} -> vector<64x64xbf16>
+    """)
+    kernel = xl.DimClasses()
+    loads = [op for op in xl._walk(_func(module)) if op.name == "xegpu.load_nd"]
+    accesses = [xl._access(op) for op in loads]
+    xl._tie_accesses(kernel, accesses, _func(module))
+    assert not kernel.same((loads[0].results[0], 0), (loads[1].results[0], 0))
+
+
 def test_dim_size_conflict_is_refused() -> None:
     classes = xl.DimClasses()
     module = _parse(_gemm_body(256, 512))
@@ -411,9 +461,9 @@ def test_form_is_refused_by_lighthouses_path(name: str) -> None:
         )
 
 
-def test_dot_product_row_norm_is_refused_clearly() -> None:
-    """``sum(a * a)`` vectorizes to a ``vector.contract`` of a row with itself, which
-    no XeGPU op takes: refused, not a contraction laid out as a DPAS."""
+def test_dot_product_row_norm_lays_out() -> None:
+    """``sum(a * a)`` vectorizes to a ``vector.contract`` of a row with itself, which no
+    XeGPU op takes: it becomes a product and a row reduction, not a DPAS."""
 
     def row_l2(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         m, k = x.size()
@@ -438,7 +488,26 @@ def test_dot_product_row_norm_is_refused_clearly() -> None:
         xpu_tensor(512, 2048, dtype=torch.bfloat16),
         xpu_tensor(256, 2048, dtype=torch.bfloat16),
     ]
-    with pytest.raises(UnsupportedOperationError, match="vector.contract"):
+    text = str(lower_mlir(kernel, args, target="xpu", stop_at="xegpu-wg"))
+    assert "vector.contract" not in text
+    assert text.count("xegpu.dpas") == 1
+    assert "vector.multi_reduction <add>" in text
+
+
+def test_one_row_gemm_is_refused_clearly() -> None:
+    """``M = 1``: its unit dim is folded, A is a row, and the contraction is no matmul.
+    A 1-row DPAS is what :data:`~xl.MIN_DPAS_ROWS` keeps out anyway."""
+    kernel = helion.kernel(
+        tile_forms.one_row_gemm,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[1, 64, 32], xegpu_layouts=["ir"]),
+    )
+    args = [
+        xpu_tensor(1, 1024, dtype=torch.bfloat16),
+        xpu_tensor(1024, 64, dtype=torch.bfloat16),
+    ]
+    with pytest.raises(UnsupportedOperationError, match="M = 1"):
         lower_mlir(kernel, args, target="xpu", stop_at="xegpu-wg")
 
 
@@ -1141,6 +1210,7 @@ def test_tile_over_the_registers_warns_with_the_cause(
     assert "take smaller block sizes" in caplog.text
 
 
+@pytest.mark.isolated
 @pytest.mark.parametrize(
     ("fn", "shapes"),
     [
@@ -1148,10 +1218,9 @@ def test_tile_over_the_registers_warns_with_the_cause(
         (forms.tile_plus_its_transpose, ((256, 256),)),
     ],
 )
-def test_transposes_the_lowering_aborts_on_are_refused(
-    fn: object, shapes: tuple
-) -> None:
-    """Exact regression: an assert in upstream's lane distribution killed the lowering."""
+def test_transposed_elementwise_lowers(fn: object, shapes: tuple) -> None:
+    """Exact regression: an assert in upstream's lane distribution killed the lowering, then
+    a refusal. Isolated: that assert would take the process."""
     kernel = helion.kernel(
         fn,
         backend="mlir",
@@ -1159,8 +1228,7 @@ def test_transposes_the_lowering_aborts_on_are_refused(
         config=helion.Config(block_sizes=[64, 64], xegpu_layouts=["ir"]),
     )
     args = [xpu_tensor(*shape, dtype=torch.bfloat16) for shape in shapes]
-    with pytest.raises(UnsupportedOperationError, match="vector.transpose"):
-        lower_mlir(kernel, args, target="xpu", stop_at="xegpu-wg")
+    lower_mlir(kernel, args, target="xpu", stop_at="xevm")
 
 
 def _computed_then_transposed(a, b, o):
@@ -1185,6 +1253,7 @@ def _b_computed_then_transposed(a, b, o):
     return o
 
 
+@pytest.mark.isolated
 @pytest.mark.parametrize(
     ("fn", "shapes"),
     [
@@ -1193,9 +1262,10 @@ def _b_computed_then_transposed(a, b, o):
     ],
     ids=["a", "b"],
 )
-def test_computed_operand_then_transposed_is_refused(fn: object, shapes: tuple) -> None:
+def test_computed_operand_then_transposed_lowers(fn: object, shapes: tuple) -> None:
     """Exact regression: an assert in upstream's ``computeDistributedCoordsForMatrixOp``
-    killed the lowering; the uncomputed ``a[tk, tm].T`` lays out."""
+    killed the lowering, then a refusal; the transpose now moves to the read. Isolated:
+    that assert would take the process."""
     kernel = helion.kernel(
         fn,
         backend="mlir",
@@ -1203,5 +1273,4 @@ def test_computed_operand_then_transposed_is_refused(fn: object, shapes: tuple) 
         config=helion.Config(block_sizes=[256, 256, 32], xegpu_layouts=["ir"]),
     )
     args = [xpu_tensor(*shape, dtype=torch.bfloat16) for shape in shapes]
-    with pytest.raises(UnsupportedOperationError, match="vector.transpose"):
-        lower_mlir(kernel, args, target="xpu", stop_at="xevm")
+    lower_mlir(kernel, args, target="xpu", stop_at="xevm")

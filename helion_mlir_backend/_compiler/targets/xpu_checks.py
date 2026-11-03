@@ -407,6 +407,13 @@ def _is_reduction(op: ir.OpView) -> bool:
     return bool(maps) and len(indexed) < maps[0].n_dims
 
 
+def _is_elementwise_product(op: ir.OpView) -> bool:
+    """``sum(a * b)``: a contraction whose inputs share an indexing map. It's a product and a
+    reduction, which :mod:`..mlir_transforms.xegpu_tile_forms` writes out, not a matmul."""
+    maps = linalg.get_indexing_maps(op)
+    return len(maps) == 3 and maps[0] == maps[1]
+
+
 def _check_reduction(op: ir.OpView) -> None:
     """The reduction ``op`` reduces its inputs over their innermost dim only
     (lighthouse's reductions: the rows of a 2D tile)."""
@@ -461,7 +468,9 @@ def _check_kernel_class(loop: ir.Operation, ir_layouts: bool = False) -> None:
         view = op.opview
         if linalg.get_indexing_maps(view) is None:
             continue
-        if linalg.isa_contraction_op(view):
+        if linalg.isa_contraction_op(view) and not (
+            ir_layouts and _is_elementwise_product(view)
+        ):
             contractions.append(view)
         elif _is_reduction(view):
             _check_reduction(view)

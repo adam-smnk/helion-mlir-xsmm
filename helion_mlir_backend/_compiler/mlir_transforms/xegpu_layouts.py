@@ -49,6 +49,11 @@ from .xegpu_elementwise import block_load_tile
 from .xegpu_elementwise import block_store_tile
 from .xegpu_elementwise import elementwise_layout
 from .xegpu_elementwise import find_tiles
+from .xegpu_tile_forms import buffer_root
+from .xegpu_tile_forms import expand_elementwise_contractions
+from .xegpu_tile_forms import hoist_transposes
+from .xegpu_tile_forms import split_reads
+from .xegpu_tile_forms import stored_buffers
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -255,22 +260,41 @@ def _tie_dpas(classes: DimClasses, op: ir.Operation) -> None:
         classes.tie_all(op.operands[2], result)
 
 
-def _tie_accesses(classes: DimClasses, accesses: list[_Access]) -> None:
+def _tie_accesses(
+    classes: DimClasses, accesses: list[_Access], func: ir.Operation
+) -> None:
     """Accesses of one buffer in one tile shape, at one offset per dim (or a loop
     variable in both, walking the same dim), are the same subgroup's data: a tile
     a subgroup stores must be the one it loads, and no subgroup waits for
-    another's store inside a workgroup."""
+    another's store inside a workgroup. Two reads of one tile of a buffer the kernel
+    doesn't store to (:func:`.xegpu_tile_forms.split_reads`) take the same data whichever
+    subgroup reads it, so they needn't be distributed alike."""
+    stored, unknown = stored_buffers(func)
     by_source: dict[ir.Value, list[_Access]] = {}
     for access in accesses:
         by_source.setdefault(access.source, []).append(access)
-    for group in by_source.values():
+    for source, group in by_source.items():
         for other in group[1:]:
             first = group[0]
             if _shape(first.value) != _shape(other.value):
                 continue
+            if (
+                not unknown
+                and buffer_root(source) not in stored
+                and _same_read(first, other)
+            ):
+                continue
             for dim in range(len(_shape(first.value))):
                 if _same_offset(first.offsets, other.offsets, dim):
                     classes.tie(first.value, dim, other.value, dim)
+
+
+def _same_read(a: _Access, b: _Access) -> bool:
+    return (
+        a.op.name == b.op.name == "xegpu.load_nd"
+        and len(a.offsets) == len(b.offsets)
+        and all(x == y for x, y in zip(a.offsets, b.offsets, strict=True))
+    )
 
 
 def _same_offset(a: Sequence[object], b: Sequence[object], dim: int) -> bool:
@@ -377,13 +401,10 @@ def analyze(func: ir.Operation) -> KernelIR:
             _shape(value) for value in [*op.operands, *op.results]
         ):
             if name == "vector.contract":
-                raise LayoutError(
-                    "a 'vector.contract' that is no matmul (e.g. a row's dot product "
-                    "with itself): no XeGPU op takes it"
-                )
+                raise LayoutError(_contract_refusal(op))
             if name != "vector.step":
                 raise LayoutError(f"'{name}' on tile vectors")
-    _tie_accesses(classes, [*loads, *stores])
+    _tie_accesses(classes, [*loads, *stores], func)
     primary = next(
         (a.value for a in reversed(stores) if len(_shape(a.value)) == 2),
         reductions[0].operands[0] if reductions else None,
@@ -391,6 +412,15 @@ def analyze(func: ir.Operation) -> KernelIR:
     return KernelIR(
         func, classes, dpas, loads, stores, reductions, scatter_stores, primary
     )
+
+
+def _contract_refusal(op: ir.Operation) -> str:
+    message = "a 'vector.contract' that is no matmul: no XeGPU op takes it"
+    if len(_shape(op.operands[0]) or ()) == 1:
+        return (
+            f"{message}; a GEMM of M = 1 has a row for A: pad M to 2 rows in the model"
+        )
+    return message
 
 
 def _tie_gather(classes: DimClasses, op: ir.Operation) -> None:
@@ -1093,6 +1123,11 @@ def _plan_operand_load(
     value = access.value
     layout = value_layout(kernel, grid, value)
     role = load_role(value)
+    if value_bits(value) != 16:
+        raise LayoutError(
+            f"a DPAS operand read as {value_bits(value)}-bit elements and narrowed: its "
+            "tile has no block read; read a bf16 or f16 tile, or copy it to one first"
+        )
     if role.a and role.b:
         raise LayoutError("a loaded tile used as both DPAS operands")
     if role.b and role.other:
@@ -1256,13 +1291,19 @@ def _plan_other_load(
     forced = None
     if hints.load_tiles is not None and len(hints.load_tiles) == 2:
         forced = hints.load_tiles
+    transposed = load_role(value).transposed
     try:
         tile = block_load_tile(layout.sg_data, (value_bits(value),), forced)
+        if transposed and tuple(tile) != TRANSPOSED_LOAD:
+            # 1, 2, 4 or 8 rows abort in upstream's layout code (XeGPULayoutImpl.cpp).
+            raise ValueError(
+                f"a transposed load takes {list(TRANSPOSED_LOAD)} tiles, not {list(tile)}"
+            )
     except ValueError as exc:
         if forced is None:
             raise LayoutError(str(exc)) from exc
         raise HintError("load_tiles", str(exc)) from exc
-    order = (0, 1) if load_role(value).transposed else None
+    order = (0, 1) if transposed else None
     plan.anchors.append((access.op, "layout", _layout_text(layout, tile, order)))
 
 
@@ -1350,8 +1391,8 @@ def plan_kernel(func: ir.Operation, hints: Hints) -> Plan:
     no legal layout without hints is a :class:`LayoutError`."""
     while True:
         try:
-            plan = plan_elementwise(func, hints)
-            _refuse_transposes_the_lowering_aborts_on(func, plan is not None)
+            plan = None if _reads_transposed(func) else plan_elementwise(func, hints)
+            _refuse_transposes_the_lowering_aborts_on(func)
             if plan is None:
                 plan = plan_layouts(analyze(func), hints)
         except HintError as exc:
@@ -1404,24 +1445,39 @@ def _log_line(func: ir.Operation, line: str) -> None:
     attributes[LOWERING_LOG_ATTR] = ir.ArrayAttr.get([*lines, new])
 
 
-def _refuse_transposes_the_lowering_aborts_on(
-    func: ir.Operation, elementwise: bool
-) -> None:
-    """A transposed tile outside the two forms that work, a loaded tile feeding a DPAS or
-    other math in a DPAS or reduction kernel, and a broadcast row: anything else
-    asserts in upstream's lane distribution of its SLM path (``computeDistributedCoords
-    ForMatrixOp``), on any layout path."""
+def _reads_transposed(func: ir.Operation) -> bool:
+    """A transposed read: an elementwise kernel's single layout can't take one, so its
+    tiles get laid out one by one."""
+    return any(
+        op.name == "vector.transpose"
+        and (source := _defining(op.operands[0])) is not None
+        and source.name == "xegpu.load_nd"
+        for op in _walk(func)
+    )
+
+
+def _refuse_transposes_the_lowering_aborts_on(func: ir.Operation) -> None:
+    """A transposed tile outside the two forms that work, a loaded tile and a broadcast
+    row: anything else asserts in upstream's lane distribution of its SLM path
+    (``computeDistributedCoordsForMatrixOp``), on any layout path."""
     for op in _walk(func):
         if op.name != "vector.transpose":
             continue
         source = _defining(op.operands[0])
         name = source.name if source is not None else ""
-        if name == "vector.broadcast" or (name == "xegpu.load_nd" and not elementwise):
+        if name in ("vector.broadcast", "xegpu.load_nd"):
             continue
         raise LayoutError(
             f"a 'vector.transpose' of a value from '{name or 'a block argument'}': "
             "the lowering can't distribute it across subgroups"
         )
+
+
+def prepare_tiles(func: ir.Operation) -> None:
+    """The forms :mod:`.xegpu_tile_forms` rewrites to ones this module lays out."""
+    expand_elementwise_contractions(func)
+    hoist_transposes(func)
+    split_reads(func, refuse=LayoutError)
 
 
 def annotate_layouts(module: ir.Operation, func: ir.Operation) -> Plan:
@@ -1430,6 +1486,7 @@ def annotate_layouts(module: ir.Operation, func: ir.Operation) -> Plan:
     ``prefetches``, for the caller's schedule; :func:`clear_tags` removes it).
     :class:`LayoutError` if none is legal."""
     hints = Hints.of(func)
+    prepare_tiles(func)
     plan = plan_kernel(func, hints)
     if HINTS_ATTR in func.attributes:
         del func.attributes[HINTS_ATTR]
