@@ -1415,6 +1415,7 @@ def test_stage_dumps(monkeypatch: pytest.MonkeyPatch) -> None:
         "grid-mappings",
         "gpu-outlining",
         "row-results",
+        "bool-casts",
         "xegpu-initial",
         "xegpu-wg",
     ]

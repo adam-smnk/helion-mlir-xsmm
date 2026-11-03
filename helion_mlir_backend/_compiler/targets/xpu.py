@@ -72,6 +72,7 @@ from ..mlir_transforms.xevm_tile_order import order_tile_chunks
 from ..mlir_transforms.xevm_tile_order import spill_bytes
 from ..mlir_transforms.xevm_tile_order import tile_math_grfs
 from ..mlir_transforms.xevm_unit_clamps import unit_clamps_without_sat
+from ..mlir_transforms.xpu_bool_casts import select_bool_casts
 from ..mlir_transforms.xpu_math_approx import approximate_math
 from ..mlir_transforms.xpu_math_approx import fold_extended_splats
 from .base import MLIRTarget
@@ -205,6 +206,8 @@ def _stages(
         ("gpu-outlining", xpu_transforms.outline_kernels(entry, kernels, columns)),
         # Row results stored as [rows, 1] columns: see keep_row_dims.
         ("row-results", _KeepRowDims()),
+        # A SPIR-V backend abort on bool to float casts: see xpu_bool_casts.
+        ("bool-casts", _BoolCasts()),
         ("xegpu-initial", xegpu.vector_to_xegpu_schedule()),
         ("xegpu-wg", xpu_transforms.annotate_kernels(entry, kernels)),
     ]
@@ -261,6 +264,14 @@ def _kernels_by_module(
         xpu_transforms.kernel_module_name(entry, index): kernel
         for index, kernel in enumerate(kernels)
     }
+
+
+class _BoolCasts(Stage):
+    """Bool to float casts as selects (:mod:`xpu_bool_casts`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        select_bool_casts(module)
+        return module
 
 
 class _NanMaxima(Stage):
