@@ -46,6 +46,13 @@ so also matched:
 VNNI operands (``... x 2``) are loaded with tile loads at the read's
 indices, so only the first applies to them.
 
+The rewrite loads an operand at the contraction, not at its read. Also matched:
+a read above the contraction of a memref written between the two, in a loop
+around the contraction too. One-shot bufferization may give two pads of one shape
+one buffer, as a read vector needs no memory once it's read: a query tile read
+above a key loop whose tile lands there would load the keys, silently (a 32x32
+query and key tile of padded columns, ``tests/test_amx_stale_reads.py``).
+
 Left alone: contractions with only plain operand reads the rewrite reads
 right, of other element types, and every contraction on a target without
 AMX (the rewrite matches no register tile there).
@@ -69,6 +76,17 @@ from .utils import payload_ops
 
 # The column of the second RHS read of a pair the rewrite packs together.
 _PAIR_COLUMN = 16
+
+
+# Views of memory, and ops that only read it.
+_VIEWS = (
+    "memref.subview",
+    "memref.expand_shape",
+    "memref.collapse_shape",
+    "memref.cast",
+    "memref.reinterpret_cast",
+)
+_NOT_WRITING = (*_VIEWS, "vector.transfer_read", "memref.dim", "memref.load")
 
 
 def _element_type(value: ir.Value) -> ir.Type | None:
@@ -154,6 +172,52 @@ def _is_misread_in_k_loop(op: vector.ContractionOp) -> bool:
     return not _is_vnni(op.rhs) and not _is_packed_from_origin(rhs)
 
 
+def _root(value: ir.Value) -> ir.Value:
+    """The memref ``value`` is a view of."""
+    while isinstance(value, ir.OpResult) and value.owner.name in _VIEWS:
+        value = value.owner.operands[0]
+    return value
+
+
+def _touches(op: ir.Operation, root: ir.Value) -> bool:
+    """Whether ``op`` or an op nested in it may write ``root`` or a view of it."""
+    found = False
+
+    def visit(nested: ir.Operation) -> ir.WalkResult:
+        nonlocal found
+        if nested.name in _NOT_WRITING:
+            return ir.WalkResult.ADVANCE
+        if any(_root(operand) == root for operand in nested.operands):
+            found = True
+            return ir.WalkResult.INTERRUPT
+        return ir.WalkResult.ADVANCE
+
+    op.walk(visit)
+    return found
+
+
+def _is_stale_read(value: ir.Value, op: vector.ContractionOp) -> bool:
+    """Whether the read ``value`` of ``op`` is of memory written after it, before
+    ``op`` or in a loop around it."""
+    read = opview(value.owner)
+    block = read.operation.block
+    ancestor = op.operation
+    while ancestor.block != block:
+        ancestor = ancestor.parent
+        if ancestor is None or not isinstance(ancestor, ir.Operation):
+            return False
+    root = _root(read.base)
+    after = False
+    for between in block.operations:
+        if between == read.operation:
+            after = True
+        elif after and _touches(between, root):
+            return True
+        if between == ancestor:
+            return False
+    return False
+
+
 def _is_misread(op: vector.ContractionOp) -> bool:
     lhs, rhs, acc = op.lhs, op.rhs, op.acc
     bf16 = ir.BF16Type
@@ -165,7 +229,11 @@ def _is_misread(op: vector.ContractionOp) -> bool:
         return False
     if not (_is_plain_read(lhs) and _is_plain_read(rhs)):
         return True
-    return _is_misread_in_k_loop(op)
+    return (
+        _is_misread_in_k_loop(op)
+        or _is_stale_read(lhs, op)
+        or _is_stale_read(rhs, op)
+    )
 
 
 def _widen(op: vector.ContractionOp) -> None:
