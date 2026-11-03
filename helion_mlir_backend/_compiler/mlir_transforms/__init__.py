@@ -14,6 +14,7 @@ from .first_touch import mark_overwritten_args
 from .fit_subviews_to_reads import fit_subviews_to_reads
 from .fold_full_insert_slices import fold_full_insert_slices
 from .fold_loop_unit_dims import fold_loop_unit_dims
+from .fold_pad_unit_inserts import fold_pad_unit_inserts
 from .fold_region_inserts import fold_region_inserts
 from .fold_slice_unit_dims import fold_slice_unit_dims
 from .forward_rows import forward_rows
@@ -71,6 +72,7 @@ __all__ = [
     "fit_subviews_to_reads",
     "fold_full_insert_slices",
     "fold_loop_unit_dims",
+    "fold_pad_unit_inserts",
     "fold_region_inserts",
     "fold_slice_unit_dims",
     "forward_rows",

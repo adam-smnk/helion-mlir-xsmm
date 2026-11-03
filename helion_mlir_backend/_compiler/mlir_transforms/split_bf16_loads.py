@@ -24,7 +24,6 @@ with a hole in it, 32 lanes plus one anywhere in the next part, suffixes of 33,
 aborts in the Python bindings' LLVM too; split, it folds back to the same vector,
 so it stays."""
 
-
 from mlir import ir
 from mlir.dialects import ext
 from mlir.dialects import llvm

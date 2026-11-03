@@ -230,9 +230,7 @@ def _is_misread(op: vector.ContractionOp) -> bool:
     if not (_is_plain_read(lhs) and _is_plain_read(rhs)):
         return True
     return (
-        _is_misread_in_k_loop(op)
-        or _is_stale_read(lhs, op)
-        or _is_stale_read(rhs, op)
+        _is_misread_in_k_loop(op) or _is_stale_read(lhs, op) or _is_stale_read(rhs, op)
     )
 
 

@@ -186,6 +186,17 @@ def materialize_copies() -> ir.Module:
     return schedule
 
 
+def fold_pad_unit_inserts() -> ir.Module:
+    """Schedule: pads put back into unit dims by an insert into an empty tensor,
+    in every function, as reshapes."""
+    ht.HelionTransformDialect.load()
+    with schedule_boilerplate() as (schedule, named_seq):
+        funcs = lh_transform.match_op(named_seq.bodyTarget, "func.func")
+        ht.fold_pad_unit_inserts(funcs)
+        transform.yield_()
+    return schedule
+
+
 def materialize_operand_pads(packed_only: bool = False) -> ir.Module:
     """Schedule: every function's zero-padded contraction operands in memory
     (with ``packed_only``, those read through an operand pack)."""

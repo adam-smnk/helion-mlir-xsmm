@@ -33,6 +33,8 @@ Pipeline:
   - schedule: "helion_transforms.py[gen=split_contraction_operands]"
   # Simplify shapes.
   - schedule: "linalg.py[gen=linalg_contract_fold_unit_dims]"
+  ## Its rank-reduced pads as reshapes, which materialize_operand_pads reads through.
+  - schedule: "helion_transforms.py[gen=fold_pad_unit_inserts]"
   - include: cleanup.yaml
 
   ## Remap iteration space of parallel loops for communication avoidance.

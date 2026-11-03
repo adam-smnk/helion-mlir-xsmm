@@ -132,9 +132,7 @@ def _padded_dots(
 
 @pytest.mark.slow
 @pytest.mark.isolated
-@pytest.mark.parametrize(
-    ("seq", "dim"), [(64, 7), (48, 7), (33, 7), (64, 16)], ids=str
-)
+@pytest.mark.parametrize(("seq", "dim"), [(64, 7), (48, 7), (33, 7), (64, 16)], ids=str)
 def test_query_and_key_tiles_of_one_buffer(seq: int, dim: int) -> None:
     torch.manual_seed(0)
     q, k = (torch.randn(2, seq, dim).bfloat16() for _ in range(2))
