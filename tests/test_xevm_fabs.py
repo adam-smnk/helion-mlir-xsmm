@@ -73,23 +73,30 @@ def test_f32_fabs_becomes_an_integer_minimum(value: str, bits: str) -> None:
             "%a: f16",
         ),
         (
-            """%r = llvm.intr.fabs(%a) : (f64) -> f64
-      llvm.store %r, %p : f64, !llvm.ptr<1>""",
-            "%a: f64",
-        ),
-        (
             """%r = llvm.fneg %a : f32
       llvm.store %r, %p : f32, !llvm.ptr<1>""",
             "%a: f32",
         ),
     ],
-    ids=["f16", "f64", "other-op"],
+    ids=["f16", "other-op"],
 )
 def test_other_ops_are_untouched(body: str, args: str) -> None:
     source = _module(body, args)
     count, text = _rewrite(source)
     assert count == 0
     assert text == _rewrite(source, apply=False)[1]
+
+
+def test_f64_fabs_becomes_an_integer_minimum() -> None:
+    """IGC's ``llvm.fabs`` on a vector of f64 is no better than on f32."""
+    body = """%r = llvm.intr.fabs(%a) : (vector<4xf64>) -> vector<4xf64>
+      llvm.store %r, %p : vector<4xf64>, !llvm.ptr<1>"""
+    count, text = _rewrite(_module(body, "%a: vector<4xf64>"))
+    assert count == 1
+    kernel = _kernel(text)
+    assert "llvm.intr.fabs" not in kernel
+    assert "llvm.intr.umin" in kernel
+    assert "-9223372036854775808" in kernel
 
 
 def test_non_xevm_gpu_modules_are_untouched() -> None:

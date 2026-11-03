@@ -231,9 +231,15 @@ _BIT_EXACT_VS_TORCH = {
     "1_Square_matrix_multiplication_",
     "13_Matmul_for_symmetric_matrices",
 }
-"""Verified bit for bit against ``torch.matmul`` at the shapes above (two seeds).
+"""Verified bit for bit against ``torch.matmul`` at the shapes above (two seeds), on the B50.
 2 is not: at 512x1024x8192 torch picks another kernel (and K order) than the
-spec shape's, so it is compared with the same kernel under the inferred config."""
+spec shape's, so it is compared with the same kernel under the inferred config.
+On the B70 torch's ``matmul`` isn't bit-identical to this kernel, which says only how torch
+runs there, so those are checked by the error bound."""
+
+
+def _on_b50() -> bool:
+    return "B50" in torch.xpu.get_device_name(0)
 
 
 @pytest.mark.parametrize("name", list(_GEMM_AT_SCALE))
@@ -243,7 +249,7 @@ def test_kernelbench_hand_picked_gemm_at_scale(name: str) -> None:
     a, b = _randn(m, k), _randn(k, n)
     out = problem.kernel(a, b)
     if name in _BIT_EXACT_VS_TORCH:
-        _check(out, a @ b, bound=0.0)
+        _check(out, a @ b, bound=0.0 if _on_b50() else None)
         return
     _check(out, a @ b)
     # The same K step, so the same accumulation order: the config changes
@@ -1637,7 +1643,10 @@ def test_attention_matrix_finds_the_miscompile(
     matrix of kernels go wrong varies with what stale registers hold (108-154 of 156
     across runs, none with the options), so this asserts only that some do. If this
     fails after an IGC update, the miscompile is gone: then this test can go, not the
-    one above."""
+    one above. A control on the B50 only: on the B70 it doesn't fire, so the check above has
+    no demonstrated detecting power there."""
+    if not _on_b50():
+        pytest.skip("the control doesn't fire on this card")
     monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")
     # In-process entries are cached by module text, which the option is not part of.
     monkeypatch.setattr(execution, "_JIT_CACHE", type(execution._JIT_CACHE)())

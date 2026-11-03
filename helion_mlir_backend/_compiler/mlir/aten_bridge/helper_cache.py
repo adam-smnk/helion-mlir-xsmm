@@ -24,6 +24,8 @@ from ..support import UnsupportedOperationError
 from .nan_minmax import NAN_PROPAGATING_OPS
 from .nan_minmax import propagate_nan
 from .samples import substitute
+from .scalar_compares import COMPARE_OPS
+from .scalar_compares import compare_in_tile_type
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -72,6 +74,8 @@ class HelperCache:
 
     def lower(self, requests: list[tuple[HelperRequest, torch.fx.Node]]) -> None:
         """Lower ``requests`` (with the node each came from) into the cache."""
+        for request, node in requests:
+            _refuse_what_crashes_torch_mlir(request, node)
         batch = [request for request, _ in requests]
         try:
             helpers = _run_torch_mlir(batch)
@@ -106,6 +110,52 @@ class HelperCache:
         for request in requests:
             if request.target.overloadpacket in NAN_PROPAGATING_OPS:
                 propagate_nan(self._functions[request.name])
+            # torch-mlir's compares with a number aren't in the tile's type: see there.
+            if request.target in COMPARE_OPS:
+                compare_in_tile_type(
+                    self._functions[request.name],
+                    request.args[1] if len(request.args) > 1 else None,
+                    request.target.__name__.split(".")[-2],
+                )
+
+
+_BYTE_TILE_CRASHES = frozenset({"mul", "remainder"})
+"""torch-mlir's ops that crash on an i8 tile and a Python integer, with ``div.Tensor_mode`` and
+``sub`` with the integer second. Measured, wheel 20261001: its ``convertScalarToDtype`` reports
+"for conversion to byte or char type dstOriginalDtype has to be passed", and then the process
+dies with SIGSEGV in ``lower_mlir_module``: nothing here could catch it. ``t + 1``, ``1 - t``,
+``t & 1``, ``torch.clamp``, ``t / 2``, ``t << 1`` and others lower, and are right."""
+
+
+def _refuse_what_crashes_torch_mlir(
+    request: HelperRequest, node: torch.fx.Node
+) -> None:
+    samples = request.samples
+    byte_tile = any(
+        isinstance(sample, torch.Tensor) and sample.dtype == torch.int8
+        for sample in samples
+    )
+    an_int = any(
+        isinstance(arg, int) and not isinstance(arg, bool) for arg in request.args
+    )
+    name = request.target.__name__
+    op = name.split(".")[0]
+    second_is_int = len(request.args) > 1 and isinstance(request.args[1], int)
+    crashes = (
+        op in _BYTE_TILE_CRASHES
+        or name == "div.Tensor_mode"
+        or (op == "sub" and second_is_int)
+    )
+    if byte_tile and an_int and crashes:
+        with located(node):
+            raise UnsupportedOperationError(
+                str(request.target),
+                reason="torch-mlir crashes on an i8 tensor with a Python integer in this op",
+                alternatives=[
+                    "a tensor of the integer, of the same type",
+                    "another type",
+                ],
+            )
 
 
 CACHE = HelperCache()

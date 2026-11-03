@@ -27,9 +27,12 @@ import torch.nn.functional as F
 
 from tests import kernelbench_xpu as kb
 from tests import xpu_math_full_kernels as full_kernels
+from tests import scalar_compare_kernels as compares
 from tests import xpu_partial_kernels as pk
 from tests.harness import xpu_tensor
+from tests.igc_dumps import elements_read_never_written
 from tests.igc_dumps import igc_dump_problems
+from tests.igc_dumps import vector_intrinsics
 from tests.igc_dumps import narrow_minmax
 
 from helion_mlir_backend import lower_mlir
@@ -559,7 +562,8 @@ def test_builtins_rounded_to_16_bits_have_no_use_before_def(
     args = [xpu_tensor(*shape, dtype=dtypes[0]), xpu_tensor(*shape, dtype=dtypes[1])]
     config = helion.Config(block_sizes=blocks)
     dump = _igc_dump(monkeypatch, tmp_path, kernel, args, config)
-    _assert_options_in_force(dump, off=False)
+    # Narrowing f64: IGCVectorizer's fptrunc of f64 gives wrong rows (_narrows_f64).
+    _assert_options_in_force(dump, off=name == "f64_sin")
     assert _dump_problems(dump) == []
 
 
@@ -607,6 +611,55 @@ def test_the_scan_finds_a_narrow_minmax(tmp_path: pathlib.Path) -> None:
         "max (M1, 16) V0084(0,0)<1> V0075(0,0)<1;1,0> V0079(0,0)<1;1,0>\n"
     )
     assert len(narrow_minmax(visaasm)) == 2
+
+
+_LANE_KERNELS: dict[str, object] = {
+    **{name: fn for name, (fn, _) in compares.COMBINED.items()},
+    **compares.INT_ABS_KERNELS,
+}
+
+
+@BINARIES
+@pytest.mark.parametrize("name", list(_LANE_KERNELS))
+def test_compare_kernels_leave_igc_nothing_to_fold(
+    name: str, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """The check of the whole class: no vector ``llvm.*`` call but those IGC writes whole, and
+    no element read that was never written (``llvm.fabs.v16f32``, ``llvm.abs.v16i32``: one
+    row of 16 written). ``_dump_problems``, on every problem's binary too, also has no vector
+    compare left: the static form of ``xevm_lane_compares``'s promise."""
+    dtype = torch.int32 if name in compares.INT_ABS_KERNELS else torch.float32
+    kernel = _kernel(_LANE_KERNELS[name], [32, 32])
+    dump = _igc_dump(monkeypatch, tmp_path, kernel, [xpu_tensor(128, 256, dtype=dtype)])
+    assert _dump_problems(dump) == []
+    for visaasm in dump.glob("*.visaasm"):
+        assert elements_read_never_written(visaasm) == [], visaasm.name
+
+
+def test_the_scan_finds_a_vector_fabs_and_a_row_never_written(
+    tmp_path: pathlib.Path,
+) -> None:
+    """On the vISA and final IR the reproducer's ``idiom`` kernel has without the stage."""
+    codegen = tmp_path / "k_codegen.ll"
+    codegen.write_text(
+        "  %1 = call <16 x float> @llvm.fabs.v16f32(<16 x float> %0)\n"
+        "  %2 = call <16 x i32> @llvm.umin.v16i32(<16 x i32> %a, <16 x i32> %b)\n"
+        "  %3 = call <16 x i32> @llvm.genx.GenISA.x.v16i32(i32 0)\n"
+        "  %4 = call float @llvm.fabs.f32(float %x)\n"
+    )
+    assert vector_intrinsics(codegen) == ["fabs.v16f32"]
+    visaasm = tmp_path / "k.visaasm"
+    visaasm.write_text(
+        ".decl V0089 v_type=G type=f num_elts=256 align=wordx32\n"
+        ".decl V0090 v_type=G type=f num_elts=256 align=wordx32\n"
+        ".decl V0092 v_type=G type=f num_elts=16 align=wordx32\n"
+        "    raw_send (M1, 16) V0089(0,0)<1>\n"
+        "    mov (M1, 16) V0090(0,0)<1> (abs)V0089(0,0)<1;1,0>\n"
+        "    add (M1, 16) V0092(0,0)<1> V0090(0,0)<1;1,0> V0090(1,0)<1;1,0>\n"
+    )
+    found = elements_read_never_written(visaasm)
+    assert len(found) == 1
+    assert found[0].startswith("V0090")
 
 
 @BINARIES

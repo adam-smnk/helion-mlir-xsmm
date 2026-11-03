@@ -63,6 +63,7 @@ from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
 from ..mlir_transforms.xevm_fabs import fabs_as_integer_min
+from ..mlir_transforms.xevm_lane_compares import compare_lanes
 from ..mlir_transforms.xevm_lane_conversions import convert_lanes_where_computed
 from ..mlir_transforms.xevm_lane_reductions import check_lane_reductions
 from ..mlir_transforms.xevm_lane_reductions import check_transposed_reads
@@ -239,8 +240,8 @@ def _stages(
         stages[index] = ("xevm", lowering)
     if stop_at == "binary":
         # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays,
-        # xevm_nsz_minmax, xevm_unit_clamps, xevm_bf16_extensions, xevm_fabs and
-        # xevm_lane_conversions;
+        # xevm_nsz_minmax, xevm_unit_clamps, xevm_bf16_extensions, xevm_fabs,
+        # xevm_lane_compares and xevm_lane_conversions;
         # _ToBinary for xevm_tile_order.
         stages.extend(
             [
@@ -250,6 +251,7 @@ def _stages(
                 ("xevm-unit-clamps", _UnitClamps()),
                 ("xevm-bf16-extensions", _Bf16Extensions()),
                 ("xevm-fabs", _FabsAsIntegerMin()),
+                ("xevm-lane-compares", _CompareLanes()),
                 ("xevm-lane-conversions", _LaneConversions()),
                 ("binary", _ToBinary(_kernels_by_module(entry, kernels))),
             ]
@@ -361,7 +363,7 @@ class _BinaryPasses:
         kernel = self.kernels.get(name, KernelParams())
         options = (
             xpu_transforms.IGC_OPTIONS_OFF
-            if kernel.vectorizer_off
+            if kernel.vectorizer_off or _narrows_f64(operation)
             else xpu_transforms.IGC_OPTIONS
         )
         if options not in self.passes:
@@ -370,6 +372,31 @@ class _BinaryPasses:
                 self.context,
             )
         self.passes[options].run(operation)
+
+
+def _narrows_f64(operation: ir.Operation) -> bool:
+    """An ``fptrunc`` of f64, scalar or vector, in the module. ``IGCVectorizer`` makes
+    ``fptrunc <8 x double>`` of the scalar ones too, and rows 4 to 7 of each 8 come out wrong,
+    with no diagnostic (``torch.abs(t.to(f64)).to(f32)``, ``torch.sqrt(t.to(f64) * t.to(f64))``:
+    half of the elements on the B50, IGC 2.41; right with the vectorizer off). No benchmark
+    kernel has f64 in a GPU module. See ``agent-wiki/upstream-repro/igc-vector-fabs/``."""
+    found: list[bool] = []
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        if op.name == "llvm.fptrunc":
+            source = op.operands[0].type
+            element = (
+                ir.VectorType(source).element_type
+                if isinstance(source, ir.VectorType)
+                else source
+            )
+            if isinstance(element, ir.F64Type):
+                found.append(True)
+                return ir.WalkResult.INTERRUPT
+        return ir.WalkResult.ADVANCE
+
+    operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    return bool(found)
 
 
 def _compile(
@@ -667,6 +694,15 @@ class _FabsAsIntegerMin(Stage):
 
     def apply(self, module: ir.Module) -> ir.Module:
         fabs_as_integer_min(module)
+        return module
+
+
+class _CompareLanes(Stage):
+    """Vector compares lane by lane (works around IGC's one-row ``fabs`` and ``abs``,
+    :mod:`xevm_lane_compares`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        compare_lanes(module)
         return module
 
 
