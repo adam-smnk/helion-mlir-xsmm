@@ -143,3 +143,55 @@ def test_square_auto_grid_is_not_refused() -> None:
         config=helion.Config(block_sizes=[16, 16]),
     )
     assert torch.equal(kernel(square_auto_grid)(x), x * 2.0)
+
+
+def stored_sub_tiles(x: torch.Tensor, o: torch.Tensor) -> torch.Tensor:
+    """Inner tiles stored; the last inner tile of an outer tile ends inside ``o``."""
+    m, n = x.size()
+    outer = hl.register_block_size(n)
+    inner = hl.register_block_size(outer)
+    for tm in hl.tile(m):
+        for to in hl.tile(n, block_size=outer):
+            for ti in hl.tile(to.begin, to.end, block_size=inner):
+                o[tm, ti] = x[tm, ti] * 2.0
+    return o
+
+
+@pytest.mark.isolated(timeout=120)
+def test_stored_sub_tiles_do_not_hang() -> None:
+    """Regression: the tile that owns a store was searched for around a cycle of
+    enclosing tiles, forever."""
+    x = torch.rand(32, 256)
+    o = torch.full_like(x, 7.0)
+    kernel = helion.kernel(
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[64, 128, 48]),
+    )
+    with pytest.raises(UnsupportedOperationError, match="bounded by the other"):
+        kernel(stored_sub_tiles)(x, o)
+
+
+def stored_sub_tiles_bounded_by_the_size(
+    x: torch.Tensor, o: torch.Tensor
+) -> torch.Tensor:
+    """As :func:`stored_sub_tiles` with what the refusal names: right."""
+    m, n = x.size()
+    outer = hl.register_block_size(n)
+    inner = hl.register_block_size(n)
+    for tm in hl.tile(m):
+        for to in hl.tile(n, block_size=outer):
+            for ti in hl.tile(to.begin, to.end, block_size=inner):
+                o[tm, ti] = x[tm, ti] * 2.0
+    return o
+
+
+@pytest.mark.parametrize("blocks", [[64, 128, 48], [64, 128, 32]], ids=["48", "32"])
+def test_the_refusals_alternative_for_sub_tiles_is_right(blocks: list[int]) -> None:
+    x = torch.rand(32, 256)
+    o = torch.full_like(x, 7.0)
+    kernel = helion.kernel(
+        backend="mlir", static_shapes=True, config=helion.Config(block_sizes=blocks)
+    )
+    kernel(stored_sub_tiles_bounded_by_the_size)(x, o)
+    assert torch.equal(o, x * 2.0)

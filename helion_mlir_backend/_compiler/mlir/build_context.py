@@ -299,11 +299,13 @@ class BuildContext:
             raise UnsupportedOperationError(
                 "nested tile loops of one block size",
                 reason=(
-                    "a block size is one symbol: both loops' tiles would index "
-                    "with the inner loop's position"
+                    "both loops have one block id, from one block size or from one "
+                    "bounded by the other: their tiles would index with the inner "
+                    "loop's position"
                 ),
                 alternatives=[
-                    "hl.register_block_size for each loop, with the same value"
+                    "hl.register_block_size for each loop, bounded by a tensor's size, "
+                    "not by another block size"
                 ],
             )
         saved = [
