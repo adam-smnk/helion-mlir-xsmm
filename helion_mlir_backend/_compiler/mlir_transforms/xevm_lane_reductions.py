@@ -131,10 +131,14 @@ def check_lane_reductions(module: ir.Module) -> None:
 
 _WRONG_TRANSPOSED_READ = "transpose_32b_32r8x1c"
 """A transposed 2D block read of 32 rows: lowered with no diagnostic, every row wrong on
-the B50 (llvm-project 79ab4054), from upstream's default for an unanchored transposed tile.
-16 rows are right. A named workaround: the elements are all there, in another order
-(k=0, m0; k=0, m1; k=16, m0; ...), so it goes when an annotation or upstream gets the order
-right, and this check narrows to the wrong form."""
+the B50 (llvm-project 79ab4054), from upstream's default for an unanchored transposed tile,
+and from a 32-row anchor. 16 rows are right. A named workaround, by intrinsic: the read has
+no right form today, as ``xegpu-sg-to-lane-distribute`` casts what a lane gets to
+``vector<2x8xi32>``, rows l and l + 16 one after the other, and the read delivers them
+column by column (row l, row l + 16, next column). The anchor cannot change that:
+``order``, ``inst_data`` and the lane fields give that cast, a read that fails to lower, or
+a read that is not transposed. Reordering the buffer after the call gave right rows on the
+B50. This check goes when upstream gets the order right."""
 
 
 def check_transposed_reads(module: ir.Module) -> None:

@@ -91,9 +91,12 @@ LOAD_MAX_COLS = 32
 """A 2D block load of 16-bit elements: at most 32 rows of 64 bytes."""
 TRANSPOSED_LOAD = (16, 16)
 """The one transposed 2D block load of a DPAS operand (32-bit pairs: 8 wide). Upstream's
-``getBlockWidthHeightCount`` also allows 32 rows, and it lowers with no diagnostic
-to ``transpose_32b_32r8x1c``, but every row was wrong on the B50 (normalized error
-1.3 against 2.9e-3 for 16 rows; ``test_transposed_32_row_read_is_refused``)."""
+``getBlockWidthHeightCount`` also allows 32 rows, and every row is wrong on the B50 whatever
+the anchor says (normalized error 1.3 against 2.9e-3 for 16 rows;
+:data:`.xevm_lane_reductions._WRONG_TRANSPOSED_READ`). 16 rows are also the choice on speed:
+with the order put right by hand, 32 rows gained nothing on the B50 (sustained, device: 72
+against 75 us at 512x1024x2048, 219 against 218 at 256x256x8192), and neither did the read
+without those moves, on wrong rows (74 us)."""
 PREFETCH_ROWS = (8, 32)
 PREFETCH_COLS = (16, 32)
 PREFETCH_INST = (8, 16)

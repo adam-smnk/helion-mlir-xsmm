@@ -990,6 +990,39 @@ def _strip_anchors(module: ir.Module) -> None:
         op.erase()
 
 
+_TRANSPOSED_32_ROWS = """
+gpu.module @m [#xevm.target<chip = "bmg">] {
+  gpu.func @k(%p: memref<64x8xi32>) -> vector<32x8xi32> {
+    %c0 = arith.constant 0 : index
+    %d = xegpu.create_nd_tdesc %p : memref<64x8xi32> -> !xegpu.tensor_desc<32x8xi32,
+      #xegpu.layout<lane_layout = [16, 1], lane_data = [1, 1], order = [0, 1]>>
+    %v = xegpu.load_nd %d[%c0, %c0]
+      <{layout = #xegpu.layout<lane_layout = [16, 1], lane_data = [1, 1],
+        order = [0, 1]>}> : !xegpu.tensor_desc<32x8xi32,
+      #xegpu.layout<lane_layout = [16, 1], lane_data = [1, 1], order = [0, 1]>>
+      -> vector<32x8xi32>
+    gpu.return %v : vector<32x8xi32>
+  }
+}
+"""
+
+
+def test_transposed_32_row_read_is_cast_row_by_row() -> None:
+    """Why 32 rows stay refused: the reduced form of the wrong rows. A lane's 16 values
+    are cast to rows l and l + 16 one after the other, while the read delivers them
+    column by column. If this fails, upstream changed the order: try 32 rows on the
+    B50, and drop ``check_transposed_reads`` if they are right."""
+    with ir.Context() as context, ir.Location.unknown():
+        lh_dialects.register_and_load()
+        module = ir.Module.parse(_TRANSPOSED_32_ROWS)
+        PassManager.parse(
+            "builtin.module(gpu.module(xegpu-sg-to-lane-distribute))", context
+        ).run(module.operation)
+        text = str(module)
+    assert "transpose = array<i64: 1, 0>" in text
+    assert "vector.shape_cast %1 : vector<16xi32> to vector<2x8xi32>" in text
+
+
 @pytest.mark.parametrize(
     ("name", "refused"),
     [
