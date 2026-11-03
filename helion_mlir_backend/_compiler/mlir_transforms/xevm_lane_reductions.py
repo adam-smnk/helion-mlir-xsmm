@@ -127,3 +127,40 @@ def check_lane_reductions(module: ir.Module) -> None:
                 "target='cpu' (CPU tensors)",
             ],
         )
+
+
+_WRONG_TRANSPOSED_READ = "transpose_32b_32r8x1c"
+"""A transposed 2D block read of 32 rows: lowered with no diagnostic, every row wrong on
+the B50 (llvm-project 79ab4054), from upstream's default for an unanchored transposed tile.
+16 rows are right. A named workaround: the elements are all there, in another order
+(k=0, m0; k=0, m1; k=16, m0; ...), so it goes when an annotation or upstream gets the order
+right, and this check narrows to the wrong form."""
+
+
+def check_transposed_reads(module: ir.Module) -> None:
+    """Raise :class:`UnsupportedOperationError` if a lowered kernel calls a transposed
+    block read of 32 rows (:data:`_WRONG_TRANSPOSED_READ`). On any layout path: what
+    picks the read is not what makes it wrong."""
+    found: list[str] = []
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        if op.name == "llvm.call":
+            callee = op.attributes.get("callee")
+            if callee is not None and _WRONG_TRANSPOSED_READ in callee.value:
+                found.append(callee.value)
+                return ir.WalkResult.INTERRUPT
+        return ir.WalkResult.ADVANCE
+
+    module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    if found:
+        raise UnsupportedOperationError(
+            "a transposed block read of 32 rows",
+            reason=(
+                f"'{_WRONG_TRANSPOSED_READ}' gives wrong rows on the B50, with no "
+                "diagnostic; XeGPU picks it for a transposed tile without an anchor"
+            ),
+            alternatives=[
+                'anchored layouts (xegpu_layouts="ir" or "lighthouse")',
+                "target='cpu' (CPU tensors)",
+            ],
+        )

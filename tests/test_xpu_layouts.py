@@ -4,6 +4,8 @@ grids on small kernels, and what is refused."""
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
 
 import helion
@@ -25,9 +27,18 @@ from helion_mlir_backend._compiler.mlir_transforms import xegpu_layouts as xl
 from helion_mlir_backend._compiler.targets.xpu_params import xegpu_params
 
 PROBLEMS = (*kb.PROBLEMS, *kb.RANK3_PROBLEMS, *kb.LEVEL2_PROBLEMS)
-HAS_EXPLICIT_FIELDS = {"97_ScaledDotProductAttention"}
-"""Lighthouse's attention annotation leaves ``inst_data`` and ``order`` to the
-propagation, whose values IR-derived anchors state: same otherwise."""
+DIFFERS_FROM_LIGHTHOUSE = {
+    "6_Matmul_with_large_K_dimension_",
+    "7_Matmul_with_small_K_dimension_",
+    "9_Tall_skinny_matrix_multiplication_",
+    "17_Matmul_with_transposed_B",
+    "3_Batched_matrix_multiplication",
+    "10_3D_tensor_matrix_multiplication",
+    "59_Matmul_Swish_Scaling",
+    "97_ScaledDotProductAttention",
+}
+"""Where the rule decides a parameter these problems' keys leave open, measured (97:
+explicit fields lighthouse leaves to the propagation, same lowered kernels)."""
 
 
 def _lower(problem: kb.Problem, stage: str = "xegpu-wg", **extra: object) -> str:
@@ -53,31 +64,23 @@ def _without_explicit_fields(text: str) -> str:
     return re.sub(r", order = \[\d+, \d+\]", "", text)
 
 
-@pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.name)
+@pytest.mark.parametrize(
+    "problem",
+    [p for p in PROBLEMS if p.name not in DIFFERS_FROM_LIGHTHOUSE],
+    ids=lambda p: p.name,
+)
 def test_same_kernels_as_lighthouse(problem: kb.Problem) -> None:
-    """The toggle's reproduction claim: with lighthouse's selector as the source
-    and the same config, the same XeGPU, on every KernelBench kernel."""
+    """With today's keys the annotators agree on all but :data:`DIFFERS_FROM_LIGHTHOUSE`."""
     lighthouse = _kernels(_lower(problem, xegpu_layouts=["lighthouse"]))
-    derived = _kernels(_lower(problem, xegpu_layouts=["ir-selector"]))
-    if problem.name in HAS_EXPLICIT_FIELDS:
-        lighthouse = _without_explicit_fields(lighthouse)
-        derived = _without_explicit_fields(derived)
-    assert derived == lighthouse
+    assert _kernels(_lower(problem, xegpu_layouts=["ir"])) == lighthouse
 
 
 # --- The toggle ------------------------------------------------------------------
 
 
 def test_toggle_values() -> None:
-    params = xegpu_params(
-        {"xegpu_layouts": ["ir", "lighthouse", "ir-selector", "ir-upstream"]}
-    )
-    assert [p.layout_source for p in params] == [
-        "rule",
-        None,
-        "selector",
-        "upstream",
-    ]
+    params = xegpu_params({"xegpu_layouts": ["ir", "lighthouse"]})
+    assert [p.derives_layouts for p in params] == [True, False]
 
 
 def test_default_layouts_follow_the_environment(
@@ -89,10 +92,10 @@ def test_default_layouts_follow_the_environment(
     from helion_mlir_backend._compiler.targets.xpu_params import take_params
 
     entry = xegpu_params({"xegpu_layouts": [None]})[0]
-    for value, source in (("ir", "rule"), ("lighthouse", None)):
+    for value, derived in (("ir", True), ("lighthouse", False)):
         monkeypatch.setenv("HELION_MLIR_XPU_LAYOUTS", value)
-        assert entry.layout_source == source
-        assert KernelParams().layout_source == source
+        assert entry.derives_layouts == derived
+        assert KernelParams().derives_layouts == derived
         module = ir.Module.parse("module {}")
         attach_params(module, ())
         assert DEFAULT_LAYOUTS_ATTR in str(module)
@@ -100,11 +103,13 @@ def test_default_layouts_follow_the_environment(
         assert DEFAULT_LAYOUTS_ATTR not in str(module)
     monkeypatch.setenv("HELION_MLIR_XPU_LAYOUTS", "guess")
     with pytest.raises(XeGPUConfigError, match="HELION_MLIR_XPU_LAYOUTS"):
-        _ = KernelParams().layout_source
+        _ = KernelParams().derives_layouts
 
 
 @pytest.mark.parametrize(
-    "value", ["ir", ["IR"], [1], [True]], ids=["not-a-list", "name", "int", "bool"]
+    "value",
+    ["ir", ["IR"], [1], [True], ["ir-selector"], ["ir-upstream"]],
+    ids=["not-a-list", "name", "int", "bool", "selector", "upstream"],
 )
 def test_toggle_refuses(value: object) -> None:
     with pytest.raises(XeGPUConfigError, match="xegpu_layouts"):
@@ -130,12 +135,6 @@ def test_explicit_lighthouse_is_the_lighthouse_path() -> None:
         patch.setenv("HELION_MLIR_XPU_LAYOUTS", "lighthouse")
         by_default = _kernels(_lower(problem))
     assert by_default == _kernels(_lower(problem, xegpu_layouts=["lighthouse"]))
-
-
-def test_forced_tiles_are_checked_from_the_ir() -> None:
-    problem = kb.PROBLEMS[0]
-    with pytest.raises(XeGPUConfigError, match="does not divide"):
-        _lower(problem, xegpu_layouts=["ir"], xegpu_sg_tiles=[[33, 64]])
 
 
 # --- Small kernels, parsed: nothing but the IR ---------------------------------------
@@ -273,30 +272,9 @@ def test_sg_tile_hint_overrides_the_rule() -> None:
     assert xl.HINTS_ATTR not in str(module)
 
 
-@pytest.mark.parametrize(
-    ("hint", "match"),
-    [
-        ("sg_tile = array<i64: 33, 64>", "does not divide"),
-        ("sg_tile = array<i64: 8, 16>", "exceed"),
-        ('source = "guess"', "unknown layout source"),
-        (
-            "sg_tile = array<i64: 64, 32>, load_tiles = array<i64: 64, 32, 16, 16>",
-            "at most",
-        ),
-        ("load_tiles = array<i64: 7, 16, 16, 16>", "does not divide"),
-        ("prefetch_tiles = array<i64: 7, 16, 16, 16>", "does not divide"),
-    ],
-)
-def test_hints_refused(hint: str, match: str) -> None:
-    module = _parse(_gemm_body(), hint)
-    with pytest.raises(xl.LayoutError, match=match):
-        xl.annotate_layouts(module.operation, _func(module))
-
-
 def test_reduced_columns_pin_the_grid_to_rows() -> None:
     """A reduction over a GEMM's columns: all subgroups on the rows, no column
-    split (it would need SLM and a barrier); ``[rows, cols]`` is refused if it
-    splits them."""
+    split (it would need SLM and a barrier)."""
     module = _parse(_reduction_after_gemm())
     kernel = xl.analyze(_func(module))
     axes = xl.axes_of(kernel)
@@ -305,9 +283,9 @@ def test_reduced_columns_pin_the_grid_to_rows() -> None:
     plan = xl.annotate_layouts(module.operation, _func(module))
     assert plan.grid == xl.Grid(16, 1)
     assert plan.threads == 256
+    # A hint that would split them is dropped.
     module = _parse(_reduction_after_gemm(), "sg_tile = array<i64: 32, 32>")
-    with pytest.raises(xl.LayoutError, match="contracted or reduced"):
-        xl.annotate_layouts(module.operation, _func(module))
+    assert xl.annotate_layouts(module.operation, _func(module)).grid == xl.Grid(16, 1)
 
 
 def test_unknown_op_on_tiles_is_refused() -> None:
@@ -384,60 +362,11 @@ def test_check_layouts_refuses_inst_data_that_does_not_divide() -> None:
     assert any("does not divide" in p for p in xl.check_anchors(func))
 
 
-@pytest.mark.parametrize(
-    ("hint", "match"),
-    [
-        ("prefetch_depths = array<i64: 1, 1>", "apply to loads of DPAS operands"),
-        ("prefetch_tiles = array<i64: 16, 16, 16, 16>", "apply to loads of DPAS"),
-        ("load_tiles = array<i64: 16, 16, 16, 16>", "apply to DPAS operands"),
-    ],
-)
-def test_hints_without_a_target_are_refused(hint: str, match: str) -> None:
-    body = f"""
-      %t = arith.constant dense<0.0> : vector<64x64xf32>
-      %r0 = arith.constant dense<0.0> : vector<64xf32>
-      %r = vector.multi_reduction <add>, %t, %r0 [1] : vector<64x64xf32> to vector<64xf32>
-      %bc = vector.broadcast %r : vector<64xf32> to vector<64x64xf32>
-      %tr = vector.transpose %bc, [1, 0] : vector<64x64xf32> to vector<64x64xf32>
-      %out = arith.truncf %tr : vector<64x64xf32> to vector<64x64xbf16>
-      %dc = xegpu.create_nd_tdesc %c : memref<1024x1024xbf16> -> {_TDESC.format("64x64")}
-      xegpu.store_nd %out, %dc[%c0, %c0] : vector<64x64xbf16>, {_TDESC.format("64x64")}
-    """
-    module = _parse(body, hint)
-    with pytest.raises(xl.LayoutError, match=match):
-        xl.annotate_layouts(module.operation, _func(module))
-
-
-def test_a_2d_load_tile_needs_a_tile_that_is_no_operand() -> None:
-    module = _parse(_gemm_body(), "load_tiles = array<i64: 8, 16>")
-    with pytest.raises(xl.LayoutError, match="no DPAS operands"):
-        xl.annotate_layouts(module.operation, _func(module))
-
-
-def test_prefetch_tile_limits() -> None:
-    module = _parse(_gemm_body(), "prefetch_tiles = array<i64: 4, 16, 16, 16>")
-    with pytest.raises(xl.LayoutError, match="2D block prefetches"):
-        xl.annotate_layouts(module.operation, _func(module))
-
-
 def test_prefetch_depth_zero_is_none() -> None:
     """Explicitly no prefetch of A, a form lighthouse's annotation refuses."""
     module = _parse(_gemm_body(), "prefetch_depths = array<i64: 0, 1>")
     plan = xl.annotate_layouts(module.operation, _func(module))
     assert len(plan.prefetches) == 1
-
-
-@pytest.mark.parametrize(
-    ("hint", "k", "match"),
-    [
-        ("sg_tile = array<i64: 128, 256>", 32, "parallel DPAS"),
-        ("sg_tile = array<i64: 64, 32>", 64, "in registers"),
-    ],
-)
-def test_forced_tiles_must_fit_a_subgroup(hint: str, k: int, match: str) -> None:
-    module = _parse(_gemm_body(256, 256, k), hint)
-    with pytest.raises(xl.LayoutError, match=match):
-        xl.annotate_layouts(module.operation, _func(module))
 
 
 # --- New forms: refused by lighthouse's path, laid out from their IR --------------
@@ -642,8 +571,9 @@ def test_rule_anchors_its_load_tiles() -> None:
     assert "sg_data = [32, 64], inst_data = [16, 32]" in b_load
 
 
-def test_transposed_load_takes_16_or_32_rows() -> None:
-    """Upstream's table: a transposed block read is 8 pairs wide, 16 or 32 rows."""
+def test_transposed_32_row_read_is_never_laid_out() -> None:
+    """Upstream's table allows 32 rows, and it lowers with no diagnostic, but every row
+    was wrong on the B50: the hint is dropped, and the read takes 16 rows."""
     a = _TDESC.format("256x32")
     b = _TDESC.format("256x32")
     c = _TDESC.format("256x256")
@@ -662,23 +592,34 @@ def test_transposed_load_takes_16_or_32_rows() -> None:
       %dc = xegpu.create_nd_tdesc %c : memref<1024x1024xbf16> -> {c}
       xegpu.store_nd %t, %dc[%c0, %c0] : vector<256x256xbf16>, {c}
     """
+    module = _parse(body, "load_tiles = array<i64: 16, 32, 16, 16>")
+    xl.annotate_layouts(module.operation, _func(module))
+    (_, transposed) = _anchors(module, "xegpu.load_nd")
+    assert "inst_data = [16, 16], order = [0, 1]" in transposed
     module = _parse(body, "load_tiles = array<i64: 16, 32, 32, 16>")
     xl.annotate_layouts(module.operation, _func(module))
     (_, transposed) = _anchors(module, "xegpu.load_nd")
-    assert "inst_data = [32, 16], order = [0, 1]" in transposed
-    module = _parse(body, "load_tiles = array<i64: 16, 32, 16, 32>")
-    with pytest.raises(xl.LayoutError, match="a transposed load takes"):
-        xl.annotate_layouts(module.operation, _func(module))
+    assert "inst_data = [16, 16], order = [0, 1]" in transposed
+    assert "inst_data = [32, 16]" not in str(module)
 
 
 def test_output_bound_kernel_takes_wide_subgroups() -> None:
-    """``M * N >= K * (M + N)``: fewer subgroups, each storing 8 rows of 128 bytes."""
-    body = _gemm_body(64, 128, 32).replace("%c1024 step", "%c32 step")
+    """``M * N >= 32 * K * (M + N)``: fewer subgroups, each storing 8 rows of 128 bytes."""
+    body = "%k = arith.constant 8 : index\n" + _gemm_body(64, 128, 32).replace(
+        "%c1024 step", "%k step"
+    )
     module = _parse(body)
     kernel = xl.analyze(_func(module))
     assert xl.output_bound(kernel)
     axes = xl.axes_of(kernel)
     assert xl.preferred_grid(axes, xl.legal_grids(axes)) == xl.Grid(8, 2)
+
+
+def test_mildly_output_heavy_kernel_is_not_output_bound() -> None:
+    """Factor 16 in the output's favour: 32x32 won there, so it isn't."""
+    body = _gemm_body(64, 128, 32).replace("%c1024 step", "%c32 step")
+    module = _parse(body)
+    assert not xl.output_bound(xl.analyze(_func(module)))
 
 
 def test_operand_bound_kernel_takes_all_subgroups() -> None:
@@ -723,3 +664,498 @@ def test_b_next_to_a_transposed_a_loads_16_columns() -> None:
     a_load, b_load = _anchors(module, "xegpu.load_nd")
     assert "inst_data = [16, 16], order = [0, 1]" in a_load
     assert "sg_data = [32, 64], inst_data = [16, 16]" in b_load
+
+
+@pytest.mark.parametrize("problem", PROBLEMS, ids=lambda p: p.name)
+def test_default_lowers_every_problem(problem: kb.Problem) -> None:
+    """The default path, with each problem's config, reaches LLVM with no XeGPU."""
+    text = _lower(problem, "xevm")
+    assert "xegpu." not in text
+    assert "llvm.func spir_funccc" in text
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "1_Square_matrix_multiplication_",
+        "19_ReLU",
+        "23_Softmax",
+        "97_ScaledDotProductAttention",
+    ],
+)
+def test_sampled_configs_are_laid_out_or_refused(name: str) -> None:
+    """The autotuner's samples under the default: a layout, or a config error,
+    later than lighthouse's (at the layout stage) but not an internal failure."""
+    from tests.test_xpu_autotune import _samples
+    from tests.test_xpu_autotune import _xpu_spec
+
+    problem = next(p for p in PROBLEMS if p.name == name)
+    spec = _xpu_spec(problem)
+    inputs = [xpu_tensor(*shape, dtype=problem.dtype) for shape in problem.shapes]
+    for config in [spec.default_config(), *_samples(spec, 6)]:
+        with contextlib.suppress(XeGPUConfigError, UnsupportedOperationError):
+            lower_mlir(
+                problem.kernel, inputs, config=config, target="xpu", stop_at="xegpu-wg"
+            )
+
+
+# --- Hints: dropped when they don't fit, with a log line ----------------------------
+
+_GEMM_FORM = forms.GEMM_FORM
+_ROW_NORM = forms.FORMS["row_norm_n256"]
+_ATTENTION = forms.FORMS["attention_head128"]
+_ELEMENTWISE = forms.ELEMENTWISE_FORM
+_REDUCTION = forms.REDUCTION_FORM
+
+_PLAIN_B_FORM = forms.PLAIN_B_FORM
+
+DROPPED_HINTS = {
+    "load_a_24_rows": (
+        forms.GEMM_FORM_48,
+        "xegpu_load_tiles",
+        [24, 16, 16, 16],
+        "load_tiles",
+    ),
+    "prefetch_not_whole_blocks": (
+        _GEMM_FORM,
+        "xegpu_prefetch_tiles",
+        [12, 16, 16, 16],
+        "prefetch_tiles",
+    ),
+    # name: (form, config key, value, hint in the log, lighthouse's path refuses it too)
+    "sg_not_dividing": (_GEMM_FORM, "xegpu_sg_tiles", [33, 64], "sg_tile"),
+    "sg_too_many_subgroups": (_GEMM_FORM, "xegpu_sg_tiles", [8, 16], "sg_tile"),
+    "sg_too_many_dpas": (_GEMM_FORM, "xegpu_sg_tiles", [128, 256], "sg_tile"),
+    "sg_zero_rows": (_GEMM_FORM, "xegpu_sg_tiles", [0, 64], "sg_tile"),
+    "sg_splits_reduced_columns": (_ROW_NORM, "xegpu_sg_tiles", [32, 32], "sg_tile"),
+    "sg_attention_rows": (_ATTENTION, "xegpu_sg_tiles", [48, 0], "sg_tile"),
+    "sg_elementwise": (_ELEMENTWISE, "xegpu_sg_tiles", [48, 64], "sg_tile"),
+    "sg_reduction": (_REDUCTION, "xegpu_sg_tiles", [48, 0], "sg_tile"),
+    "load_a_1_row": (_GEMM_FORM, "xegpu_load_tiles", [1, 32, 16, 16], "load_tiles"),
+    "load_a_2_rows": (_GEMM_FORM, "xegpu_load_tiles", [2, 32, 16, 16], "load_tiles"),
+    "load_a_4_rows": (_GEMM_FORM, "xegpu_load_tiles", [4, 32, 16, 16], "load_tiles"),
+    "load_a_1_row_16_cols": (
+        _GEMM_FORM,
+        "xegpu_load_tiles",
+        [1, 16, 16, 16],
+        "load_tiles",
+    ),
+    "load_a_8_cols": (_GEMM_FORM, "xegpu_load_tiles", [8, 8, 16, 16], "load_tiles"),
+    "load_b_1_row": (_PLAIN_B_FORM, "xegpu_load_tiles", [8, 16, 1, 16], "load_tiles"),
+    "load_b_2_rows": (_PLAIN_B_FORM, "xegpu_load_tiles", [8, 16, 2, 16], "load_tiles"),
+    "load_b_4_rows": (_PLAIN_B_FORM, "xegpu_load_tiles", [8, 16, 4, 16], "load_tiles"),
+    "load_b_8_rows": (_PLAIN_B_FORM, "xegpu_load_tiles", [8, 16, 8, 16], "load_tiles"),
+    "load_b_8_cols": (_PLAIN_B_FORM, "xegpu_load_tiles", [8, 16, 16, 8], "load_tiles"),
+    "load_not_dividing": (
+        _GEMM_FORM,
+        "xegpu_load_tiles",
+        [7, 16, 16, 16],
+        "load_tiles",
+    ),
+    "load_too_big": (_GEMM_FORM, "xegpu_load_tiles", [64, 32, 16, 16], "load_tiles"),
+    "load_two_entries_on_gemm": (_GEMM_FORM, "xegpu_load_tiles", [8, 16], "load_tiles"),
+    "load_transposed_32_rows": (
+        _GEMM_FORM,
+        "xegpu_load_tiles",
+        [16, 32, 32, 16],
+        "load_tiles",
+    ),
+    "load_four_on_elementwise": (
+        _ELEMENTWISE,
+        "xegpu_load_tiles",
+        [8, 16, 16, 16],
+        "load_tiles",
+    ),
+    "load_four_on_reduction": (
+        _REDUCTION,
+        "xegpu_load_tiles",
+        [8, 16, 16, 16],
+        "load_tiles",
+    ),
+    "load_reduction_rows": (_REDUCTION, "xegpu_load_tiles", [3, 16], "load_tiles"),
+    "prefetch_not_dividing": (
+        _GEMM_FORM,
+        "xegpu_prefetch_tiles",
+        [7, 16, 16, 16],
+        "prefetch_tiles",
+    ),
+    "prefetch_too_small": (
+        _GEMM_FORM,
+        "xegpu_prefetch_tiles",
+        [4, 16, 16, 16],
+        "prefetch_tiles",
+    ),
+    "prefetch_tile_on_reduction": (
+        _REDUCTION,
+        "xegpu_prefetch_tiles",
+        [16, 16, 16, 16],
+        "prefetch_tiles",
+    ),
+    "prefetch_depth_on_elementwise": (
+        _ELEMENTWISE,
+        "xegpu_prefetch_depths",
+        [1, 1],
+        "prefetch_depths",
+    ),
+}
+"""Every way a hint was refused before; ``tests/test_xpu_layouts_runtime.py`` runs these
+on the device."""
+
+
+def _lower_hinted(form: forms.Form, stage: str = "xegpu-wg", **config: object) -> str:
+    kernel = _form_kernel(form, **config)
+    return str(lower_mlir(kernel, _form_args(form), target="xpu", stop_at=stage))
+
+
+@pytest.mark.parametrize("name", list(DROPPED_HINTS))
+def test_dropped_hint_gives_the_rules_layout_and_a_log_line(
+    name: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    form, key, value, hint = DROPPED_HINTS[name]
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")  # lower in-process
+    with caplog.at_level("WARNING", logger=xl.log.name):
+        hinted = _lower_hinted(form, xegpu_layouts=["ir"], **{key: [value]})
+    assert f"dropped the hint {hint}=" in caplog.text
+    assert _kernels(hinted) == _kernels(_lower_hinted(form, xegpu_layouts=["ir"]))
+
+
+@pytest.mark.parametrize("name", list(DROPPED_HINTS))
+def test_dropped_hint_is_refused_on_lighthouses_path(name: str) -> None:
+    """The strict checks stay on lighthouse's path. A form it has no class for is
+    refused for that; every other case for the hint itself."""
+    form, key, value, _ = DROPPED_HINTS[name]
+    with pytest.raises((XeGPUConfigError, UnsupportedOperationError)):
+        _lower_hinted(form, xegpu_layouts=["lighthouse"], **{key: [value]})
+
+
+def test_legal_hint_is_honoured_without_a_log_line(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")
+    with caplog.at_level("WARNING", logger=xl.log.name):
+        text = _lower_hinted(
+            _GEMM_FORM, xegpu_layouts=["ir"], xegpu_sg_tiles=[[64, 32]]
+        )
+    assert "dropped the hint" not in caplog.text
+    assert "sg_layout = [4, 8], sg_data = [64, 32]" in text
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("xegpu_sg_tiles", [64]),
+        ("xegpu_sg_tiles", [64.0, 32]),
+        ("xegpu_load_tiles", [8, 16, 16]),
+        ("xegpu_prefetch_depths", [1]),
+        ("xegpu_prefetch_tiles", [8, 16]),
+    ],
+)
+def test_malformed_keys_still_fail_under_the_annotator(key: str, value: list) -> None:
+    """Typos are not hints."""
+    with pytest.raises(XeGPUConfigError, match=key):
+        _lower_hinted(_GEMM_FORM, xegpu_layouts=["ir"], **{key: [value]})
+
+
+def test_an_illegal_layout_without_hints_is_still_refused() -> None:
+    """Dropping hints doesn't make a kernel legal: the check after them stays strict."""
+    module = _parse(_gemm_body(256, 24), "sg_tile = array<i64: 32, 24>")
+    with pytest.raises(xl.LayoutError):
+        xl.annotate_layouts(module.operation, _func(module))
+
+
+def test_tiles_over_the_register_file_are_dropped(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A forced tile whose A, B and C don't fit in registers is dropped; the rule's
+    grid stands."""
+    hinted = _parse(_gemm_body(256, 256, 64), "sg_tile = array<i64: 64, 32>")
+    with caplog.at_level("WARNING", logger=xl.log.name):
+        plan = xl.annotate_layouts(hinted.operation, _func(hinted))
+    assert "dropped the hint sg_tile=" in caplog.text
+    assert "in registers" in caplog.text
+    ruled = _parse(_gemm_body(256, 256, 64))
+    assert plan.grid == xl.annotate_layouts(ruled.operation, _func(ruled)).grid
+    assert _anchors(hinted, "xegpu.load_nd") == _anchors(ruled, "xegpu.load_nd")
+
+
+_TRANSPOSED_32_ROWS = "transpose_32b_32r8x1c"
+_TRANSPOSED_16_ROWS = "transpose_32b_16r8x1c"
+
+
+@pytest.mark.parametrize("layouts", ["lighthouse", "ir"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "16_Matmul_with_transposed_A",
+        "17_Matmul_with_transposed_B",
+        "18_Matmul_with_transposed_both",
+        "29_Matmul_Mish_Mish",
+        "97_ScaledDotProductAttention",
+    ],
+)
+def test_no_annotator_reads_transposed_tiles_in_32_rows(
+    name: str, layouts: str
+) -> None:
+    """Those reads are wrong on every row on the B50, with no diagnostic: nothing
+    a kernel with transposed operands lowers to may use them, whichever annotator."""
+    problem = next(p for p in PROBLEMS if p.name == name)
+    text = _lower(problem, "xevm", xegpu_layouts=[layouts])
+    assert _TRANSPOSED_16_ROWS in text
+    assert _TRANSPOSED_32_ROWS not in text
+
+
+def test_lighthouses_path_refuses_a_transposed_32_row_hint() -> None:
+    with pytest.raises(XeGPUConfigError, match="transposed"):
+        _lower_hinted(
+            _GEMM_FORM,
+            xegpu_layouts=["lighthouse"],
+            xegpu_load_tiles=[[16, 32, 32, 16]],
+        )
+
+
+@pytest.mark.parametrize("rows", [3, 5, 7, 9, 15])
+def test_attention_rows_with_no_dpas_are_refused(rows: int) -> None:
+    """Subgroups of 1 row abort at launch (``ZE_RESULT_ERROR_INVALID_MODULE_UNLINKED``):
+    a clean refusal, as lighthouse's path gives."""
+    kernel = helion.kernel(
+        forms.attention,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[1, rows, 64], xegpu_layouts=["ir"]),
+    )
+    args = [
+        xpu_tensor(*shape, dtype=torch.bfloat16)
+        for shape in ((64, rows, 64), (64, 512, 64), (64, 512, 64))
+    ]
+    with pytest.raises(UnsupportedOperationError, match="subgroups of"):
+        lower_mlir(kernel, args, target="xpu", stop_at="xegpu-wg")
+
+
+def test_reduction_over_the_rows_is_refused() -> None:
+    """Exact regression: a sum over columns and rows aborted on an SLM size."""
+    kernel = helion.kernel(
+        forms.gemm_norm_over_rows,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[128, 32], xegpu_layouts=["ir"]),
+    )
+    args = [
+        xpu_tensor(512, 2048, dtype=torch.bfloat16),
+        xpu_tensor(256, 2048, dtype=torch.bfloat16),
+    ]
+    with pytest.raises(UnsupportedOperationError, match="no subgroup grid"):
+        lower_mlir(kernel, args, target="xpu", stop_at="xegpu-wg")
+
+
+def test_transposed_a_keeps_16_row_subgroups() -> None:
+    """Exact regression: the rule's grid must leave a transposed read its 16 rows,
+    where lighthouse lowers the kernel."""
+    module_text = _lower_hinted(
+        forms.FORMS["transposed_both_16_rows"], xegpu_layouts=["ir"]
+    )
+    (load, *_) = re.findall(r"xegpu\.load_nd [^\n]*order = \[0, 1\][^\n]*", module_text)
+    assert "inst_data = [16, 16]" in load
+
+
+def test_transposed_read_that_is_no_operand_has_its_order() -> None:
+    """Exact regression: without ``order`` the lowering aborts."""
+    text = _lower_hinted(
+        forms.FORMS["gemm_plus_transposed"], xegpu_layouts=["ir"], stage="xevm"
+    )
+    assert "xegpu." not in text
+
+
+def test_dropped_hint_reaches_the_parent_log(caplog: pytest.LogCaptureFixture) -> None:
+    """In the default mode the lowering runs in a forked child, whose stderr is not
+    shown: the line must still reach the caller's log."""
+    assert os.environ.get("HELION_MLIR_COMPILE_TIMEOUT") != "0"
+    with caplog.at_level("WARNING"):
+        _lower_hinted(_GEMM_FORM, xegpu_layouts=["ir"], xegpu_sg_tiles=[[33, 64]])
+    assert "dropped the hint sg_tile=" in caplog.text
+
+
+def _strip_anchors(module: ir.Module) -> None:
+    prefetches = []
+
+    def visit(op: ir.Operation) -> ir.WalkResult:
+        for name in ("layout", "layout_a", "layout_b", "layout_cd"):
+            if op.name.startswith("xegpu.") and name in op.attributes:
+                del op.attributes[name]
+        if op.name == "xegpu.prefetch_nd":
+            prefetches.append(op)
+        return ir.WalkResult.ADVANCE
+
+    module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    for op in prefetches:
+        op.erase()
+
+
+@pytest.mark.parametrize(
+    ("name", "refused"),
+    [
+        ("16_Matmul_with_transposed_A", True),
+        ("18_Matmul_with_transposed_both", True),
+        ("17_Matmul_with_transposed_B", False),
+    ],
+)
+def test_upstreams_default_32_row_transposed_read_is_caught(
+    name: str, refused: bool
+) -> None:
+    """Exact regression, by what the check sees: with no anchors, upstream reads a
+    transposed A in 32 rows, and 512 of 512 rows came out wrong on the B50 (max error
+    1.4; 2.5e-3 with anchors), with no diagnostic. A transposed B stays at 16 rows."""
+    from helion_mlir_backend._compiler.mlir_transforms.xevm_lane_reductions import (
+        check_transposed_reads,
+    )
+
+    problem = next(p for p in PROBLEMS if p.name == name)
+    module = ir.Module.parse(_lower(problem, xegpu_layouts=["lighthouse"]))
+    _strip_anchors(module)
+    PassManager.parse(
+        "builtin.module(gpu-lower-to-xevm-pipeline{xegpu-op-level=workgroup "
+        "binary-format=skip})",
+        module.context,
+    ).run(module.operation)
+    if refused:
+        with pytest.raises(UnsupportedOperationError, match="32 rows"):
+            check_transposed_reads(module)
+    else:
+        check_transposed_reads(module)
+
+
+@pytest.mark.parametrize(
+    ("tile", "grid"),
+    [
+        ((128, 128), xl.Grid(4, 4)),  # at most 16 subgroups of 32x32
+        ((256, 256), xl.Grid(8, 4)),  # 32 subgroups already give 32x64
+        ((32, 256), xl.Grid(2, 16)),  # 32x32 would leave 8: as many as fit
+    ],
+)
+def test_rule_keeps_tiles_of_32x32_while_16_subgroups_remain(
+    tile: tuple[int, int], grid: xl.Grid
+) -> None:
+    module = _parse(_gemm_body(*tile, 32))
+    axes = xl.axes_of(xl.analyze(_func(module)))
+    assert xl.preferred_grid(axes, xl.legal_grids(axes)) == grid
+
+
+def test_no_prefetch_tile_fits_means_no_prefetch() -> None:
+    """Exact regression: a K=512 grid lighthouse lowers and ``ir`` refused. The tile 32x64
+    with 1 subgroup row has no prefetch tile within the kernel's threads: slower, not
+    wrong."""
+    assert xl._prefetch_tile((512, 64), 2, False) is None
+    assert xl._prefetch_tile((64, 64), 32, False) == (8, 16)
+
+
+@pytest.mark.parametrize("blocks", [[32, 512, 64], [48, 512, 64], [512, 32, 64]])
+def test_cells_without_a_prefetch_tile_lower(blocks: list[int]) -> None:
+    kernel = helion.kernel(
+        forms.matmul,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=blocks, xegpu_layouts=["ir"]),
+    )
+    m = 4 * blocks[0]
+    n = 4 * blocks[1]
+    args = [
+        xpu_tensor(m, 512, dtype=torch.bfloat16),
+        xpu_tensor(512, n, dtype=torch.bfloat16),
+    ]
+    assert "xegpu.dpas" in str(
+        lower_mlir(kernel, args, target="xpu", stop_at="xegpu-wg")
+    )
+
+
+def test_rule_prefetch_tile_is_whole_blocks() -> None:
+    """Regression: a tile :data:`PREFETCH_INST` doesn't divide ended in "a kernel without
+    valid XeGPU layouts" with a legal ``xegpu_sg_tiles=[[24, 32]]``."""
+    assert xl._prefetch_tile((96, 64), 32, False) in {
+        (8, 16),
+        (16, 16),
+        (8, 32),
+        (16, 32),
+        (24, 16),
+        (24, 32),
+        (32, 16),
+        (32, 32),
+    }
+    assert xl._prefetch_blocks((12, 16), False) is False
+    assert xl._prefetch_blocks((24, 32), True) is False
+
+
+def test_tile_over_the_registers_warns_with_the_cause(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """No tile fits the registers (4096^3 at [512, 512, 32]: 134956 us against 7123 at
+    [128, 128, 32] on the B50, correct, and lighthouse refuses): the rule goes on, and
+    says why it will be slow."""
+    module = _parse(_gemm_body(512, 512, 32))
+    with caplog.at_level("WARNING", logger=xl.log.name):
+        xl.annotate_layouts(module.operation, _func(module))
+    assert "take smaller block sizes" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("fn", "shapes"),
+    [
+        (forms.elementwise_plus_transposed, ((256, 256), (256, 256))),
+        (forms.tile_plus_its_transpose, ((256, 256),)),
+    ],
+)
+def test_transposes_the_lowering_aborts_on_are_refused(
+    fn: object, shapes: tuple
+) -> None:
+    """Exact regression: an assert in upstream's lane distribution killed the lowering."""
+    kernel = helion.kernel(
+        fn,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[64, 64], xegpu_layouts=["ir"]),
+    )
+    args = [xpu_tensor(*shape, dtype=torch.bfloat16) for shape in shapes]
+    with pytest.raises(UnsupportedOperationError, match="vector.transpose"):
+        lower_mlir(kernel, args, target="xpu", stop_at="xegpu-wg")
+
+
+def _computed_then_transposed(a, b, o):
+    for tm, tn in hl.tile([a.size(1), b.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(a.size(0)):
+            acc = torch.addmm(
+                acc, (a[tk, tm].to(torch.float32) + 1.0).to(a.dtype).T, b[tk, tn]
+            )
+        o[tm, tn] = acc.to(a.dtype)
+    return o
+
+
+def _b_computed_then_transposed(a, b, o):
+    for tm, tn in hl.tile([a.size(0), b.size(0)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(a.size(1)):
+            acc = torch.addmm(
+                acc, a[tm, tk], (b[tn, tk].to(torch.float32) + 1.0).to(b.dtype).T
+            )
+        o[tm, tn] = acc.to(a.dtype)
+    return o
+
+
+@pytest.mark.parametrize(
+    ("fn", "shapes"),
+    [
+        (_computed_then_transposed, ((256, 512), (256, 512), (512, 512))),
+        (_b_computed_then_transposed, ((512, 256), (512, 256), (512, 512))),
+    ],
+    ids=["a", "b"],
+)
+def test_computed_operand_then_transposed_is_refused(fn: object, shapes: tuple) -> None:
+    """Exact regression: an assert in upstream's ``computeDistributedCoordsForMatrixOp``
+    killed the lowering; the uncomputed ``a[tk, tm].T`` lays out."""
+    kernel = helion.kernel(
+        fn,
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[256, 256, 32], xegpu_layouts=["ir"]),
+    )
+    args = [xpu_tensor(*shape, dtype=torch.bfloat16) for shape in shapes]
+    with pytest.raises(UnsupportedOperationError, match="vector.transpose"):
+        lower_mlir(kernel, args, target="xpu", stop_at="xevm")

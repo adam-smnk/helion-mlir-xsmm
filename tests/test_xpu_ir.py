@@ -11,6 +11,7 @@ import collections
 import contextlib
 import importlib.util
 import io
+import os
 import re
 from typing import TYPE_CHECKING
 from unittest import mock
@@ -45,6 +46,7 @@ from helion_mlir_backend._compiler.targets.xpu import bindings_emit_spirv
 from helion_mlir_backend._compiler.targets.xpu_params import AttentionShape
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
     from pathlib import Path
 
 N = 1024
@@ -399,9 +401,14 @@ def _gemm_args(dtype: torch.dtype = torch.float16, size: int = N) -> list[object
 
 
 @pytest.fixture(autouse=True)
-def xpu_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def xpu_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     for name in ("HELION_MLIR_TARGET", "HELION_MLIR_XPU_STOP_AT"):
         monkeypatch.delenv(name, raising=False)
+    # Lighthouse's path, as long as the toggle has it: its refusals and classes.
+    # Not through monkeypatch: isolated tests pickle the fixtures they take.
+    os.environ["HELION_MLIR_XPU_LAYOUTS"] = "lighthouse"
+    yield
+    del os.environ["HELION_MLIR_XPU_LAYOUTS"]
 
 
 # --- IR checks ---------------------------------------------------------------

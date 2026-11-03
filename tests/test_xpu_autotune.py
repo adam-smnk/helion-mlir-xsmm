@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import random
+from typing import TYPE_CHECKING
 from unittest import mock
 
 import helion
@@ -33,6 +34,9 @@ from helion_mlir_backend._compiler.targets.xpu_search import ATTENTION as ATTENT
 from helion_mlir_backend._compiler.targets.xpu_search import KernelChoicesFragment
 from helion_mlir_backend._compiler.targets.xpu_search import search_kernels
 from helion_mlir_backend.api import _compile
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _PROBLEMS = {problem.name: problem for problem in (*PROBLEMS, *RANK3_PROBLEMS)}
 GEMM = "1_Square_matrix_multiplication_"
@@ -60,9 +64,14 @@ def _samples(spec: object, count: int) -> list[helion.Config]:
 
 
 @pytest.fixture(autouse=True)
-def xpu_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def xpu_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     for name in ("HELION_MLIR_TARGET", "HELION_MLIR_XPU_STOP_AT"):
         monkeypatch.delenv(name, raising=False)
+    # Lighthouse's path, as long as the toggle has it: its refusals and classes.
+    # Not through monkeypatch: isolated tests pickle the fixtures they take.
+    os.environ["HELION_MLIR_XPU_LAYOUTS"] = "lighthouse"
+    yield
+    del os.environ["HELION_MLIR_XPU_LAYOUTS"]
 
 
 @pytest.mark.isolated

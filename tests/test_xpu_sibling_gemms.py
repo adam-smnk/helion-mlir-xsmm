@@ -3,6 +3,8 @@ projections) in one grid loop on XPU: each DPAS gets the layout of a lone GEMM."
 
 from __future__ import annotations
 
+import os
+from typing import TYPE_CHECKING
 from unittest import mock
 
 import helion
@@ -17,7 +19,21 @@ import helion_mlir_backend  # noqa: F401
 from helion_mlir_backend._compiler import xpu_transforms
 from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
 BF16 = torch.bfloat16
+
+
+@pytest.fixture(autouse=True)
+def lighthouse_layouts() -> Iterator[None]:
+    """Sibling GEMMs on lighthouse's path; the default's are in
+    ``test_xpu_layouts``, and its refusals don't apply there."""
+    os.environ["HELION_MLIR_XPU_LAYOUTS"] = "lighthouse"
+    yield
+    del os.environ["HELION_MLIR_XPU_LAYOUTS"]
+
+
 M, N, K = 64, 512, 256
 CONFIG = {"block_sizes": [64, 256, 32], "xegpu_sg_tiles": [[8, 64]]}
 

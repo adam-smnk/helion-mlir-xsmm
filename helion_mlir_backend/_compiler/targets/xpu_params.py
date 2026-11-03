@@ -104,15 +104,12 @@ Other kernels and other builds are not proven: ``agent-tools/igc_binary_check.py
 helion-mlir-dev checks a kernel's binaries, and ``igc_vectorizer="off"`` is the escape
 hatch."""
 LAYOUTS = "xegpu_layouts"
-"""Per GPU kernel, who decides its XeGPU layouts: ``"lighthouse"``, the default
-(lighthouse's annotation, by kernel class), ``"ir"`` (derived from the kernel's IR
-by :mod:`~..mlir_transforms.xegpu_layouts`, with its rule for what the config does
-not force), ``"ir-selector"`` (the same, with lighthouse's parameter selection
-where it applies) or ``"ir-upstream"`` (the rule's thread count, then what
-upstream's ``xegpu-propagate-layout`` defaults to; a baseline to measure against).
-Not searched by the autotuner."""
-LAYOUT_VALUES = {"lighthouse": 0, "ir": 1, "ir-selector": 2, "ir-upstream": 3}
-LAYOUT_SOURCES = {1: "rule", 2: "selector", 3: "upstream"}
+"""Per GPU kernel, who decides its XeGPU layouts: ``"ir"`` (derived from
+the kernel's IR by :mod:`~..mlir_transforms.xegpu_layouts`, the other keys being hints it
+drops with a log line if they don't fit), or ``"lighthouse"``, the default (lighthouse's
+annotation, by kernel class, the other keys checked strictly). ``HELION_MLIR_XPU_LAYOUTS`` changes the
+default: an escape hatch. Not searched by the autotuner."""
+LAYOUT_VALUES = {"lighthouse": 0, "ir": 1}
 DEFAULT_LAYOUTS = "lighthouse"
 """What a kernel without an ``xegpu_layouts`` entry takes."""
 DEFAULT_LAYOUTS_ATTR = "helion.xegpu_default_layouts"
@@ -167,10 +164,10 @@ class KernelParams:
     """``(LAYOUT_VALUES[...],)``; ``None``: :func:`default_layouts`."""
 
     @property
-    def layout_source(self) -> str | None:
-        """The source of IR-derived layouts; ``None``: lighthouse's annotation."""
+    def derives_layouts(self) -> bool:
+        """Whether the layouts come from the IR, not lighthouse's annotation."""
         value = self.layouts[0] if self.layouts else LAYOUT_VALUES[default_layouts()]
-        return LAYOUT_SOURCES.get(value)
+        return value != LAYOUT_VALUES["lighthouse"]
 
     def forced(self) -> dict[str, tuple[int, ...]]:
         """The forced parameters, by config key."""
@@ -222,7 +219,7 @@ def xegpu_params(config: Mapping[str, object]) -> tuple[KernelParams, ...]:
             entry = {
                 NAN_IGNORING_MAXIMA: "True",
                 VECTORIZER: '"cmp" or "off"',
-                LAYOUTS: '"lighthouse", "ir", "ir-selector" or "ir-upstream"',
+                LAYOUTS: '"ir" or "lighthouse"',
             }.get(key, f"a list of {_ARITY.get(key)} ints")
             raise XeGPUConfigError(
                 f"{key}={value!r}: expected a list with one entry per GPU kernel "
@@ -247,8 +244,8 @@ def _entry(key: str, index: int, item: object) -> tuple[int, ...] | None:
     if key == LAYOUTS:
         if item not in LAYOUT_VALUES:
             raise XeGPUConfigError(
-                f'{key}[{index}]={item!r}: expected "lighthouse", "ir", '
-                '"ir-selector", "ir-upstream" or None (one entry per GPU kernel)'
+                f'{key}[{index}]={item!r}: expected "ir", "lighthouse" or None (one entry '
+                "per GPU kernel)"
             )
         return (LAYOUT_VALUES[item],)
     if key == VECTORIZER:
@@ -880,16 +877,18 @@ def check_params(
     specs = XeGPUSpecs.get("B70")
     for index, shape in enumerate(shapes):
         kernel = params[index] if index < len(params) else KernelParams()
+        if kernel.derives_layouts:
+            # Keys are hints when the layouts are derived, and these checks are
+            # lighthouse's: xegpu_layouts drops what doesn't fit, with a log line.
+            # Malformed entries failed in xegpu_params. Row maxima are decided by
+            # their own def-use graph (row_maxima).
+            continue
         if kernel.nan_ignoring_maxima and not isinstance(shape, AttentionShape):
             raise XeGPUConfigError(
                 f"{NAN_IGNORING_MAXIMA}[{index}]: invalid for GPU kernel {index}: "
                 "it applies to attention kernels, whose row maxima only shift an "
                 "exponential"
             )
-        if kernel.layout_source is not None:
-            # Legality comes from the IR when the layouts are derived, with
-            # what is forced as hints in it (xegpu_layouts.check_layouts).
-            continue
         forced = kernel.layout_forced()
         try:
             if isinstance(shape, GemmShape):

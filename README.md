@@ -146,7 +146,7 @@ keeps lighthouse's inference.
 | `xegpu_prefetch_tiles` | `[a_m, a_k, b_k, b_n]`: A and B prefetch tiles, in the operand's stored orientation (`[n, k]` for a transposed B) | GEMM kernels |
 | `xegpu_prefetch_depths` | `[a_nb, b_nb]`: K iterations A and B are prefetched ahead | GEMM kernels |
 | `xegpu_nan_ignoring_maxima` | `True`: row maxima that only shift an `exp` ignore NaN, which is faster. The output is the same, as a NaN score gives a NaN row through `exp` and the sum, given IGC's options: this form is what IGC's vectorizer miscompiles without them ([`xpu_params.py`](helion_mlir_backend/_compiler/targets/xpu_params.py)) | attention kernels |
-| `xegpu_layouts` | Who decides the kernel's XeGPU layouts. `"lighthouse"`, the default: lighthouse's annotation, by kernel class. `"ir"`: derived from the kernel's IR and the target (`mlir_transforms/xegpu_layouts.py`), which also lays out kernels the classes refuse (sibling GEMMs, a GEMM with a row reduction, attention of any head dim and rows, GEMMs of few rows, chains), the other keys here acting as hints. `"ir-selector"`: the same with lighthouse's parameter selection as its source. `"ir-upstream"`: the rule's thread count, then what upstream's propagation defaults to, a baseline to measure against. Not searched. | All kernels |
+| `xegpu_layouts` | Who decides the kernel's XeGPU layouts. `"ir"`: derived from the kernel's IR and the target (`mlir_transforms/xegpu_layouts.py`), which also lays out kernels the classes refuse (sibling and chained GEMMs, a GEMM with a row reduction, attention of other head dims and rows, GEMMs of few rows); the other keys here are hints, dropped with a log line if they don't fit. `"lighthouse"`, the default: lighthouse's annotation, by kernel class, the other keys checked strictly. `HELION_MLIR_XPU_LAYOUTS` changes the default, an escape hatch. Not searched. | All kernels |
 | `igc_vectorizer` | Not an XeGPU parameter. `"cmp"`, the default: IGC's vectorizer on but for vector compares. `"off"`: the escape hatch, the vectorizer off, slower on some kernels (`xpu_transforms.IGC_OPTIONS`). Not searched, not checked at compile time; see below the table | every kernel |
 
 ```python
@@ -158,13 +158,14 @@ config = helion.Config(
 )
 ```
 
-Before lowering, forced parameters are checked against each kernel's shapes with
-lighthouse's XeGPU constraints (`matmul_constraints`, the cost model's register and
+Malformed entries and lists longer than the number of kernels raise `XeGPUConfigError`
+on every path. With `xegpu_layouts="lighthouse"`, forced parameters are also checked before
+lowering against each kernel's shapes with lighthouse's XeGPU constraints (`matmul_constraints`, the cost model's register and
 DPAS limits; for elementwise and reduction kernels the limits of the inference
 above, e.g. a reduction's load tile rows divide its subgroup rows and f32 loads take
 16 columns; the prefetch keys are rejected: GEMM only; attention kernels take only
-`xegpu_sg_tiles`, `xegpu_nan_ignoring_maxima` and `igc_vectorizer`); invalid ones, malformed entries and lists longer than the number of
-kernels raise `XeGPUConfigError` (an `MLIRBackendError`, so the autotuner skips the
+`xegpu_sg_tiles`, `xegpu_nan_ignoring_maxima` and `igc_vectorizer`); invalid ones raise
+`XeGPUConfigError` (an `MLIRBackendError`, so the autotuner skips the
 config). The CPU target ignores the `xegpu_*` keys, so one config can serve both
 devices.
 

@@ -127,6 +127,89 @@ def linear_ref(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     return x @ w.T
 
 
+def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``a @ b``: a B that is not transposed."""
+    m, k = a.size()
+    n = b.size(1)
+    out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=F32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        out[tm, tn] = acc.to(a.dtype)
+    return out
+
+
+def matmul_ref(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:  # noqa: FURB118
+    return a @ b
+
+
+def elementwise_plus_transposed(a: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(a)
+    for tm, tn in hl.tile(list(a.size())):
+        out[tm, tn] = (a[tm, tn].to(F32) + z[tn, tm].T.to(F32)).to(a.dtype)
+    return out
+
+
+def tile_plus_its_transpose(a: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(a)
+    for tm, tn in hl.tile(list(a.size())):
+        t = a[tm, tn].to(F32)
+        out[tm, tn] = (t + t.T).to(a.dtype)
+    return out
+
+
+def transposed_both(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """``x.T @ w.T`` of ``x: [K, M]``, ``w: [N, K]``."""
+    k, m = x.size()
+    n = w.size(0)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=F32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tk, tm].T, w[tn, tk].T)
+        out[tm, tn] = acc.to(x.dtype)
+    return out
+
+
+def transposed_both_ref(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    return x.T @ w.T
+
+
+def gemm_plus_transposed(
+    x: torch.Tensor, w: torch.Tensor, z: torch.Tensor
+) -> torch.Tensor:
+    """``x @ w^T + z^T``: a transposed read that is no DPAS operand."""
+    m, k = x.size()
+    n = w.size(0)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=F32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], w[tn, tk].T)
+        out[tm, tn] = (acc + z[tn, tm].T.to(F32)).to(x.dtype)
+    return out
+
+
+def gemm_plus_transposed_ref(
+    x: torch.Tensor, w: torch.Tensor, z: torch.Tensor
+) -> torch.Tensor:
+    return x @ w.T + z.T
+
+
+def gemm_norm_over_rows(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """``acc / acc.abs().sum(-1).sum(0)``: a reduction over the rows as well."""
+    m, k = x.size()
+    n = w.size(0)
+    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, n], dtype=F32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, x[tm, tk], w[:, tk].T)
+        out[tm, :] = (acc / acc.abs().sum(-1).sum(0)).to(x.dtype)
+    return out
+
+
 def chain_in_registers(
     x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor
 ) -> torch.Tensor:
@@ -170,6 +253,37 @@ def chain_ref(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tens
     return (x @ w1.T) @ w2
 
 
+def scaled(x: torch.Tensor) -> torch.Tensor:
+    """An elementwise kernel with 2D tiles."""
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(list(x.size())):
+        out[tm, tn] = x[tm, tn] * 2.0
+    return out
+
+
+def scaled_ref(x: torch.Tensor) -> torch.Tensor:
+    return x * 2.0
+
+
+def row_sums(x: torch.Tensor) -> torch.Tensor:
+    """A reduction kernel: each row less its sum."""
+    m, n = x.size()
+    out = torch.empty_like(x)
+    block = hl.register_block_size(n)
+    for tm in hl.tile(m):
+        acc = hl.zeros([tm, block], dtype=F32)
+        for tn in hl.tile(n, block_size=block):
+            acc = acc + x[tm, tn].to(F32)
+        total = acc.sum(-1, keepdim=True)
+        for tn in hl.tile(n, block_size=block):
+            out[tm, tn] = (x[tm, tn].to(F32) - total).to(x.dtype)
+    return out
+
+
+def row_sums_ref(x: torch.Tensor) -> torch.Tensor:
+    return x - x.sum(-1, keepdim=True)
+
+
 @dataclass(frozen=True)
 class Form:
     fn: Callable[..., torch.Tensor]
@@ -192,7 +306,7 @@ FORMS: dict[str, Form] = {
         [64, 256, 32],
         ((64, 2048), (1024, 2048), (1024, 2048)),
         "",
-        (2, 16),
+        (2, 8),
     ),
     "sibling_gemms_m2048": Form(
         swiglu,
@@ -274,6 +388,46 @@ FORMS: dict[str, Form] = {
         "not a multiple of the 16-row subgroups",
         (3, 1),
     ),
+    "attention_rows2": Form(
+        attention,
+        attention_ref,
+        [1, 2, 64],
+        ((64, 2, 64), (64, 512, 64), (64, 512, 64)),
+        "not a multiple of the 16-row subgroups",
+        (1, 1),
+    ),
+    "attention_rows6": Form(
+        attention,
+        attention_ref,
+        [1, 6, 64],
+        ((64, 6, 64), (64, 512, 64), (64, 512, 64)),
+        "not a multiple of the 16-row subgroups",
+        (3, 1),
+    ),
+    "attention_rows12": Form(
+        attention,
+        attention_ref,
+        [1, 12, 64],
+        ((64, 12, 64), (64, 512, 64), (64, 512, 64)),
+        "not a multiple of the 16-row subgroups",
+        (3, 1),
+    ),
+    "transposed_both_16_rows": Form(
+        transposed_both,
+        transposed_both_ref,
+        [32, 128, 32],
+        ((256, 64), (256, 256)),
+        "",
+        (2, 8),
+    ),
+    "gemm_plus_transposed": Form(
+        gemm_plus_transposed,
+        gemm_plus_transposed_ref,
+        [256, 256, 32],
+        ((512, 256), (512, 256), (512, 512)),
+        "",
+        (8, 4),
+    ),
     "gemm_m32": Form(
         linear,
         linear_ref,
@@ -307,3 +461,16 @@ FORMS: dict[str, Form] = {
         (8, 1),
     ),
 }
+
+ELEMENTWISE_FORM = Form(scaled, scaled_ref, [128, 256], ((512, 1024),), "", (4, 8))
+REDUCTION_FORM = Form(row_sums, row_sums_ref, [64, 64], ((256, 1024),), "", (8, 1))
+"""Not in :data:`FORMS`: lighthouse's path takes these. For the hints tests."""
+GEMM_FORM = Form(
+    linear, linear_ref, [256, 256, 32], ((512, 2048), (1024, 2048)), "", (8, 4)
+)
+PLAIN_B_FORM = Form(
+    matmul, matmul_ref, [256, 256, 32], ((512, 2048), (2048, 1024)), "", (8, 4)
+)
+GEMM_FORM_48 = Form(
+    linear, linear_ref, [384, 256, 32], ((768, 2048), (1024, 2048)), "", (8, 4)
+)

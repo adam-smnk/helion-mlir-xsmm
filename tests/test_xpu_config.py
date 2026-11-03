@@ -9,7 +9,9 @@ ignores the keys.
 
 from __future__ import annotations
 
+import os
 import re
+from typing import TYPE_CHECKING
 from unittest import mock
 
 import helion
@@ -47,6 +49,9 @@ from helion_mlir_backend._compiler.targets.xpu_params import attach_params
 from helion_mlir_backend._compiler.targets.xpu_params import columns_first
 from helion_mlir_backend._compiler.targets.xpu_params import take_params
 from helion_mlir_backend._compiler.targets.xpu_params import xegpu_params
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 N = 1024
 GEMM_BLOCKS = [256, 256, 32]
@@ -193,9 +198,14 @@ def _lower_stages(
 
 
 @pytest.fixture(autouse=True)
-def xpu_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+def xpu_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     for name in ("HELION_MLIR_TARGET", "HELION_MLIR_XPU_STOP_AT"):
         monkeypatch.delenv(name, raising=False)
+    # Lighthouse's path, as long as the toggle has it: its refusals and classes.
+    # Not through monkeypatch: isolated tests pickle the fixtures they take.
+    os.environ["HELION_MLIR_XPU_LAYOUTS"] = "lighthouse"
+    yield
+    del os.environ["HELION_MLIR_XPU_LAYOUTS"]
 
 
 # --- IR checks ---------------------------------------------------------------

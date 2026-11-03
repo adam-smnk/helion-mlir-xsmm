@@ -10,6 +10,9 @@ PIPELINES = ("opt", "scalar")
 """The CPU target's lighthouse pipelines."""
 TARGETS = ("auto", "cpu", "xpu")
 """``HELION_MLIR_TARGET`` values; ``auto`` follows the device."""
+LOWERING_LOG_ATTR = "helion.lowering_log"
+"""Module attribute: lines a lowering logged that its caller must see too, since a forked
+lowering's log doesn't reach the caller's process."""
 XPU_STOP_POINTS = ("xegpu-wg", "xevm", "binary")
 """Where the XPU lowering can stop: annotated XeGPU, LLVM/XeVM without a device
 binary, and the full lowering with the binary."""

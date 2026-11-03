@@ -51,19 +51,19 @@ from ..mlir.support.debug import DebugOptions
 from ..mlir.support.debug import xpu_stop_at
 from ..mlir.support.errors import UnsupportedOperationError
 from ..mlir.support.errors import UnsupportedTargetError
-from ..mlir.support.errors import XeGPUConfigError
 from ..mlir_transforms import xegpu_layouts
 from ..mlir_transforms.keep_row_dims import keep_row_dims
-from ..mlir_transforms.xegpu_attention_loops import copy_attention_layouts
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
 from ..mlir_transforms.row_maxima import restore_nan_propagating_maxima
+from ..mlir_transforms.xegpu_attention_loops import copy_attention_layouts
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
 from ..mlir_transforms.xevm_fabs import fabs_as_integer_min
 from ..mlir_transforms.xevm_lane_conversions import convert_lanes_where_computed
 from ..mlir_transforms.xevm_lane_reductions import check_lane_reductions
+from ..mlir_transforms.xevm_lane_reductions import check_transposed_reads
 from ..mlir_transforms.xevm_nsz_minmax import nsz_minmax
 from ..mlir_transforms.xevm_tile_order import ORDER_FIRST_ABOVE
 from ..mlir_transforms.xevm_tile_order import order_tile_chunks
@@ -201,17 +201,13 @@ def _stages(
     index = next(i for i, (name, _) in enumerate(stages) if name == "xegpu-wg")
     stages[index] = (
         "xegpu-wg",
-        _CheckBlockSurfaces(
-            _IRLayouts(stages[index][1], entry, kernels),
-            # The baseline leaves its DPAS to upstream's propagation on purpose.
-            check_dpas=not any(k.layout_source == "upstream" for k in kernels),
-        ),
+        _CheckBlockSurfaces(_IRLayouts(stages[index][1], entry, kernels)),
     )
     if stop_at != "xegpu-wg":
         # The reductions as lowered are checked (xevm_lane_reductions).
         index = next(i for i, (name, _) in enumerate(stages) if name == "xevm")
         lowering = _CheckLaneReductions(stages[index][1])
-        if any(kernel.layout_source is not None for kernel in kernels):
+        if any(kernel.derives_layouts for kernel in kernels):
             lowering = _LayoutWarningsAreErrors(lowering)
         stages[index] = ("xevm", lowering)
     if stop_at == "binary":
@@ -427,12 +423,15 @@ class _IRLayouts(Stage):
 
     def apply(self, module: ir.Module) -> ir.Module:
         module = self.stage.apply(module)
+        # Lighthouse's kernels: the IR-derived ones have no anchors yet, so it leaves
+        # them alone, and they anchor every K/V loop by its own tiles.
+        copy_attention_layouts(module)
         funcs = {
             index: _kernel_func(
                 module, xpu_transforms.kernel_module_name(self.entry, index)
             )
             for index, kernel in enumerate(self.kernels)
-            if kernel.layout_source is not None
+            if kernel.derives_layouts
         }
         if not funcs:
             return module
@@ -443,7 +442,7 @@ class _IRLayouts(Stage):
             try:
                 plan = xegpu_layouts.annotate_layouts(module.operation, func)
             except (xegpu_layouts.LayoutError, ValueError) as exc:
-                raise _layout_failure(index, kernel, exc) from exc
+                raise _layout_failure(index, exc) from exc
             finished.append((index, plan))
         stage = TransformStage(
             xpu_transforms.finish_ir_layouts(self.entry, finished), module.context
@@ -463,7 +462,6 @@ class _IRLayouts(Stage):
                     ).parent.operation
                 )
                 for index in funcs
-                if self.kernels[index].layout_source != "upstream"
             ],
         )
         if problems:
@@ -485,9 +483,7 @@ def _kernel_func(module: ir.Module, name: str) -> ir.Operation:
 
 
 def _layout_hints(kernel: KernelParams) -> ir.Attribute:
-    hints: dict[str, ir.Attribute] = {
-        "source": ir.StringAttr.get(kernel.layout_source or "rule")
-    }
+    hints: dict[str, ir.Attribute] = {}
     for key, value in (
         ("sg_tile", kernel.sg_tile),
         ("load_tiles", kernel.load_tiles),
@@ -499,15 +495,11 @@ def _layout_hints(kernel: KernelParams) -> ir.Attribute:
     return ir.DictAttr.get(hints)
 
 
-def _layout_failure(index: int, kernel: KernelParams, exc: Exception) -> Exception:
-    forced = kernel.layout_forced()
-    if forced:
-        values = ", ".join(f"{key}[{index}]={list(v)}" for key, v in forced.items())
-        return XeGPUConfigError(f"{values}: invalid for GPU kernel {index}: {exc}")
+def _layout_failure(index: int, exc: Exception) -> Exception:
     return UnsupportedOperationError(
         f"GPU kernel {index}: no XeGPU layout derived from its IR",
         reason=str(exc),
-        alternatives=[_CPU],
+        alternatives=['xegpu_layouts="lighthouse"', _CPU],
     )
 
 
@@ -547,22 +539,17 @@ class _LayoutWarningsAreErrors(Stage):
 
 
 class _CheckBlockSurfaces(Stage):
-    """``stage``, the anchors of an attention kernel's later K/V loops
-    (:mod:`xegpu_attention_loops`), then a failure on 2D block descriptors of surfaces
-    beyond the hardware limits (silently wrong rows, :mod:`xegpu_block_surfaces`), and on
-    DPAS ops lighthouse's layout annotation left out (``check_dpas``: a layout path
-    that leaves them to upstream's propagation on purpose passes ``False``)."""
+    """``stage``, then a failure on 2D block descriptors of surfaces beyond the
+    hardware limits (silently wrong rows, :mod:`xegpu_block_surfaces`) and on DPAS
+    ops the layout annotation left out."""
 
-    def __init__(self, stage: Stage, check_dpas: bool = True) -> None:
+    def __init__(self, stage: Stage) -> None:
         self.stage = stage
-        self.check_dpas = check_dpas
 
     def apply(self, module: ir.Module) -> ir.Module:
         module = self.stage.apply(module)
-        copy_attention_layouts(module)
         check_block_surfaces(module)
-        if self.check_dpas:
-            _check_dpas_anchored(module)
+        _check_dpas_anchored(module)
         return module
 
 
@@ -576,6 +563,7 @@ class _CheckLaneReductions(Stage):
     def apply(self, module: ir.Module) -> ir.Module:
         module = self.stage.apply(module)
         check_lane_reductions(module)
+        check_transposed_reads(module)
         return module
 
 
@@ -737,8 +725,8 @@ class XpuTarget(MLIRTarget):
         loops = check_xegpu_capabilities(
             module,
             entry,
-            [kernel.layout_source is not None for kernel in params],
-            KernelParams().layout_source is not None,
+            [kernel.derives_layouts for kernel in params],
+            KernelParams().derives_layouts,
         )
         shapes = [kernel_shape(loop) for loop in loops]
         check_params(params, shapes)

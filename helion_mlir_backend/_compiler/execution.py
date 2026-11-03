@@ -40,6 +40,7 @@ import torch
 
 from helion_mlir_backend._compiler import native
 from helion_mlir_backend._compiler.mlir.in_place import update_carried_values_in_place
+from helion_mlir_backend._compiler.mlir.support.debug import LOWERING_LOG_ATTR
 from helion_mlir_backend._compiler.mlir.support.debug import DebugOptions
 from helion_mlir_backend._compiler.mlir.support.debug import compile_timeout
 from helion_mlir_backend._compiler.mlir.support.errors import CompileTimeoutError
@@ -536,7 +537,10 @@ def _lower(
         lowering = target.lowering(module, entry, pipeline, stop_at)
         timeout = compile_timeout()
         if timeout is None or "fork" not in multiprocessing.get_all_start_methods():
-            return lowering.apply(module)
+            lowered = lowering.apply(module)
+            # Already logged, in this process.
+            _take_lowering_log(lowered)
+            return lowered
     receiver, sender = multiprocessing.Pipe(duplex=False)
     with _anonymous_file() as stderr:
         child = multiprocessing.get_context("fork").Process(
@@ -576,7 +580,23 @@ def _lower(
         raise error
     if output:
         log.debug("lighthouse output:\n%s", output)
-    return ir.Module.parse(result, context=module.context)
+    lowered = ir.Module.parse(result, context=module.context)
+    for line in _take_lowering_log(lowered):
+        log.warning("%s", line)
+    return lowered
+
+
+def _take_lowering_log(module: ir.Module) -> list[str]:
+    """The lines the lowering recorded on ``module``, removed from it."""
+    attributes = module.operation.attributes
+    if LOWERING_LOG_ATTR not in attributes:
+        return []
+    lines = [
+        ir.StringAttr(line).value
+        for line in ir.ArrayAttr(attributes[LOWERING_LOG_ATTR])
+    ]
+    del attributes[LOWERING_LOG_ATTR]
+    return lines
 
 
 def _death_message(exitcode: int | None, output: str) -> str:

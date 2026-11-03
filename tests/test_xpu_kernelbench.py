@@ -15,6 +15,7 @@ the CPU target against the KernelBench models' eager PyTorch.
 
 from __future__ import annotations
 
+import os
 import re
 from typing import TYPE_CHECKING
 
@@ -48,12 +49,22 @@ from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from collections.abc import Iterator
 
 _LAYOUT = re.compile(r"layout = #xegpu\.layout<([^>]*)>")
 _TENSOR_DESC = re.compile(r"!xegpu\.tensor_desc<((?:\d+x)+)\w+")
 _ALL = {
     problem.name: problem for problem in (*PROBLEMS, *RANK3_PROBLEMS, *LEVEL2_PROBLEMS)
 }
+
+
+@pytest.fixture(autouse=True)
+def lighthouse_layouts() -> Iterator[None]:
+    """The layouts checked here are lighthouse's: its path stays tested as long as
+    the toggle has it (``test_xpu_layouts`` covers the default)."""
+    os.environ["HELION_MLIR_XPU_LAYOUTS"] = "lighthouse"
+    yield
+    del os.environ["HELION_MLIR_XPU_LAYOUTS"]
 
 
 def _args(problem: Problem) -> list[object]:
