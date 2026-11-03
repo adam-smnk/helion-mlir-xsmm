@@ -159,7 +159,8 @@ class CompiledEntry:
     def _native_call(self) -> object | None:
         """The native ``EntryCall`` of a static entry on a target with native
         paths, if the extension is available."""
-        if self._static is None or not self.target.native_in_place:
+        static = self._static
+        if static is None or static.scalars or not self.target.native_in_place:
             return None
         if (extension := native.module()) is None:
             return None
@@ -174,16 +175,20 @@ class CompiledEntry:
         )
 
     def call_in_place(self, values: Sequence[object]) -> list[torch.Tensor] | None:
-        """Call the entry and return its inout tensors if every argument is a
-        tensor that it can take as is -- the static shape and dtype, contiguous
-        strides, no negative or conjugate bit, data aligned to
+        """Call the entry and return its inout tensors if every argument but
+        the runtime scalars is a tensor that it can take as is -- the static
+        shape and dtype, contiguous strides, no negative or conjugate bit,
+        data aligned to
         :attr:`MLIRTarget.buffer_alignment`,
         :meth:`MLIRTarget.passes_in_place` and a target without call
-        hooks (:meth:`MLIRTarget.prepare_call`), no inout sharing memory
-        with another argument -- else return ``None`` without calling it: the
-        caller then takes the general path (``driver.call_entry``), which
-        stages, checks and reports. Only the data pointers change between
-        calls, so the arguments are packed once per entry. On a target with
+        hooks (:meth:`MLIRTarget.prepare_call`) or one whose hooks run here
+        (:attr:`MLIRTarget.hooks_in_place`), no inout sharing memory with
+        another argument except as the general path last passed them
+        (:meth:`note_passed_as_is`) -- else return ``None`` without calling
+        it: the caller then takes the general path (``driver.call_entry``),
+        which stages, checks and reports. Only the data pointers and scalar
+        values change between calls, so the arguments are packed once per
+        entry. On a target with
         :attr:`MLIRTarget.native_in_place`, the native ``EntryCall``
         (``native/``) does these checks and the call first (descriptors on
         the stack, no lock); a call it refuses gets the Python checks."""
@@ -192,22 +197,24 @@ class CompiledEntry:
             return None
         # Checked per call, not once: entries are shared through the JIT
         # cache, and a target's hooks may be replaced after one was built.
-        hooks = type(self.target)
-        if (
-            hooks.prepare_call is not MLIRTarget.prepare_call
-            or hooks.finish_call is not MLIRTarget.finish_call
-        ):
+        target = self.target
+        hooks = type(target)
+        prepare = hooks.prepare_call is not MLIRTarget.prepare_call
+        finish = hooks.finish_call is not MLIRTarget.finish_call
+        if (prepare or finish) and not target.hooks_in_place:
             return None
-        if (native_call := self._native) is not None:
-            # The checks below and the call, natively; a value it doesn't
-            # take (e.g. a non-plain tensor that passes_in_place admits)
-            # gets the Python checks.
+        if (native_call := self._native) is not None and not (prepare or finish):
+            # The checks below and the call, natively (it runs no hooks); a
+            # value it doesn't take (e.g. a non-plain tensor that
+            # passes_in_place admits) gets the Python checks.
             if native_call.call(values):
                 return [values[i] for i in static.inouts]  # type: ignore[misc]
-        passes = self.target.passes_in_place
-        alignment = self.target.buffer_alignment
+        passes = target.passes_in_place
+        alignment = target.buffer_alignment
+        scalars = static.scalars
+        tensors = [values[i] for i in static.tensors] if scalars else values
         for value, shape, strides, dtype in zip(
-            values, static.shapes, static.strides, static.dtypes, strict=True
+            tensors, static.shapes, static.strides, static.dtypes, strict=True
         ):
             if not (
                 isinstance(value, torch.Tensor)
@@ -217,16 +224,17 @@ class CompiledEntry:
                 and not value.is_neg()
                 and not value.is_conj()
                 and passes(value)
-                and (alignment == 1 or value.data_ptr() % alignment == 0)
             ):
                 return None
-        pointers = [value.data_ptr() for value in values]  # type: ignore[union-attr]
-        nbytes = static.nbytes
-        for i in static.inouts:
-            start, end = pointers[i], pointers[i] + nbytes[i]
-            for j, other in enumerate(pointers):
-                if j != i and other < end and start < other + nbytes[j]:
-                    return None
+        pointers = [value.data_ptr() for value in tensors]  # type: ignore[union-attr]
+        if alignment != 1 and any(pointer % alignment for pointer in pointers):
+            return None
+        overlaps = static.overlaps(pointers)
+        if overlaps and overlaps not in static.passed_as_is:
+            return None
+        numbers = [python_type(values[i]) for i, _, python_type in scalars]
+        if prepare:
+            target.prepare_call(tensors)  # type: ignore[arg-type]
         # One packed buffer per entry: a call from another thread meanwhile
         # takes the general path.
         if not static.lock.acquire(blocking=False):
@@ -236,13 +244,29 @@ class CompiledEntry:
             for slot, pointer in zip(static.slots, pointers, strict=True):
                 buffer[slot] = pointer
                 buffer[slot + 1] = pointer
+            for (_, storage, _), number in zip(scalars, numbers, strict=True):
+                storage.value = number
             self._func(static.packed)
         except Exception as exc:
             exc.add_note(f"Helion MLIR backend: failed while running '{self.name}'")
             raise
         finally:
             static.lock.release()
+        if finish:
+            target.finish_call(tensors)  # type: ignore[arg-type]
         return [values[i] for i in static.inouts]  # type: ignore[misc]
+
+    def note_passed_as_is(self, values: Sequence[torch.Tensor]) -> None:
+        """The general path passed ``values``, one per tensor argument, as they are.
+        What it decides about tensors sharing memory depends only on which
+        contiguous tensors overlap (the entry's read order is fixed), so
+        :meth:`call_in_place` may pass the same overlaps as they are too,
+        without repeating the decision."""
+        static = self._static
+        if static is not None:
+            pointers = [value.data_ptr() for value in values]
+            if overlaps := static.overlaps(pointers):
+                static.passed_as_is.add(overlaps)
 
     def __call__(self, values: Sequence[torch.Tensor | float | int | bool]) -> None:
         """Call the entry with one value per argument: a tensor for a memref, a
@@ -260,15 +284,25 @@ _WORD = ctypes.sizeof(ctypes.c_int64)
 
 class _StaticCall:
     """The packed arguments of an entry that takes only memrefs of static,
-    non-empty shapes, built once: the descriptors as :func:`_packed_args`
-    builds them for contiguous tensors, with the data pointers (``allocated``
-    and ``aligned``) filled in per call."""
+    non-empty shapes and runtime scalars, built once: the descriptors as
+    :func:`_packed_args` builds them for contiguous tensors, with the data
+    pointers (``allocated`` and ``aligned``) and the scalars' values filled in
+    per call. ``shapes`` and the like are per tensor argument, in order."""
 
     def __init__(self, args: Sequence[EntryArg]) -> None:
-        self.shapes = tuple(torch.Size(arg.shape) for arg in args)
-        self.strides = tuple(_contiguous_strides(arg.shape) for arg in args)
-        self.dtypes = tuple(arg.dtype for arg in args)
-        self.nbytes = tuple(math.prod(arg.shape) * arg.dtype.itemsize for arg in args)
+        memrefs = [arg for arg in args if arg.role != "scalar"]
+        self.tensors = tuple(i for i, arg in enumerate(args) if arg.role != "scalar")
+        self.scalars = tuple(
+            (i, _SCALAR_CTYPES[arg.dtype][0](), _SCALAR_CTYPES[arg.dtype][1])
+            for i, arg in enumerate(args)
+            if arg.role == "scalar"
+        )
+        self.shapes = tuple(torch.Size(arg.shape) for arg in memrefs)
+        self.strides = tuple(_contiguous_strides(arg.shape) for arg in memrefs)
+        self.dtypes = tuple(arg.dtype for arg in memrefs)
+        self.nbytes = tuple(
+            math.prod(arg.shape) * arg.dtype.itemsize for arg in memrefs
+        )
         self.inouts = tuple(i for i, arg in enumerate(args) if arg.role == "inout")
         words: list[int] = []
         slots: list[int] = []
@@ -277,19 +311,50 @@ class _StaticCall:
             words += (0, 0, 0, *shape, *strides)
         self.slots = tuple(slots)
         descriptors = len(words)
-        self.buffer = (ctypes.c_int64 * (descriptors + 2 * len(args)))()
+        self.buffer = (ctypes.c_int64 * (descriptors + len(memrefs) + len(args)))()
         base = ctypes.addressof(self.buffer)
         words += [base + _WORD * slot for slot in slots]
-        words += [base + _WORD * (descriptors + i) for i in range(len(args))]
+        pointer = iter(range(descriptors, descriptors + len(memrefs)))
+        scalar = {i: storage for i, storage, _ in self.scalars}
+        words += [
+            ctypes.addressof(scalar[i]) if i in scalar else base + _WORD * next(pointer)
+            for i in range(len(args))
+        ]
         self.buffer[:] = words
-        self.packed = base + _WORD * (descriptors + len(args))
+        self.packed = base + _WORD * (descriptors + len(memrefs))
         self.lock = threading.Lock()
+        self.written = tuple(arg.role == "inout" for arg in memrefs)
+        self.passed_as_is: set[int] = set()
+        """Results of :meth:`overlaps` the general path passed as they are."""
+        self._last_overlaps: tuple[list[int] | None, int] = (None, 0)
+
+    def overlaps(self, pointers: list[int]) -> int:
+        """Which tensor arguments at ``pointers`` overlap an inout: a bitmask with
+        one bit per pair of their positions, whatever their addresses. Zero: none.
+        A kernel's fresh tensors tend to be at the same addresses from call to
+        call, which skips the sweep."""
+        last, mask = self._last_overlaps
+        if pointers == last:
+            return mask
+        count = len(pointers)
+        order = sorted(range(count), key=pointers.__getitem__)
+        nbytes = self.nbytes
+        written = self.written
+        mask = 0
+        for position, i in enumerate(order):
+            end = pointers[i] + nbytes[i]
+            for later in range(position + 1, count):
+                j = order[later]
+                if pointers[j] >= end:
+                    break
+                if written[i] or written[j]:
+                    mask |= 1 << (min(i, j) * count + max(i, j))
+        self._last_overlaps = (pointers, mask)
+        return mask
 
     @classmethod
     def build(cls, args: Sequence[EntryArg]) -> _StaticCall | None:
-        if not args or any(
-            arg.role == "scalar" or -1 in arg.shape or 0 in arg.shape for arg in args
-        ):
+        if not args or any(-1 in arg.shape or 0 in arg.shape for arg in args):
             return None
         return cls(args)
 

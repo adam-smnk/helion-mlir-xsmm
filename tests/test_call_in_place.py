@@ -1,15 +1,19 @@
 """The in-place call path (``CompiledEntry.call_in_place``).
 
 A call whose arguments are all tensors of the entry's static shapes and dtypes,
-contiguous, on the target's device and not aliasing an inout skips the general
-path of ``driver.call_entry`` (checks, staging, hooks): its arguments are packed
-once per entry. Every other call must take the general path, with its results
-and errors unchanged.
+contiguous, on the target's device and not aliasing an inout (except as the
+general path passed it) skips the general path of ``driver.call_entry`` (checks,
+staging, and hooks unless the target runs them in place): its arguments are
+packed once per entry. Every other call must take the general path, with its
+results and errors unchanged.
 """
 
 from __future__ import annotations
 
 import threading
+from types import SimpleNamespace
+from typing import TYPE_CHECKING
+from unittest import mock
 
 import helion
 import helion.language as hl
@@ -21,6 +25,10 @@ from tests.harness import run_direct
 from helion_mlir_backend._compiler import execution
 from helion_mlir_backend._compiler.mlir import driver
 from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
+from helion_mlir_backend._compiler.targets.cpu import CpuTarget
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
 def _cfg(*block_sizes: int) -> helion.Config:
@@ -165,18 +173,238 @@ def test_wrong_dtype_reports_the_general_error() -> None:
         driver.call_entry(entry, [b, a.double()])
 
 
-def test_scalar_and_dynamic_entries_have_no_in_place_path(
-    general_calls: list[str],
-) -> None:
+def test_dynamic_entries_have_no_in_place_path(general_calls: list[str]) -> None:
     x = torch.randn(16)
-    torch.testing.assert_close(run_direct(add_int, [x, 3]), x + 3)
     torch.testing.assert_close(run_direct(add_one_dynamic, [x]), x + 1.0)
-    assert _entry(add_int, [x, 3])._static is None
     assert _entry(add_one_dynamic, [x])._static is None
     general_calls.clear()
-    torch.testing.assert_close(run_direct(add_int, [x, 4]), x + 4)
     torch.testing.assert_close(run_direct(add_one_dynamic, [x]), x + 1.0)
     assert general_calls
+
+
+def test_scalar_entries_take_each_call_s_value_in_place(
+    general_calls: list[str],
+) -> None:
+    # A static entry with a runtime scalar: no native path, the Python in-place
+    # path, and the value of this call (never an earlier call's).
+    x = torch.randn(16)
+    torch.testing.assert_close(run_direct(add_int, [x, 3]), x + 3)
+    entry = _entry(add_int, [x, 3])
+    assert entry._static is not None and entry._native is None
+    general_calls.clear()
+    for k in (4, -7, 0, 2**40):
+        torch.testing.assert_close(run_direct(add_int, [x, k]), x + k)
+    x2 = torch.randn(16)
+    torch.testing.assert_close(run_direct(add_int, [x2, 5]), x2 + 5)
+    assert not general_calls
+    # Not a number: the same error as on the general path.
+    out = torch.empty(16)
+    with pytest.raises(ValueError, match="invalid literal"):
+        driver.call_entry(
+            entry,
+            [
+                out if a.role == "inout" else {"x": x, "k": "a"}[a.name]
+                for a in entry.args
+            ],
+        )
+
+
+def _fake_entry(
+    target: execution.MLIRTarget,
+    roles: list[str],
+    calls: list[str],
+    read_order: object | None = None,
+    size: int = 16,
+) -> execution.CompiledEntry:
+    """A ``CompiledEntry`` over 1D float32 tensors of ``size`` elements, named
+    ``a0``, ``a1``..., whose JIT function only records the call."""
+    args = tuple(
+        execution.EntryArg(f"a{i}", role, None, (size,), torch.float32)
+        for i, role in enumerate(roles)
+    )
+    runner = mock.Mock()
+    runner.engine.lookup.return_value = lambda packed: calls.append("run")
+    return execution.CompiledEntry("fake", args, runner, target, read_order)
+
+
+class _HookedTarget(CpuTarget):
+    """The CPU's checks, no native paths and hooks that run on the in-place path."""
+
+    hooks_in_place = True
+    native_in_place = False
+
+    def __init__(self, calls: list[str]) -> None:
+        super().__init__()
+        self.calls = calls
+
+    def prepare_call(self, buffers: Sequence[torch.Tensor]) -> None:
+        self.calls.append(f"prepare:{len(buffers)}")
+
+    def finish_call(self, buffers: Sequence[torch.Tensor]) -> None:
+        self.calls.append(f"finish:{len(buffers)}")
+
+
+def test_hooks_in_place_run_around_the_call() -> None:
+    calls: list[str] = []
+    entry = _fake_entry(_HookedTarget(calls), ["in", "inout"], calls)
+    a, b = torch.zeros(16), torch.zeros(16)
+    assert entry.call_in_place([a, b]) == [b]
+    assert calls == ["prepare:2", "run", "finish:2"]
+
+
+def test_hooks_in_place_run_on_a_target_with_native_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The native call runs no hooks: it must not go first and skip them.
+    a, b = torch.randn(16), torch.zeros(16)
+    run_direct(copy_plus_one, [a, b])
+    entry = _entry(copy_plus_one, [a, b])
+    if entry._native is None:
+        pytest.skip("no native call path")
+    calls: list[str] = []
+    monkeypatch.setattr(CpuTarget, "hooks_in_place", True)
+    monkeypatch.setattr(
+        CpuTarget, "prepare_call", lambda self, buffers: calls.append("prepare")
+    )
+    monkeypatch.setattr(
+        CpuTarget, "finish_call", lambda self, buffers: calls.append("finish")
+    )
+    b.zero_()
+    values = [{"a": a, "b": b}[arg.name] for arg in entry.args]
+    (written,) = entry.call_in_place(values)
+    assert written is b
+    assert calls == ["prepare", "finish"]
+    torch.testing.assert_close(b, a + 1.0)
+
+
+def test_hooks_not_in_place_refuse_the_call() -> None:
+    calls: list[str] = []
+    target = _HookedTarget(calls)
+    target.hooks_in_place = False
+    entry = _fake_entry(target, ["in", "inout"], calls)
+    assert entry.call_in_place([torch.zeros(16), torch.zeros(16)]) is None
+    assert not calls
+
+
+def test_a_failing_prepare_hook_runs_nothing() -> None:
+    calls: list[str] = []
+    target = _HookedTarget(calls)
+    target.prepare_call = mock.Mock(side_effect=ValueError("several devices"))
+    entry = _fake_entry(target, ["in", "inout"], calls)
+    with pytest.raises(ValueError, match="several devices"):
+        entry.call_in_place([torch.zeros(16), torch.zeros(16)])
+    assert not calls
+    assert not entry._static.lock.locked()
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_overlaps_match_a_scan_of_all_pairs(seed: int) -> None:
+    random = torch.Generator().manual_seed(seed)
+    roles = [
+        "inout" if int(v) else "in" for v in torch.randint(0, 2, (9,), generator=random)
+    ]
+    static = _fake_entry(_HookedTarget([]), roles, [])._static
+    for _ in range(50):
+        pointers = [int(v) for v in torch.randint(0, 200, (9,), generator=random)]
+        expected = 0
+        for i in range(9):
+            for j in range(i + 1, 9):
+                if roles[i] == "inout" or roles[j] == "inout":
+                    if (
+                        pointers[i] < pointers[j] + 64
+                        and pointers[j] < pointers[i] + 64
+                    ):
+                        expected |= 1 << (i * 9 + j)
+        assert static.overlaps(pointers) == expected
+
+
+def test_overlaps_ignore_where_the_tensors_are_and_input_pairs() -> None:
+    static = _fake_entry(_HookedTarget([]), ["in", "in", "inout"], [])._static
+    assert static.overlaps([0, 8, 1000]) == 0  # two inputs overlap: nothing to do
+    near = static.overlaps([0, 1000, 8])
+    assert near != 0
+    assert static.overlaps([5000, 9000, 5008]) == near
+    assert static.overlaps([5008, 9000, 5000]) == near  # the other way round
+    # The memo of the last pointers answers for those pointers only.
+    assert static.overlaps([5008, 9000, 7000]) == 0
+    assert static.overlaps([5008, 9000, 5000]) == near
+
+
+_READS_AFTER_WRITES = SimpleNamespace(after={"a0": frozenset({"a2"})}, same={})
+"""A ``ReadOrder``: ``a0`` is read after ``a2`` is written."""
+
+
+def _shared(offset: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    """An input overlapping an output by all but ``offset`` elements, aligned."""
+    storage = torch.zeros(16 + offset)
+    return storage[:16], storage[offset:]
+
+
+def test_overlap_passed_as_is_repeats_in_place() -> None:
+    # The kernel reads the view after writing its base: the general path passes
+    # it as is, and later calls with the same overlap (at other addresses) go
+    # in place, as the general path would pass them.
+    calls: list[str] = []
+    target = _HookedTarget(calls)
+    target.phases_see_aliases = True
+    entry = _fake_entry(target, ["in", "in", "inout"], calls, _READS_AFTER_WRITES)
+    view, out = _shared()
+    other = torch.zeros(16)
+    assert entry.call_in_place([view, other, out]) is None
+    assert not calls
+    driver.call_entry(entry, [view, other, out])
+    assert calls == ["prepare:3", "run", "finish:3"]
+    calls.clear()
+    view2, out2 = _shared()
+    assert entry.call_in_place([view2, other, out2]) == [out2]
+    assert calls == ["prepare:3", "run", "finish:3"]
+    # Another overlap isn't the one decided: general path, which copies it
+    # (a1 isn't read after a write) and sees the call's own values.
+    calls.clear()
+    view3, out3 = _shared()
+    assert entry.call_in_place([view3, out3, out3]) is None
+    assert not calls
+    # Tensors that don't overlap need no decision.
+    assert entry.call_in_place([torch.zeros(16), other, torch.zeros(16)]) is not None
+
+
+def test_overlap_the_general_path_copies_stays_on_it() -> None:
+    # No read-after-write: each call's input is a copy, so never in place.
+    calls: list[str] = []
+    entry = _fake_entry(_HookedTarget(calls), ["in", "inout"], calls)
+    view, out = _shared()
+    driver.call_entry(entry, [view, out])
+    assert not entry._static.passed_as_is
+    calls.clear()
+    assert entry.call_in_place([view, out]) is None
+    assert not calls
+
+
+def test_refused_overlap_stays_refused_on_every_call() -> None:
+    # A read after a write that this target can't honour: the error each time.
+    calls: list[str] = []
+    entry = _fake_entry(
+        _HookedTarget(calls), ["in", "in", "inout"], calls, _READS_AFTER_WRITES
+    )
+    view, out = _shared()
+    other = torch.zeros(16)
+    for _ in range(2):
+        assert entry.call_in_place([view, other, out]) is None
+        with pytest.raises(UnsupportedOperationError, match="read after"):
+            driver.call_entry(entry, [view, other, out])
+    assert not entry._static.passed_as_is
+    assert not calls
+
+
+def test_two_written_views_of_one_buffer_stay_refused() -> None:
+    calls: list[str] = []
+    entry = _fake_entry(_HookedTarget(calls), ["inout", "inout"], calls)
+    a, b = _shared(4)
+    for _ in range(2):
+        assert entry.call_in_place([a, b]) is None
+        with pytest.raises(UnsupportedOperationError, match="share memory"):
+            driver.call_entry(entry, [a, b])
+    assert not calls
 
 
 def test_busy_packed_arguments_take_general_path(general_calls: list[str]) -> None:

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import operator
 import re
 from typing import TYPE_CHECKING
 import warnings
@@ -695,6 +696,9 @@ def bindings_emit_spirv() -> bool:
     return True
 
 
+_device_of = operator.attrgetter("device")
+
+
 def _runtime_library() -> str | None:
     """The Level Zero runtime library of the MLIR bindings, if there is one."""
     try:
@@ -809,6 +813,13 @@ class XpuTarget(MLIRTarget):
                 "tensors"
             )
 
+    hooks_in_place = True
+    """The per-call Python a kernel's launch waits for grows with its arguments, and
+    a layer's 39 cost more than 200 us on the general path, before its first launch."""
+
+    def passes_in_place(self, tensor: torch.Tensor) -> bool:
+        return tensor.is_xpu
+
     def prepare_call(self, buffers: Sequence[torch.Tensor]) -> None:
         """Wait for torch's work on the current stream (e.g. host-code
         ``torch.zeros``): the kernels run on the Level Zero runtime's own queue.
@@ -821,20 +832,17 @@ class XpuTarget(MLIRTarget):
         time): probably one ring per engine, in submission order (inferred). After a
         non-blocking copy from pinned host memory, on the copy engine, no wait read the
         old data in 60 of 60 calls, so this wait stays. Untested on B70."""
-        device = None
-        for tensor in buffers:
-            current = tensor.device
-            if current.type != "xpu":
-                continue
-            if device is None:
-                device = current
-            elif current != device:
-                raise ValueError(
-                    "the kernel's tensors are on several devices: "
-                    f"{sorted(map(str, {device, current}))}"
-                )
-        if device is None:
+        devices = {
+            device for device in set(map(_device_of, buffers)) if device.type == "xpu"
+        }
+        if not devices:
             return
+        if len(devices) > 1:
+            raise ValueError(
+                "the kernel's tensors are on several devices: "
+                f"{sorted(map(str, devices))}"
+            )
+        device = devices.pop()
         index = device.index if device.index is not None else 0
         if not torch.xpu.current_stream(index).query():
             torch.xpu.synchronize(device)

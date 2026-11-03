@@ -130,10 +130,16 @@ class MLIRTarget(abc.ABC):
 
     def passes_in_place(self, tensor: torch.Tensor) -> bool:
         """Whether the kernel can take ``tensor`` as is, with no
-        :meth:`check_tensor` error: a call whose tensors all pass, on a target
-        that keeps the default no-op :meth:`prepare_call` and
-        :meth:`finish_call`, skips those checks and hooks (default: never)."""
+        :meth:`check_tensor` error: a call whose tensors all pass skips those
+        checks, and on a target that keeps the default no-op
+        :meth:`prepare_call` and :meth:`finish_call` those hooks too (default:
+        never)."""
         return False
+
+    hooks_in_place: bool = False
+    """Whether a call that passes as is still runs here if the target has
+    :meth:`prepare_call` or :meth:`finish_call` hooks, which then get the
+    arguments themselves (default: such a call takes the general path)."""
 
     native_in_place: bool = False
     """Whether the native call paths (``native/``) may be used. They take only

@@ -1914,15 +1914,27 @@ def test_tile_expression_in_an_inner_loop(
 
 
 def _spy_entry_arguments() -> tuple[list[list[object]], object]:
-    """A patch of ``CompiledEntry.__call__`` recording the values it passes."""
+    """A patch of ``CompiledEntry`` recording the values each call passes, on the
+    in-place path or the general one."""
     calls: list[list[object]] = []
     original = execution.CompiledEntry.__call__
+    original_in_place = execution.CompiledEntry.call_in_place
 
     def spy(self: execution.CompiledEntry, values: list[object]) -> None:
         calls.append(list(values))
         original(self, values)
 
-    return calls, mock.patch.object(execution.CompiledEntry, "__call__", spy)
+    def spy_in_place(
+        self: execution.CompiledEntry, values: list[object]
+    ) -> list[torch.Tensor] | None:
+        inouts = original_in_place(self, values)
+        if inouts is not None:
+            calls.append(list(values))
+        return inouts
+
+    return calls, mock.patch.multiple(
+        execution.CompiledEntry, __call__=spy, call_in_place=spy_in_place
+    )
 
 
 def test_usm_pointers_go_straight_to_the_kernel() -> None:
@@ -2374,7 +2386,9 @@ def test_row_store_out_of_bounds_raises(pos: int) -> None:
 
     cache = torch.zeros(8, 8, 512, 64, device="xpu").to(BF16)
     with pytest.raises(IndexError, match="out of bounds"):
-        _kernel(put_row, [1, 1, 64])(torch.randn(8, 8, 64).to(BF16).to("xpu"), cache, pos)
+        _kernel(put_row, [1, 1, 64])(
+            torch.randn(8, 8, 64).to(BF16).to("xpu"), cache, pos
+        )
 
 
 def _add_one(x: torch.Tensor) -> torch.Tensor:
@@ -2403,3 +2417,114 @@ def test_kernel_waits_for_a_copy_offloaded_from_the_host() -> None:
         out = kernel(dst[-1, -64:, :])
         torch.xpu.synchronize()
         assert (out.cpu() == value + 1).all()
+
+
+def _plain_add(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.shape):
+        out[tm, tn] = x[tm, tn] + 1.0
+    return out
+
+
+def _phases(x: torch.Tensor, k: int) -> torch.Tensor:
+    """Two launches through a view of a fresh tensor (the host writes nothing),
+    with a runtime scalar: the second reads what the first stored."""
+    m, n = x.shape
+    q = torch.empty_like(x)
+    view = q.view(m * 2, n // 2)
+    out = torch.empty_like(view)
+    for tm, tn in hl.tile([m, n]):
+        q[tm, tn] = x[tm, tn] * 2.0
+    hl.barrier()
+    for tm, tn in hl.tile([m * 2, n // 2]):
+        out[tm, tn] = view[tm, tn] + k
+    return out
+
+
+def test_repeat_calls_take_the_in_place_path_with_fresh_values() -> None:
+    """After the first call of an aliasing kernel no call packs its arguments anew,
+    and each call computes from its own inputs, scalars and buffers: an earlier
+    output is left as it was (its address differs), outputs are bit-exact against the
+    general path."""
+    kernel = _kernel(_phases, [1, 256, 1, 128])
+    y = torch.randn(64, 256, dtype=F32, device="xpu")
+    expected = lambda x, k: (x * 2.0).view(128, 128) + k  # noqa: E731
+    first = kernel(y, 3)
+    torch.xpu.synchronize()
+    _check_exact = lambda out, ref: torch.equal(out.cpu(), ref.cpu())  # noqa: E731
+    assert _check_exact(first, expected(y, 3))
+    kept = first.clone()
+    with mock.patch.object(
+        execution, "_packed_args", wraps=execution._packed_args
+    ) as general:
+        for step in range(4):
+            x = torch.randn(64, 256, dtype=F32, device="xpu")
+            out = kernel(x, step)
+            torch.xpu.synchronize()
+            assert _check_exact(out, expected(x, step)), step
+            assert _check_exact(first, kept)
+            # The same input again: a stale buffer would not show otherwise.
+            again = kernel(y, step)
+            torch.xpu.synchronize()
+            assert _check_exact(again, expected(y, step)), step
+            assert _check_exact(first, kept)
+    assert not general.called
+
+
+def test_in_place_calls_wait_for_the_stream() -> None:
+    kernel = _kernel(_plain_add, [1, 256])
+    x = torch.randn(64, 256, dtype=F32, device="xpu")
+    kernel(x)
+    with (
+        mock.patch.object(
+            XpuTarget, "prepare_call", autospec=True, side_effect=XpuTarget.prepare_call
+        ) as prepare,
+        mock.patch.object(
+            execution, "_packed_args", wraps=execution._packed_args
+        ) as general,
+    ):
+        out = kernel(x)
+    torch.xpu.synchronize()
+    assert prepare.call_count == 1
+    assert not general.called
+    assert torch.equal(out.cpu(), x.cpu() + 1.0)
+
+
+@pytest.mark.parametrize("form", ["misaligned", "strided", "negative", "aliased"])
+def test_arguments_that_need_care_after_in_place_calls(form: str) -> None:
+    """A kernel on the in-place path meets an argument it can't take as is: the
+    general path staged it, right values, and the next plain call is right too."""
+
+    def add_into(x: torch.Tensor, out: torch.Tensor) -> None:
+        for tm, tn in hl.tile(x.shape):
+            out[tm, tn] = x[tm, tn] + 1.0
+
+    kernel = _kernel(add_into, [1, 64])
+    base = torch.randn(64, 256, dtype=F32, device="xpu")
+    out = torch.empty_like(base)
+    kernel(base, out)
+    if form == "misaligned":
+        buf = torch.randn(64 * 256 + 1, dtype=F32, device="xpu")
+        x = buf[1:].view(64, 256)
+    elif form == "strided":
+        x = torch.randn(128, 256, dtype=F32, device="xpu")[::2]
+    elif form == "negative":
+        x = torch._neg_view(base)
+    else:
+        x = out  # the input is the output: its value at the call
+        out.copy_(base)
+    ref = x.resolve_neg().clone() + 1.0
+    with mock.patch.object(
+        execution, "_packed_args", wraps=execution._packed_args
+    ) as general:
+        kernel(x, out)
+    torch.xpu.synchronize()
+    assert general.called, "right values alone don't show the call was refused"
+    assert torch.equal(out.cpu(), ref.cpu())
+    with mock.patch.object(
+        execution, "_packed_args", wraps=execution._packed_args
+    ) as general:
+        kernel(base, out)
+    torch.xpu.synchronize()
+    assert not general.called
+    assert torch.equal(out.cpu(), base.cpu() + 1.0)

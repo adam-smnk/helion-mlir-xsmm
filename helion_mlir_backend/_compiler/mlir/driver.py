@@ -10,6 +10,7 @@ from __future__ import annotations
 import bisect
 from itertools import starmap
 import keyword
+import operator
 from typing import TYPE_CHECKING
 
 import sympy
@@ -423,6 +424,8 @@ def call_entry(
     target.prepare_call(staged)
     entry(arguments)
     target.finish_call(staged)
+    if all(map(operator.is_, staged, tensors)):
+        entry.note_passed_as_is(staged)
     for tensor, copy, role in zip(tensors, staged, roles, strict=True):
         if role == "inout" and copy is not tensor:
             tensor.copy_(copy)
