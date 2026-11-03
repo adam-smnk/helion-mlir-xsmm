@@ -171,7 +171,8 @@ What the numbers rest on, each measured alone:
   of a thread read one stream's K/V. `causal_split` 1617 → 1084 µs at S = 2048.
 - **K/V tile 32 under masks or selects:** IGC's vectorizer only stubs a per-element `select`; at 64
   K/V rows that takes the softmax out of vector form, at 32 it stays. Causal asm 4395 → 1784 lines,
-  softcap 2832 → 952 µs wall. Plain itself stays at 64.
+  softcap 1109 → 956 µs wall. Plain itself stays at 64. Most of softcap's old gap (2832 µs at
+  64) was IGC's retry after a spill, now off (`DisableRecompilation=1`, `IGC_OPTIONS`).
 - **Not masking fully visible tiles** (`causal_split`, about 12 more lines): 7 %. Where the
   query tile is the block, nothing needs a mask (`block_diffusion_aligned`).
 

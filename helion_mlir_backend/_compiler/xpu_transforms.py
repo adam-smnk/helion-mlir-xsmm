@@ -138,7 +138,10 @@ def legalize_host_ops() -> ir.Module:
     return schedule
 
 
-IGC_OPTIONS = r"-ze-opt-large-register-file\" \"-igc_opts \'VectorizerAllowCMP=0\'"
+IGC_OPTIONS = (
+    r"-ze-opt-large-register-file\" \"-igc_opts \'VectorizerAllowCMP=0,"
+    r"DisableRecompilation=1\'"
+)
 """IGC options of a device binary by default: ``igc_vectorizer`` unset or ``"cmp"``.
 Only ``gpu-module-to-binary``'s ``opts`` pass them to IGC (the XPU target's binary
 stage); this LLVM never reads a target's ``cmd-options`` flag.
@@ -153,6 +156,13 @@ escaped quotes close the first pair and open a second one.
 - ``VectorizerAllowCMP=0`` keeps ``IGCVectorizer`` on without its vector compares,
   one of the two miscompiles below (IGC 2.41, B50). The other one, a vector ``fptrunc``
   before its operand, is avoided in the IR (:mod:`.mlir_transforms.xevm_lane_conversions`).
+- ``DisableRecompilation=1``: no retry after a spill. IGC would ship a second binary,
+  larger and slower, where the first spills a little. Device time without it, on the
+  B50: attention at partial K/V 268 against 187 us at 4x4x1024x64 (181 at full K/V), softcap at K/V 64
+  2604 against 959, gemma2 at K/V 64 2285 against 755, sibling GEMMs at partial tiles
+  +70 %. No spec kernel's binary changes (33 on the B50 and B70, none retries), and
+  no kernel timed was slower for it. The spills it keeps cost less than the retry:
+  384 B on softcap, 4800 B on gemma2, about what the retry leaves elsewhere.
 
 On an Arc B50 with IGC 2.41, every kernel benchmarked here gives correct results; the
 two known bugs are avoided by this option and an IR rewrite, on that one IGC build.
@@ -194,10 +204,15 @@ The pass's partial switches (``-igc_opts``, comma separated), and what each avoi
 - ``VectorizerAllowFADD``, ``FSUB``, ``FMUL``, ``FDIV``, ``EXP2``, ``MAXNUM``,
   ``WAVEALL``, ``WAVEALLJoint``, ``UniformCMP``, ``UniformSelect``: no bug known in
   them, none tried on our kernels."""
-IGC_OPTIONS_OFF = r"-ze-opt-large-register-file\" \"-igc_opts \'EnableVectorizer=0\'"
+IGC_OPTIONS_OFF = (
+    r"-ze-opt-large-register-file\" \"-igc_opts \'EnableVectorizer=0,"
+    r"DisableRecompilation=1\'"
+)
 """IGC options of a device binary with ``igc_vectorizer`` ``"off"``, the escape hatch:
 ``EnableVectorizer=0`` turns ``IGCVectorizer`` off, with the two miscompiles below
-:data:`IGC_OPTIONS` and a compiler crash on a Triton kernel. See :data:`IGC_OPTIONS`."""
+:data:`IGC_OPTIONS` and a compiler crash on a Triton kernel. See :data:`IGC_OPTIONS`;
+``DisableRecompilation=1`` gains here too: gemma2 at K/V 64 -36 %, sibling GEMMs -12 %,
+softcap at K/V 64 -4 %, level elsewhere."""
 XEVM_TARGET = '#xevm.target<O = 3, chip = "bmg">'
 """The one XeVM target of every GPU module: lighthouse's (``O = 3``, ``bmg``)."""
 _NO_MODULE = "^$"

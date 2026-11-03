@@ -27,6 +27,7 @@ import torch.nn.functional as F
 
 from tests import kernelbench_xpu as kb
 from tests import xpu_math_full_kernels as full_kernels
+from tests import xpu_partial_kernels as pk
 from tests.harness import xpu_tensor
 from tests.igc_dumps import igc_dump_problems
 from tests.igc_dumps import narrow_minmax
@@ -356,6 +357,7 @@ def _assert_options_in_force(dump: pathlib.Path, *, off: bool) -> None:
     commands = [path.read_text(errors="replace") for path in dump.glob("*_cmd.txt")]
     assert any(wanted in text for text in commands)
     assert not any(other in text for text in commands)
+    assert all("DisableRecompilation=1" in text for text in commands)
     optimized = list(dump.glob("*_optimized.ll"))
     assert optimized
     for path in optimized:
@@ -379,6 +381,28 @@ def test_vectorizer_choice_reaches_igc(
     args = [xpu_tensor(*shape, dtype=problem.dtype) for shape in problem.shapes]
     dump = _igc_dump(monkeypatch, tmp_path, problem.kernel, args, config)
     _assert_options_in_force(dump, off=vectorizer == "off")
+
+
+@BINARIES
+@pytest.mark.parametrize("vectorizer", ["off", None], ids=["off", "cmp"])
+def test_a_spilling_kernel_ships_no_retry(
+    vectorizer: str | None, monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    """IGC's retry after a spill ships a second binary (``_1`` in the dumps), larger
+    and slower: sibling GEMMs at partial tiles retry under both settings without
+    ``DisableRecompilation=1``, 70 % and 12 % slower."""
+    case = pk.CASES["sibling_gemms_k"]
+    config = helion.Config(
+        block_sizes=case.blocks,
+        **case.config,
+        **({"igc_vectorizer": [vectorizer]} if vectorizer else {}),
+    )
+    args = [xpu_tensor(*shape, dtype=dtype) for shape, dtype, _ in case.inputs]
+    args.append(xpu_tensor(*case.output[0], dtype=case.output[1]))
+    kernel = helion.kernel(case.fn, backend="mlir", static_shapes=True)
+    dump = _igc_dump(monkeypatch, tmp_path, kernel, args, config)
+    assert list(dump.glob("*.visaasm"))
+    assert not [path.name for path in dump.glob("*_1_simd*.visaasm")]
 
 
 def _two_elementwise(x: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> None:
