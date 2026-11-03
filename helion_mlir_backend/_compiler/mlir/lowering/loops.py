@@ -71,6 +71,15 @@ _KEEP_ZERO_AFTER = (
     torch.ops.aten.neg.default,
 )
 """Ops after a loop that leave a padded 0 at 0."""
+_SAME_ELEMENTS = (
+    torch.ops.aten.permute.default,
+    torch.ops.aten.transpose.int,
+    torch.ops.aten.unsqueeze.default,
+    torch.ops.aten.squeeze.dim,
+    torch.ops.aten.clone.default,
+    torch.ops.prims.convert_element_type.default,
+)
+"""Ops that move or cast elements: a 0 stays a 0."""
 
 
 def _lower_root(ctx: BuildContext, graph_id: int, grid_ids: list[int]) -> None:
@@ -594,7 +603,7 @@ def _refuse_reduced_after_loop(
     outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
     for index, (node, output) in enumerate(zip(running, outputs, strict=True)):
         if node is None and not all(
-            kept and _keeps_zero(ctx, output)
+            kept and keeps_zero(ctx, output)
             for kept in _uses_after_loop(ctx, block_id, loop, index)
         ):
             raise UnsupportedOperationError(
@@ -693,20 +702,30 @@ def _has_tile_dim(ctx: BuildContext, block_id: int, node: torch.fx.Node) -> bool
     )
 
 
-def _keeps_zero(ctx: BuildContext, node: object) -> bool:
+def keeps_zero(ctx: BuildContext, node: object) -> bool:
     """``node``, in a loop's body, is 0 where the tiles it loads are padded."""
     if not isinstance(node, torch.fx.Node):
         return False
     if node.target is hl_memory.load:
         return True
+    if node.op == "placeholder":
+        enclosing = _enclosing_loop(ctx, node.graph)
+        if enclosing is None:
+            return False
+        position = list(node.graph.find_nodes(op="placeholder")).index(node)
+        return keeps_zero(ctx, enclosing.args[3][position])
+    if node.target is tracing_ops._mask_to:
+        return node.args[1] == 0
+    if node.target in _SAME_ELEMENTS:
+        return keeps_zero(ctx, node.args[0])
     if node.target is tracing_ops._phi:
-        return _keeps_zero(ctx, node.args[1])
+        return keeps_zero(ctx, node.args[1])
     if node.target is operator.getitem and _is_loop(node.args[0]):
         inner = ctx.host_function.device_ir.graphs[node.args[0].args[0]].graph
         (outputs,) = next(iter(inner.find_nodes(op="output"))).args
         outputs = outputs if isinstance(outputs, (list, tuple)) else [outputs]
-        return _keeps_zero(ctx, outputs[node.args[1]])
-    operands = [_keeps_zero(ctx, arg) for arg in node.args]
+        return keeps_zero(ctx, outputs[node.args[1]])
+    operands = [keeps_zero(ctx, arg) for arg in node.args]
     if node.target in (torch.ops.aten.mul.Tensor, torch.ops.aten.mul.Scalar):
         # 0 times a value computed from padding may not be 0: 0 / 0, 0 * inf.
         return any(operands) and all(

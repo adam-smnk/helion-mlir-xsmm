@@ -4,6 +4,8 @@ the same wrong values on the B50 (2026-11-02)."""
 
 from __future__ import annotations
 
+import operator
+
 import helion
 import helion.language as hl
 import pytest
@@ -450,6 +452,67 @@ def after_times_exp(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def dot_of_shifted(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([a.size(0), b.size(1)], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([a.size(0), b.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(a.size(1)):
+            acc = hl.dot(a[tm, tk] + 1.0, b[tk, tn] + 1.0, acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+def dot_of_one_shifted(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([a.size(0), b.size(1)], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([a.size(0), b.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(a.size(1)):
+            acc = hl.dot(a[tm, tk], b[tk, tn] + 1.0, acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+def addmm_of_shifted(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([a.size(0), b.size(1)], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([a.size(0), b.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(a.size(1)):
+            acc = torch.addmm(acc, a[tm, tk] + 1.0, b[tk, tn] + 1.0)
+        out[tm, tn] = acc
+    return out
+
+
+def dot_of_loads(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([a.size(0), b.size(1)], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([a.size(0), b.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(a.size(1)):
+            acc = hl.dot(a[tm, tk], b[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+def dot_of_scaled(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([a.size(0), b.size(1)], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([a.size(0), b.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(a.size(1)):
+            acc = hl.dot(a[tm, tk] * 2.0, -b[tk, tn], acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
+def dot_of_casts(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    out = torch.empty([a.size(0), b.size(1)], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([a.size(0), b.size(1)]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(a.size(1)):
+            first = a[tm, tk].to(torch.float32)
+            acc = hl.dot(first, b[tk, tn].to(torch.float32), acc=acc)
+        out[tm, tn] = acc
+    return out
+
+
 def _logical_or(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.logical_or(a, b)
 
@@ -708,3 +771,56 @@ def test_right_but_refused_without_a_proof(fn: object) -> None:
     )
     with pytest.raises(UnsupportedOperationError, match="after a loop"):
         kernel(fn)(torch.rand(16, 60) + 1.0)
+
+
+def _dot_kernel(fn: object) -> helion.Kernel:
+    return helion.kernel(
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=[16, 16, 16]),
+    )(fn)
+
+
+@pytest.mark.parametrize(
+    "fn", [dot_of_shifted, dot_of_one_shifted], ids=lambda v: v.__name__
+)
+def test_dot_of_a_computed_operand_at_a_partial_k_refused(fn: object) -> None:
+    """Regression: ``hl.dot`` gets no mask from Helion: 2.1 % off at 32x56x32, on the
+    CPU, Triton and the XPU, where ``torch.addmm`` is right. ``dot_of_one_shifted`` is
+    right without the refusal: nothing proves the other operand finite."""
+    a, b = torch.rand(32, 56) + 1.0, torch.rand(56, 32) + 1.0
+    with pytest.raises(UnsupportedOperationError, match=r"torch\.addmm"):
+        _dot_kernel(fn)(a, b)
+
+
+@pytest.mark.parametrize(
+    ("fn", "ref"),
+    [
+        (addmm_of_shifted, lambda a, b: (a + 1) @ (b + 1)),
+        (dot_of_loads, operator.matmul),
+        (dot_of_scaled, lambda a, b: (a * 2) @ -b),
+    ],
+    ids=["addmm", "loads", "scaled"],
+)
+def test_right_contractions_at_a_partial_k(fn: object, ref: object) -> None:
+    torch.manual_seed(0)
+    a, b = torch.rand(32, 56) + 1.0, torch.rand(56, 32) + 1.0
+    want = ref(a.double(), b.double())
+    got = _dot_kernel(fn)(a, b).double()
+    assert (got - want).abs().max() / want.abs().max() < 1e-5
+
+
+def test_dot_of_a_computed_operand_at_a_whole_k() -> None:
+    a, b = torch.rand(32, 64) + 1.0, torch.rand(64, 32) + 1.0
+    want = (a.double() + 1) @ (b.double() + 1)
+    got = _dot_kernel(dot_of_shifted)(a, b).double()
+    assert (got - want).abs().max() / want.abs().max() < 1e-5
+
+
+def test_dot_of_casts_at_a_partial_k() -> None:
+    torch.manual_seed(0)
+    a = (torch.rand(32, 56) + 1.0).to(torch.bfloat16)
+    b = (torch.rand(56, 32) + 1.0).to(torch.bfloat16)
+    want = a.double() @ b.double()
+    got = _dot_kernel(dot_of_casts)(a, b).double()
+    assert (got - want).abs().max() / want.abs().max() < 1e-5
