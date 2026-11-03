@@ -414,6 +414,54 @@ def test_split_bf16_loads_splits_the_last_element() -> None:
     assert text.count("llvm.shufflevector") == 2
 
 
+def _masked_bf16_load(width: int, mask: list[bool], element: str = "bf16") -> str:
+    lanes = ", ".join("true" if lane else "false" for lane in mask)
+    vector = f"vector<{width}x{element}>"
+    return f"""
+llvm.func @f(%p: !llvm.ptr, %z: {vector}) -> {vector} {{
+  %m = llvm.mlir.constant(dense<[{lanes}]> : vector<{width}xi1>) : vector<{width}xi1>
+  %r = llvm.intr.masked.load(%p, %m, %z), alignment(2) : (!llvm.ptr, vector<{width}xi1>, {vector}) -> {vector}
+  llvm.return %r : {vector}
+}}
+"""
+
+
+@pytest.mark.parametrize(("width", "kept"), [(64, 33), (96, 65), (192, 161), (40, 33)])
+def test_split_bf16_loads_splits_a_masked_load_of_32k_plus_1(
+    width: int, kept: int
+) -> None:
+    # Aborts x86 code generation (LegalizeDAG, a v32bf16 BUILD_VECTOR).
+    mask = [lane < kept for lane in range(width)]
+    text = _apply(split_bf16_loads, _masked_bf16_load(width, mask))
+    assert f"llvm.getelementptr %arg0[{kept - 1}]" in text
+    assert re.search(r"llvm\.load [^\n]*-> vector<1xbf16>", text)
+    assert text.count("llvm.intr.masked.load") == 1
+    assert text.count("llvm.shufflevector") == 2
+
+
+@pytest.mark.parametrize(
+    ("width", "mask", "element"),
+    [
+        # Other prefixes: selected as they are.
+        (96, [lane < 64 for lane in range(96)], "bf16"),
+        (96, [lane < 66 for lane in range(96)], "bf16"),
+        (64, [lane < 17 for lane in range(64)], "bf16"),
+        # No split part of one lane past the first.
+        (32, [lane < 1 for lane in range(32)], "bf16"),
+        # Not a prefix.
+        (64, [lane != 0 and lane < 34 for lane in range(64)], "bf16"),
+        # Another element type.
+        (96, [lane < 65 for lane in range(96)], "f16"),
+    ],
+)
+def test_split_bf16_loads_leaves_other_masked_loads(
+    width: int, mask: list[bool], element: str
+) -> None:
+    text = _apply(split_bf16_loads, _masked_bf16_load(width, mask, element))
+    assert "llvm.getelementptr" not in text
+    assert text.count("llvm.intr.masked.load") == 1
+
+
 def _l2_normalize(x: torch.Tensor) -> torch.Tensor:
     """AI-bench's 39_L2Norm_ kernel: ``x / ||x||_2`` per row, in two passes over
     column chunks."""
