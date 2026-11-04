@@ -48,6 +48,7 @@ from mlir.passmanager import PassManager
 import torch
 
 from .. import xpu_transforms
+from ..mlir.support.debug import LOWERING_WARNINGS_ATTR
 from ..mlir.support.debug import XPU_STOP_POINTS
 from ..mlir.support.debug import DebugOptions
 from ..mlir.support.debug import xpu_stop_at
@@ -58,6 +59,10 @@ from ..mlir_transforms import xegpu_layouts
 from ..mlir_transforms.keep_row_dims import keep_row_dims
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
+from ..mlir_transforms.prints import guard_prints
+from ..mlir_transforms.prints import prints_of_stored_buffers
+from ..mlir_transforms.prints import warn_print_is_experimental
+from ..mlir_transforms.prints import refuse_prints_needing_allocation
 from ..mlir_transforms.row_maxima import restore_nan_propagating_maxima
 from ..mlir_transforms.xegpu_attention_loops import copy_attention_layouts
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
@@ -208,6 +213,8 @@ def _stages(
         ("grid-mappings", _StripGridMappings()),
         # Lighthouse's outline_gpu_func and annotate_layouts schedules, per kernel.
         ("gpu-outlining", xpu_transforms.outline_kernels(entry, kernels, columns)),
+        # Prints a kernel can't do, or may do wrong: see prints.
+        ("print-reads", _RefusePrintsNeedingAllocation()),
         # Row results stored as [rows, 1] columns: see keep_row_dims.
         ("row-results", _KeepRowDims()),
         # A SPIR-V backend abort on bool to float casts: see xpu_bool_casts.
@@ -701,6 +708,20 @@ class _FabsAsIntegerMin(Stage):
         return module
 
 
+class _RefusePrintsNeedingAllocation(Stage):
+    """A print that needs a buffer in the kernel is refused; one that can see other threads'
+    stores gets a warning (:mod:`prints`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        refuse_prints_needing_allocation(module)
+        warnings_found = prints_of_stored_buffers(module)
+        if warnings_found:
+            module.operation.attributes[LOWERING_WARNINGS_ATTR] = ir.ArrayAttr.get(
+                [ir.StringAttr.get(line) for line in warnings_found]
+            )
+        return module
+
+
 class _CompareLanes(Stage):
     """Vector compares lane by lane (works around IGC's one-row ``fabs`` and ``abs``,
     :mod:`xevm_lane_compares`)."""
@@ -840,6 +861,9 @@ class XpuTarget(MLIRTarget):
         self.resolve_pipeline(pipeline)
         self.check_stop_at(stop_at)
         dump = DebugOptions.from_env().dump_stages
+        # One line per workgroup: before outlining, which needs the guard's region.
+        if guard_prints(module):
+            warn_print_is_experimental(entry)
         # Loads lighthouse's dialects, which building the schedules needs.
         BackendDriver(module, entry, result_to_args=False, benchmark=False)
         if partial_tiles.to_transfers(module):

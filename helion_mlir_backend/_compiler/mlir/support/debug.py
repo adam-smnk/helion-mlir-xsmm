@@ -11,6 +11,9 @@ PIPELINES = ("opt", "scalar")
 TARGETS = ("auto", "cpu", "xpu")
 """``HELION_MLIR_TARGET`` values; ``auto`` follows the device."""
 LOWERING_LOG_ATTR = "helion.lowering_log"
+LOWERING_WARNINGS_ATTR = "helion.lowering_warnings"
+"""Python warnings a lowering stage has for the user: it may run in a forked process, whose
+own warnings no one sees, so they travel on the module."""
 """Module attribute: lines a lowering logged that its caller must see too, since a forked
 lowering's log doesn't reach the caller's process."""
 XPU_STOP_POINTS = ("xegpu-wg", "xevm", "xevm-final", "binary")

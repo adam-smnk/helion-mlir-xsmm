@@ -41,11 +41,13 @@ import torch
 from helion_mlir_backend._compiler import native
 from helion_mlir_backend._compiler.mlir.in_place import update_carried_values_in_place
 from helion_mlir_backend._compiler.mlir.support.debug import LOWERING_LOG_ATTR
+from helion_mlir_backend._compiler.mlir.support.debug import LOWERING_WARNINGS_ATTR
 from helion_mlir_backend._compiler.mlir.support.debug import DebugOptions
 from helion_mlir_backend._compiler.mlir.support.debug import compile_timeout
 from helion_mlir_backend._compiler.mlir.support.errors import CompileTimeoutError
 from helion_mlir_backend._compiler.mlir.support.errors import LoweringStoppedError
 from helion_mlir_backend._compiler.mlir.support.type_utils import mlir_dtype_to_torch
+from helion_mlir_backend._compiler.mlir_transforms.prints import warn_on_each_compile
 from helion_mlir_backend._compiler.targets import resolve_target
 from helion_mlir_backend._compiler.targets.base import MLIRTarget
 
@@ -605,6 +607,7 @@ def _lower(
             lowered = lowering.apply(module)
             # Already logged, in this process.
             _take_lowering_log(lowered)
+            _warn_from_lowering(lowered)
             return lowered
     receiver, sender = multiprocessing.Pipe(duplex=False)
     with _anonymous_file() as stderr:
@@ -648,6 +651,7 @@ def _lower(
     lowered = ir.Module.parse(result, context=module.context)
     for line in _take_lowering_log(lowered):
         log.warning("%s", line)
+    _warn_from_lowering(lowered)
     return lowered
 
 
@@ -662,6 +666,16 @@ def _take_lowering_log(module: ir.Module) -> list[str]:
     ]
     del attributes[LOWERING_LOG_ATTR]
     return lines
+
+
+def _warn_from_lowering(module: ir.Module) -> None:
+    """The warnings the lowering recorded on ``module``, raised here and removed from it."""
+    attributes = module.operation.attributes
+    if LOWERING_WARNINGS_ATTR not in attributes:
+        return
+    for line in ir.ArrayAttr(attributes[LOWERING_WARNINGS_ATTR]):
+        warn_on_each_compile(ir.StringAttr(line).value)
+    del attributes[LOWERING_WARNINGS_ATTR]
 
 
 def _death_message(exitcode: int | None, output: str) -> str:

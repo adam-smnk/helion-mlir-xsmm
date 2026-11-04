@@ -1441,6 +1441,7 @@ def test_stage_dumps(monkeypatch: pytest.MonkeyPatch) -> None:
         "host-legalized",
         "grid-mappings",
         "gpu-outlining",
+        "print-reads",
         "row-results",
         "bool-casts",
         "xegpu-initial",

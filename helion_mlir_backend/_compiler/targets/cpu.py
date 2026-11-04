@@ -14,6 +14,8 @@ from lighthouse.pipeline.driver import BackendDriver
 
 from ..mlir.support.debug import PIPELINES
 from ..mlir.support.debug import default_pipeline
+from ..mlir_transforms.prints import lower_prints_to_libc
+from ..mlir_transforms.prints import warn_print_is_experimental
 from .base import MLIRTarget
 
 if TYPE_CHECKING:
@@ -83,6 +85,8 @@ class CpuTarget(MLIRTarget):
         stop_at: str | None = None,
     ) -> BackendDriver:
         self.check_stop_at(stop_at)
+        if lower_prints_to_libc(module):
+            warn_print_is_experimental(entry)
         driver = BackendDriver(module, entry, result_to_args=False, benchmark=False)
         driver.add_stage(pipeline_descriptor(pipeline))
         return driver

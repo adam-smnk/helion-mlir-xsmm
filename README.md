@@ -216,6 +216,81 @@ support. The stock bindings cannot emit SPIR-V.
 SDPA) as a fused flash-attention kernel with hand-picked config, checked against
 and timed next to torch.
 
+## Printing in a kernel
+
+**Experimental:** each compile of a kernel with a print warns so. `print("label", x, ...)`
+in a tile loop (Helion's `hl.device_print`) prints on the CPU and on the XPU, from the
+same source. The first argument is a string; the
+others are tensors, each printed one element per line as `label[i, j]: value`. A
+label alone is a line per tile loop iteration. A kernel without a print compiles to
+the same module as before.
+
+What Helion accepts is what prints: `print("at", tm.begin)` raises its "only supports
+runtime tensor values". Outside the tile loops, `print` is host Python: it runs at
+trace time and on every call. `hl.device_print` there is refused.
+
+On the CPU a line is one libc `printf` and a flush; on the XPU, an OpenCL `printf`
+from the first lane of each workgroup, delivered by the driver.
+
+**A print can change a kernel's results by rounding.** It can change the code path a
+kernel takes, so results may differ by rounding and subnormal inputs can flush, as a
+different tile size can. An `x @ w.T` of bf16 with a relu at 128x128 runs FMAs at tiles
+`[32, 32, 32]` and AMX with a print of the accumulator in its K loop, or at
+`[64, 64, 32]` without one. Each AMX form differed from the FMAs by one bf16 unit in
+the last place in 5 of 30 random inputs, with the same error against fp64 (3.1e-3 of the
+largest value), and turned a subnormal `x` times a huge `w` from 380 (exact 380.875)
+into 0. A print elsewhere in that kernel kept the FMAs. Don't compare with a printing
+kernel bit for bit.
+
+Where it goes matters to the code around it:
+
+| Placement | CPU | XPU |
+|---|---|---|
+| A label, in a tile loop | prints; path kept in the kernels tried | prints; XeGPU ops unchanged |
+| A tile of an input the kernel only reads | prints | prints; XeGPU ops unchanged |
+| The output tile, after storing it | prints | prints; not synchronized (see below) |
+| A tile of a buffer the kernel also stores, before that store or in a loop | prints | prints, maybe wrong values, with a warning (see below) |
+| A tile computed in the kernel, or partial | prints | refused (see below) |
+| In a K loop | prints; may repeat, may change path (see below) | prints what the rows above allow |
+| Between two elementwise ops | prints; they may no longer fuse | refused, as computed |
+
+Limits:
+
+- **Buffers the kernel stores, on the XPU:** a print of one that isn't provably after the
+  store of that tile, in the tile loop's body and with no other store to that buffer,
+  compiles and runs with a Python warning at compile time: its values may be wrong,
+  because thread 0 reads while the other hardware threads store (11549 of 16384 values
+  were wrong in one such print on an Arc B50). The kernel's results aren't affected. Print
+  after the store, or print an input. After the store there's no warning, but it is **not
+  synchronized** either: the first thread can read shares the others haven't stored yet;
+  no stale value was seen in the runs tried, which is observed, not guaranteed. An input
+  that overlaps an output at the call is passed as a copy, so its print shows its values
+  at the call.
+- **Computed and partial tiles on the XPU** are refused with an error naming
+  `hl.device_print`: reading one needs a buffer in the kernel, which cannot allocate.
+  Print a full loaded tile, or the output after storing it, or use `target="cpu"`.
+  Attention can only print labels on the XPU, as its tiles are computed or are 4D. A
+  kernel whose tile loop does nothing but print fails in lighthouse with "requires
+  exactly one target handle": this isn't specific to printing.
+- **K loops on the CPU:** with a consumer the register tiling fuses into, such as
+  `acc.to(torch.bfloat16)`, fusion copies the K loop, so its work and lines repeat, by
+  a count that depends on the kernel (3 times for a GEMM at a tile of 32, 5 for
+  attention's K/V loop).
+- **Fusion:** printing a tile between elementwise ops makes that tile real, so they
+  may not fuse: more loads and stores, same result.
+- **Partial tiles print their padding** (CPU).
+- **Order isn't deterministic.** Lines stay whole; tiles run in parallel. On the XPU,
+  lines arrive grouped by workgroup.
+- **XPU lines arrive late with several grid loops:** only the last launch's lines are
+  out by the end of the call; earlier ones arrive during a later call or at exit, so a
+  hang or a kill may lose them (inferred; none were lost in the totals of runs that
+  ended).
+- **XPU output can be truncated, silently:** the driver's printf buffer took about
+  100,000 lines per call on an Arc B50; a larger print loses the rest.
+- **Format:** floats print as `%f`, so a magnitude below 5e-7 shows as `0.000000`. A NUL
+  in a label cuts it off there.
+- **Don't combine it with autotuning:** every trial prints.
+
 ## Install
 
 The project is using [uv](https://docs.astral.sh/uv/) package manager.
