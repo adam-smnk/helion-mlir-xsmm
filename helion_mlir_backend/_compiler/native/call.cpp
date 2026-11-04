@@ -11,6 +11,7 @@
 // A check that fails makes the caller take the unchanged general path: these
 // objects never raise for an argument they cannot take.
 
+#include <cstring>
 #include <Python.h>
 
 #include <ATen/PythonTorchFunctionTLS.h>
@@ -284,7 +285,8 @@ PyMethodDef EntryCall_methods[] = {
 // KernelRun
 
 // Parameters: a tensor, an object compared by identity, a scalar compared by
-// type and ==, an hl.constexpr compared by type and its value's type and ==,
+// type and == (floats by their bits: 0.0 == -0.0), an hl.constexpr compared by
+// type and its value's type and likewise,
 // a function compared by its code (==) and its closure cells' contents (each by
 // identity, or as kEqual / kConstExpr), as Helion keys it.
 enum Kind { kTensor = 0, kIdentity = 1, kEqual = 2, kConstExpr = 3, kFunction = 4 };
@@ -308,6 +310,10 @@ int same_value(int kind, PyObject* a, PyObject* b) {
     a = PyTuple_GET_ITEM(a, 0);
     b = PyTuple_GET_ITEM(b, 0);
     if (Py_TYPE(a) != Py_TYPE(b)) return 0;
+  }
+  if (PyFloat_CheckExact(a)) {
+    const double x = PyFloat_AS_DOUBLE(a), y = PyFloat_AS_DOUBLE(b);
+    return std::memcmp(&x, &y, sizeof x) == 0;
   }
   return PyObject_RichCompareBool(a, b, Py_EQ);
 }

@@ -120,6 +120,14 @@ def test_nan_defaults_share_a_compile(apply_kernel: helion.Kernel) -> None:
     assert len(apply_kernel._bound_kernels) == 1
 
 
+def _int_cell(n: int) -> object:
+    return lambda t: t * n
+
+
+def _float_cell(value: float) -> object:
+    return lambda t: t * value
+
+
 def test_helion_consults_the_function_key(apply_kernel: helion.Kernel) -> None:
     """The wrapper replaces an entry of Helion's extractor table: if Helion
     stopped dispatching through that table, it would go inert while the entry
@@ -128,6 +136,10 @@ def test_helion_consults_the_function_key(apply_kernel: helion.Kernel) -> None:
     key = apply_kernel._base_specialization_key
     assert key((x, _make_divide(2.0))) != key((x, _make_divide(3.0)))
     assert key((x, _make_divide(2.0))) == key((x, _make_divide(2.0)))
+    # A number in a cell by its type, as in Helion: compile-time reads of an int go
+    # through the extras (test_constexpr_and_int_cell_keys.py).
+    assert key((x, _int_cell(1))) == key((x, _int_cell(3)))
+    assert key((x, _float_cell(1.0))) == key((x, _float_cell(3.0)))
 
 
 def test_equal_functions_share_a_compile(apply_kernel: helion.Kernel) -> None:

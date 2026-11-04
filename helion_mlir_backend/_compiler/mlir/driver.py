@@ -233,8 +233,8 @@ def _plan(
 def _plan_params(args: tuple[object, ...]) -> list[tuple[object, ...]] | None:
     """Per argument ``(kind, dtype or value, sizes, strides)``: 0 a plain CPU
     tensor, 1 an object compared by identity (a builtin function), 2 a scalar
-    (type and ``==``), 3 an ``hl.constexpr`` of a scalar (its type, its
-    value's type and ``==``: a helper may make a new one per call), 4 a
+    (type and ``==``, floats by their bits), 3 an ``hl.constexpr`` of a scalar
+    (its type, and its value as 2: a helper may make a new one per call), 4 a
     function ``(4, function, cell kinds, cell contents)``: its code and its
     closure's contents when planned, each as 1-3 (as Helion keys functions:
     another instance of a model has its own epilogue closures); ``None``: no

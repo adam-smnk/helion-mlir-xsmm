@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import dataclasses
 import logging
+import numbers
 import sys
+import types
 from typing import Callable
+
+from helion.language.constexpr import ConstExpr
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +40,8 @@ def install() -> bool:
     _accept_mlir_module_globals()
     _keep_runtime_slice_sizes(MLIRBackend)
     _key_function_args_by_globals_and_defaults(MLIRBackend)
+    _key_constexpr_by_type_and_bits(MLIRBackend)
+    _bind_kernels_with_constexpr_params(MLIRBackend)
     _check_module_lookups(MLIRBackend)
     install_trace_mode()
     install_original_args_capture()
@@ -81,8 +88,7 @@ def _keep_runtime_slice_sizes(MLIRBackend: type) -> None:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.compile_environment import _has_unbacked
     import sympy
-    import torch
-
+    
     if getattr(CompileEnvironment, "_helion_mlir_runtime_slice_sizes", False):
         return
     original = CompileEnvironment.try_concretize_symint
@@ -126,12 +132,53 @@ class _SameObject:
 
 def _default_key(value: object) -> object:
     """Defaults are compiled in as constants, so equal values may share a key.
-    Floats by their bits: 0.0 == -0.0, and NaN differs from itself."""
+    Floats by their bits: 0.0 == -0.0, and NaN differs from itself. Another object
+    by identity and the ints in it, which may be mutated: a default is read at
+    compile time, and records no guard to go by."""
     if type(value) is float:
         return float, value.hex()
     if value is None or type(value) in (bool, int, str):
         return type(value), value
-    return _SameObject(value)
+    return _SameObject(value), _cell_ints(value)
+
+
+def _constexpr_key(value: object) -> object:
+    """An ``hl.constexpr`` value: its type too (``1 == 1.0 == True``), floats of any
+    type by their bits (``0.0 == -0.0``, and NaN differs from itself), each element
+    of a tuple likewise."""
+    kind = type(value)
+    if isinstance(value, numbers.Real) and not isinstance(value, numbers.Integral):
+        return kind, float(value).hex()
+    if kind is tuple:
+        return tuple, tuple(map(_constexpr_key, value))  # type: ignore[arg-type]
+    return kind, value
+
+
+def _cell_ints(value: object) -> object:
+    """The ints in a value, nested in tuples, lists, dicts, dataclasses and
+    namedtuples; ``None`` where there are none. Everything else stays with Helion's
+    key: floats and bools (reading them at compile time raises), and functions and
+    ``hl.constexpr`` (their own extractors)."""
+    kind = type(value)
+    if kind is int:
+        return value
+    if kind is ConstExpr:
+        return None
+    if isinstance(value, (tuple, list)):
+        parts = tuple(map(_cell_ints, value))
+    elif isinstance(value, dict):
+        parts = tuple((key, _cell_ints(value[key])) for key in sorted(value, key=repr))
+        if all(part[1] is None for part in parts):
+            return None
+        return parts
+    elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+        parts = tuple(
+            _cell_ints(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        )
+    else:
+        return None
+    return parts if any(part is not None for part in parts) else None
 
 
 def _key_function_args_by_globals_and_defaults(MLIRBackend: type) -> None:
@@ -161,6 +208,65 @@ def _key_function_args_by_globals_and_defaults(MLIRBackend: type) -> None:
 
     function_key._helion_mlir_globals_and_defaults = True  # type: ignore[attr-defined]
     extractors[types.FunctionType] = function_key
+
+
+def _key_constexpr_by_type_and_bits(MLIRBackend: type) -> None:
+    """Keep ``hl.constexpr`` values of different type or sign of zero apart.
+
+    Helion keys them by the value: ``0.0 == -0.0``, so ``x / hl.constexpr(-0.0)``
+    after ``x / hl.constexpr(0.0)`` ran the first compile without an error, and
+    ``1``, ``1.0`` and ``True`` shared one. The key of an argument (wrapped, or
+    plain to an annotated parameter) is built in ``_base_specialization_key``; of
+    a constexpr in a cell or container, in the extractor table.
+    """
+    from helion.runtime.kernel import Kernel
+    from helion.runtime.kernel import _specialization_extractors as extractors
+
+    original_extractor = extractors[ConstExpr]
+    if getattr(original_extractor, "_helion_mlir_constexpr_key", False):
+        return
+    backend_name = MLIRBackend().name
+    original_base = Kernel._base_specialization_key
+
+    def constexpr_extractor(kernel: Kernel, value: ConstExpr) -> object:
+        if kernel.settings.backend != backend_name:
+            return original_extractor(kernel, value)
+        return _constexpr_key(value.value)
+
+    def base_specialization_key(self: Kernel, args: object) -> tuple[object, ...]:
+        key = original_base(self, args)
+        if self.settings.backend != backend_name:
+            return key
+        typed = [
+            _constexpr_key(value.value if isinstance(value, ConstExpr) else value)
+            for value, annotation in zip(args, self._annotations, strict=False)
+            if isinstance(value, ConstExpr) or annotation is ConstExpr
+        ]
+        return (*key, tuple(typed)) if typed else key
+
+    constexpr_extractor._helion_mlir_constexpr_key = True  # type: ignore[attr-defined]
+    extractors[ConstExpr] = constexpr_extractor
+    Kernel._base_specialization_key = base_specialization_key
+
+
+def _bind_kernels_with_constexpr_params(MLIRBackend: type) -> None:
+    """Helion's fast key of a plain float has ``0.0 == -0.0``, coarser than the full
+    key of a constexpr-annotated parameter (:func:`_key_constexpr_by_type_and_bits`):
+    such kernels take ``bind()`` on every call."""
+    from helion.runtime.kernel import Kernel
+
+    original = Kernel._fast_dispatch_key
+    if getattr(original, "_helion_mlir_constexpr_params", False):
+        return
+    backend_name = MLIRBackend().name
+
+    def fast_dispatch_key(self: Kernel, args: tuple[object, ...]) -> object:
+        if self.settings.backend == backend_name and ConstExpr in self._annotations:
+            return None
+        return original(self, args)
+
+    fast_dispatch_key._helion_mlir_constexpr_params = True  # type: ignore[attr-defined]
+    Kernel._fast_dispatch_key = fast_dispatch_key
 
 
 def _check_module_lookups(MLIRBackend: type) -> None:
