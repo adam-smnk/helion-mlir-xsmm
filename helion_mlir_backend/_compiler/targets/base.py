@@ -9,6 +9,7 @@ what autotuning searches and caches. Exactly one target compiles a kernel.
 from __future__ import annotations
 
 import abc
+import ctypes
 from typing import TYPE_CHECKING
 from typing import ClassVar
 from typing import Protocol
@@ -23,6 +24,25 @@ if TYPE_CHECKING:
     from helion.autotuner.config_spec import ConfigSpec
     from lighthouse.execution.runner import Runner
     import torch
+
+
+_THREAD_ATEXIT = "__cxa_thread_atexit_impl"
+
+
+def exit_before_teardown() -> bool:
+    """Makes C ``exit`` in this thread end the process at once, with status 1:
+    ``_exit`` as the next thread-local destructor, and those run first and in
+    reverse order, before ``atexit`` handlers and static destructors. False if
+    this libc has no such registration (a glibc-private symbol)."""
+    libc = ctypes.CDLL(None)
+    register = getattr(libc, _THREAD_ATEXIT, None)
+    if register is None:
+        return False
+    register.argtypes = [ctypes.c_void_p] * 3
+    leave = ctypes.cast(libc._exit, ctypes.c_void_p).value
+    # The object is ``_exit``'s argument; the symbol names the owning library.
+    register(leave, 1, leave)
+    return True
 
 
 class Lowering(Protocol):
@@ -120,9 +140,11 @@ class MLIRTarget(abc.ABC):
             return self.lowering(module, entry, pipeline, stop_at).apply(module)
 
     def enter_lowering_child(self) -> None:
-        """Called in a forked lowering process before it lowers (default:
-        nothing)."""
-        return
+        """Called in a forked lowering process before it lowers. ``LLVM ERROR`` ends
+        in C ``exit``, whose destructors can't run in a fork: libomp's wait forever
+        on threads that did not survive it or crash, so the error would arrive as a
+        compile timeout or a signal, and the driver's reach the parent's GPU."""
+        exit_before_teardown()
 
     @abc.abstractmethod
     def runner(self, module: ir.Module) -> Runner:

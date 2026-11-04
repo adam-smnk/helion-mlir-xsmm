@@ -1,5 +1,6 @@
-"""A lowering process that ends in C ``exit`` (``LLVM ERROR``) leaves the parent's
-GPU state alone and still reports its exit code and error."""
+"""A lowering process that ends in C ``exit`` (``LLVM ERROR``) leaves at once: it
+reports its exit code and error, on either target, and leaves the parent's GPU
+state alone."""
 
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ import pytest
 import torch
 
 from helion_mlir_backend._compiler import execution
+from helion_mlir_backend._compiler.targets import base
 from helion_mlir_backend._compiler.targets import xpu
 from helion_mlir_backend._compiler.targets.cpu import CpuTarget
 
@@ -112,7 +114,7 @@ def test_a_libc_without_the_symbol_closes_device_descriptors() -> None:
         device = os.open("/dev/null", os.O_RDONLY)
         other = os.open("/proc/self/stat", os.O_RDONLY)
         with (
-            mock.patch.object(xpu, "_THREAD_ATEXIT", "no_such_symbol"),
+            mock.patch.object(base, "_THREAD_ATEXIT", "no_such_symbol"),
             mock.patch.object(xpu, "_DEVICE_FDS", "/dev/null"),
         ):
             _Target().enter_lowering_child()
@@ -124,10 +126,23 @@ def test_a_libc_without_the_symbol_closes_device_descriptors() -> None:
     assert _in_child(body) == 0
 
 
-@pytest.mark.isolated(timeout=90)
-def test_the_cpu_target_changes_nothing() -> None:
+def test_the_cpu_target_leaves_at_once_too(tmp_path: pathlib.Path) -> None:
+    marks = tmp_path / "ran"
+
     def body() -> None:
+        keep = _register_marks(marks)  # noqa: F841 (C exit calls into it)
         CpuTarget().enter_lowering_child()
+        _llvm_error()
+
+    assert _in_child(body) == 1
+    assert not marks.exists()
+
+
+@pytest.mark.isolated(timeout=90)
+def test_a_libc_without_the_symbol_leaves_the_cpu_target_as_it_was() -> None:
+    def body() -> None:
+        with mock.patch.object(base, "_THREAD_ATEXIT", "no_such_symbol"):
+            CpuTarget().enter_lowering_child()
         _llvm_error()
 
     assert _in_child(body) == 7
@@ -174,6 +189,59 @@ def test_kernels_run_after_a_lowering_that_exits(
         pytest.raises(RuntimeError, match="with exit code 1: LLVM ERROR"),
     ):
         _kernel(_dying)(x)
+    out = _kernel(_good)(x)
+    torch.xpu.synchronize()
+    assert torch.equal(out.cpu(), (x * 2.0).cpu())
+
+
+class _ExitingLowering:
+    """A CPU lowering that ends as ``LLVM ERROR`` does."""
+
+    def apply(self, _: ir.Module) -> ir.Module:
+        _llvm_error(code=1)
+        raise AssertionError("exit returned")
+
+
+@pytest.mark.isolated(timeout=90)
+@pytest.mark.parametrize("pool", ["active", "asleep"])
+def test_cpu_exit_after_a_kernel_reports_the_code_and_the_error(
+    pool: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without the fix, the child's exit crashes on SIGSEGV with libomp's workers
+    active, and with them asleep waits forever in libomp's teardown, so the error
+    arrives as this short compile timeout. The environment pins the two states."""
+    monkeypatch.setenv("HELION_MLIR_TARGET", "cpu")
+    monkeypatch.setenv("KMP_BLOCKTIME", {"active": "infinite", "asleep": "0"}[pool])
+    monkeypatch.setenv("OMP_NUM_THREADS", "8")
+    x = torch.ones(128, 256)
+    _kernel(_good)(x)
+    with (
+        monkeypatch.context() as patch,
+        mock.patch.object(CpuTarget, "lowering", lambda *_, **__: _ExitingLowering()),
+        pytest.raises(RuntimeError) as info,
+    ):
+        patch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "10")
+        _kernel(_dying)(x)
+    message = f"{type(info.value).__name__}: {info.value}"
+    assert message.endswith("with exit code 1: LLVM ERROR: from the backend"), message
+    assert torch.equal(_kernel(_good)(x), x * 2.0)
+
+
+@pytest.mark.xpu_runtime
+@pytest.mark.isolated(timeout=90)
+def test_xpu_kernels_run_after_a_cpu_lowering_that_exits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the fix, the CPU child's exit stalls or aborts the next XPU kernel."""
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "20")
+    x = torch.randn(128, 256, dtype=torch.float32).to("xpu")
+    _kernel(_good)(x)
+    torch.xpu.synchronize()
+    with (
+        mock.patch.object(CpuTarget, "lowering", lambda *_, **__: _ExitingLowering()),
+        pytest.raises(RuntimeError, match="with exit code 1: LLVM ERROR"),
+    ):
+        _kernel(_dying)(torch.ones(128, 256))
     out = _kernel(_good)(x)
     torch.xpu.synchronize()
     assert torch.equal(out.cpu(), (x * 2.0).cpu())

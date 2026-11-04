@@ -78,6 +78,7 @@ from ..mlir_transforms.xpu_bool_casts import select_bool_casts
 from ..mlir_transforms.xpu_math_approx import approximate_math
 from ..mlir_transforms.xpu_math_approx import fold_extended_splats
 from .base import MLIRTarget
+from .base import exit_before_teardown
 from .xpu_checks import check_partial_gemms
 from .xpu_checks import check_xegpu_capabilities
 from .xpu_params import XPU_CONFIG_KEYS
@@ -98,7 +99,6 @@ if TYPE_CHECKING:
     from helion.autotuner.config_spec import ConfigSpec
 
 _RUNTIME_LIB = "libmlir_levelzero_runtime.so"
-_THREAD_ATEXIT = "__cxa_thread_atexit_impl"
 _DEVICE_FDS = "/dev/dri/"
 _PIPELINES = ("xegpu",)
 _CPU = "target='cpu' (CPU tensors)"
@@ -759,22 +759,6 @@ def _runtime_library() -> str | None:
     return str(path) if path.is_file() else None
 
 
-def _exit_before_teardown() -> bool:
-    """Makes C ``exit`` in this thread end the process at once, with status 1:
-    ``_exit`` as the next thread-local destructor, and those run first and in
-    reverse order, before ``atexit`` handlers and static destructors. False if
-    this libc has no such registration (a glibc-private symbol)."""
-    libc = ctypes.CDLL(None)
-    register = getattr(libc, _THREAD_ATEXIT, None)
-    if register is None:
-        return False
-    register.argtypes = [ctypes.c_void_p] * 3
-    leave = ctypes.cast(libc._exit, ctypes.c_void_p).value
-    # The object is ``_exit``'s argument; the symbol names the owning library.
-    register(leave, 1, leave)
-    return True
-
-
 def _close_device_fds() -> None:
     """Closes this process's descriptors of GPU devices; the parent keeps its own."""
     for name in os.listdir("/proc/self/fd"):
@@ -834,7 +818,7 @@ class XpuTarget(MLIRTarget):
         ``ZE_RESULT_ERROR_DEVICE_LOST``. A lowering never uses the device. Closing
         the descriptors also protects the parent, but the driver then aborts on
         the failed calls and the exit code is lost, so it is only the fallback."""
-        if not _exit_before_teardown():
+        if not exit_before_teardown():
             _close_device_fds()
 
     def lowering(
