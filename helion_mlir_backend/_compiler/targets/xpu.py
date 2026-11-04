@@ -31,6 +31,7 @@ from __future__ import annotations
 import ctypes
 import functools
 import operator
+import os
 import re
 from typing import TYPE_CHECKING
 import warnings
@@ -97,6 +98,8 @@ if TYPE_CHECKING:
     from helion.autotuner.config_spec import ConfigSpec
 
 _RUNTIME_LIB = "libmlir_levelzero_runtime.so"
+_THREAD_ATEXIT = "__cxa_thread_atexit_impl"
+_DEVICE_FDS = "/dev/dri/"
 _PIPELINES = ("xegpu",)
 _CPU = "target='cpu' (CPU tensors)"
 _NO_PATTERN = "Could not apply any of the defined patterns"
@@ -755,6 +758,32 @@ def _runtime_library() -> str | None:
     return str(path) if path.is_file() else None
 
 
+def _exit_before_teardown() -> bool:
+    """Makes C ``exit`` in this thread end the process at once, with status 1:
+    ``_exit`` as the next thread-local destructor, and those run first and in
+    reverse order, before ``atexit`` handlers and static destructors. False if
+    this libc has no such registration (a glibc-private symbol)."""
+    libc = ctypes.CDLL(None)
+    register = getattr(libc, _THREAD_ATEXIT, None)
+    if register is None:
+        return False
+    register.argtypes = [ctypes.c_void_p] * 3
+    leave = ctypes.cast(libc._exit, ctypes.c_void_p).value
+    # The object is ``_exit``'s argument; the symbol names the owning library.
+    register(leave, 1, leave)
+    return True
+
+
+def _close_device_fds() -> None:
+    """Closes this process's descriptors of GPU devices; the parent keeps its own."""
+    for name in os.listdir("/proc/self/fd"):
+        try:
+            if os.readlink(f"/proc/self/fd/{name}").startswith(_DEVICE_FDS):
+                os.close(int(name))
+        except OSError:
+            pass  # The descriptor of the listing itself.
+
+
 class XpuTarget(MLIRTarget):
     """Kernels compiled to Intel XPUs (XeGPU, Battlemage) through lighthouse.
 
@@ -794,6 +823,18 @@ class XpuTarget(MLIRTarget):
     def configure(self, module: ir.Module, config: Mapping[str, object]) -> None:
         """Record the config's per-kernel ``xegpu_*`` parameters on ``module``."""
         attach_params(module, xegpu_params(config))
+
+    def enter_lowering_child(self) -> None:
+        """Keeps this forked process's exit away from the parent's GPU state.
+        ``LLVM ERROR`` ends in C ``exit``, whose destructors (Level Zero objects of
+        the runtime wrappers, the driver's own teardown) would run on device
+        objects and descriptors shared with the parent: unbinds, closed buffers
+        and destroyed queues, after which the parent's next kernel stalls or gets
+        ``ZE_RESULT_ERROR_DEVICE_LOST``. A lowering never uses the device. Closing
+        the descriptors also protects the parent, but the driver then aborts on
+        the failed calls and the exit code is lost, so it is only the fallback."""
+        if not _exit_before_teardown():
+            _close_device_fds()
 
     def lowering(
         self,

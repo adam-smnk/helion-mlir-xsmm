@@ -119,6 +119,11 @@ class MLIRTarget(abc.ABC):
         with module.context, ir.Location.unknown():
             return self.lowering(module, entry, pipeline, stop_at).apply(module)
 
+    def enter_lowering_child(self) -> None:
+        """Called in a forked lowering process before it lowers (default:
+        nothing)."""
+        return
+
     @abc.abstractmethod
     def runner(self, module: ir.Module) -> Runner:
         """The lighthouse JIT runner of a lowered module."""

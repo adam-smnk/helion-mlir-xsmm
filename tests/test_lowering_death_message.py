@@ -33,6 +33,9 @@ class _Target:
     def lowering(self, *_: object) -> _Dying:
         return _Dying(self.die)
 
+    def enter_lowering_child(self) -> None:
+        pass
+
 
 def _abort_after_assertion() -> None:
     os.write(2, f"noise\n{ASSERTION}\nmore noise\n".encode())

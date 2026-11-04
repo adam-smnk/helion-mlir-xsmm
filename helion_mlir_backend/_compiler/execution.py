@@ -610,7 +610,7 @@ def _lower(
     with _anonymous_file() as stderr:
         child = multiprocessing.get_context("fork").Process(
             target=_lower_in_child,
-            args=(lowering, module, sender, stderr.fileno()),
+            args=(target, lowering, module, sender, stderr.fileno()),
             daemon=True,
         )
         with warnings.catch_warnings():
@@ -687,7 +687,11 @@ def _anonymous_file() -> BinaryIO:
 
 
 def _lower_in_child(
-    lowering: Lowering, module: ir.Module, sender: Connection, stderr: int
+    target: MLIRTarget,
+    lowering: Lowering,
+    module: ir.Module,
+    sender: Connection,
+    stderr: int,
 ) -> None:
     """Forked: apply the parent's lowering to the parent's module (both copied on
     write) and send back the lowered module as bytecode. What lighthouse prints
@@ -695,6 +699,7 @@ def _lower_in_child(
     os.dup2(stderr, 2)
     # Freeing an MLIR context whose threads did not survive the fork waits forever.
     gc.disable()
+    target.enter_lowering_child()
     try:
         with module.context, ir.Location.unknown():
             lowered = lowering.apply(module)
