@@ -5,10 +5,13 @@ from __future__ import annotations
 import dataclasses
 import logging
 import numbers
+import re
 import struct
 import sys
 import types
 from typing import Callable
+from typing import Sequence
+import warnings
 
 from helion.language.constexpr import ConstExpr
 import torch
@@ -44,6 +47,7 @@ def install() -> bool:
     _keep_runtime_slice_sizes(MLIRBackend)
     _key_function_args_by_globals_and_defaults(MLIRBackend)
     _key_constexpr_by_type_and_bits(MLIRBackend)
+    _key_ints_read_at_compile_time(BoundKernel, MLIRBackend)
     _fast_key_functions_and_constexpr(MLIRBackend)
     _check_module_lookups(MLIRBackend)
     call_trace.install(MLIRBackend)
@@ -162,13 +166,16 @@ def _constexpr_key(value: object) -> object:
 def _cell_ints(value: object) -> object:
     """The ints in a value, nested in tuples, lists, dicts, dataclasses and
     namedtuples; ``None`` where there are none. Everything else stays with Helion's
-    key: floats and bools (reading them at compile time raises), and functions and
-    ``hl.constexpr`` (their own extractors)."""
+    key: floats and bools (reading them at compile time raises) and ``hl.constexpr``
+    (its own extractor). A function counts by the ints of its cells: it may be held
+    in a container or a default, where a guard's source stops."""
     kind = type(value)
     if kind is int:
         return value
     if kind is ConstExpr:
         return None
+    if kind is types.FunctionType:
+        return _function_ints(value)
     if isinstance(value, (tuple, list)):
         parts = tuple(map(_cell_ints, value))
     elif isinstance(value, dict):
@@ -215,6 +222,222 @@ def _key_function_args_by_globals_and_defaults(MLIRBackend: type) -> None:
     extractors[types.FunctionType] = function_key
 
 
+_MANY_INT_COMPILES = 16
+"""Bound kernels of one kernel from guarded int values before it warns, once."""
+
+
+def _source_steps(source: object) -> tuple[str, object] | None:
+    """How to read a recorded symbol's value from the arguments: ``(parameter,
+    steps)``, each step ``("attr", name)`` or ``("item", index)``. Helion's
+    ``make_extractor`` can't read a closure cell, e.g.
+    ``L['fn'].__closure__[0].cell_contents``. ``None``: no value of an argument, or
+    a tensor's size, which the key holds anyway. Steps ``None``: an argument's value
+    by a chain this can't follow, so the caller keys all the ints in that argument
+    rather than leave them stale."""
+    from torch._dynamo.source import AttrSource
+    from torch._dynamo.source import GetItemSource
+    from torch._dynamo.source import LocalSource
+    from torch._dynamo.source import TensorPropertySource
+
+    if isinstance(source, TensorPropertySource):
+        return None
+    steps: list[tuple[str, object]] = []
+    current = source
+    while type(current) is not LocalSource:
+        if type(current) is AttrSource:
+            steps.append(("attr", current.member))
+        elif type(current) is GetItemSource and not current.index_is_slice:
+            steps.append(("item", current.index))
+        else:
+            root = re.match(r"L\['(\w+)'\]", getattr(source, "name", ""))
+            return (root.group(1), None) if root else None
+        current = current.base
+    return current.local_name, tuple(reversed(steps))
+
+
+def _function_ints(fn: types.FunctionType) -> object:
+    """The ints of a function's cells, in the functions in its cells too. An empty
+    cell holds none: a default may be such a function, and the key must not raise."""
+    parts: list[object] = []
+    for cell in fn.__closure__ or ():
+        try:
+            parts.append(_cell_ints(cell.cell_contents))
+        except ValueError:
+            parts.append(None)
+    return tuple(parts)
+
+
+def _walked_ints(value: object, steps: tuple[tuple[str, object], ...] | None) -> object:
+    """The ints at the end of ``steps``. A function of other code may have no such
+    cell, and steps may be ``None``: then all the ints in ``value``, as a finer key
+    costs a compile and a coarser one a wrong answer."""
+    if steps is None:
+        return _cell_ints(value)
+    current = value
+    try:
+        for kind, step in steps:
+            current = getattr(current, step) if kind == "attr" else current[step]
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return _cell_ints(value)
+    return _cell_ints(current)
+
+
+def _guarded_ints(kernel: object, args: Sequence[object]) -> object:
+    """The kernel's guarded ints in ``args``, each by its value. A short call binds
+    with its defaults applied but is keyed as made."""
+    guarded = kernel.__dict__.get("_helion_mlir_guarded")
+    if not guarded:
+        return ()
+    return tuple(
+        [
+            _walked_ints(args[index] if index < len(args) else default, steps)
+            for index, default, steps in guarded
+        ]
+    )
+
+
+def _note_guarded_ints(bound: object) -> None:
+    """Add what this compile recorded a guard on to its kernel's list. A new list:
+    another thread may be reading the old one."""
+    shape_env = bound.env.shape_env  # type: ignore[attr-defined]
+    symbols = {
+        symbol for guard in shape_env.guards for symbol in guard.expr.free_symbols
+    }
+    kernel = bound.kernel  # type: ignore[attr-defined]
+    parameters = kernel.signature.parameters
+    names = list(parameters)
+    found = kernel.__dict__.setdefault("_helion_mlir_guarded_sources", set())
+    for symbol in symbols:
+        for source in shape_env.var_to_sources.get(symbol, ()):
+            step = _source_steps(source)
+            if step is not None and step[0] in parameters:
+                found.add(step)
+    # Against the current list, not this call's additions: with no lock, a thread may
+    # have assigned an older list after a newer one, and the next compile repairs it.
+    if len(found) != len(kernel.__dict__.get("_helion_mlir_guarded", ())):
+        known = list(found)  # another thread may be adding
+        kernel._helion_mlir_guarded = [
+            (names.index(name), parameters[name].default, steps)
+            for name, steps in sorted(known, key=repr)
+        ]
+
+
+def _warn_on_many_int_compiles(bound: object, args: tuple[object, ...]) -> None:
+    """A compile per value is right but costs, over a minute on XPU: say so once a
+    kernel has many, as nothing evicts them."""
+    kernel = bound.kernel  # type: ignore[attr-defined]
+    values = _guarded_ints(kernel, args)
+    if not values:
+        return
+    seen = kernel.__dict__.setdefault("_helion_mlir_int_values", set())
+    seen.add(values)
+    if len(seen) > _MANY_INT_COMPILES and not kernel.__dict__.get(
+        "_helion_mlir_warned_ints"
+    ):
+        kernel._helion_mlir_warned_ints = True
+        warnings.warn(
+            f"Helion MLIR backend: kernel {kernel.name} compiled for more than "
+            f"{_MANY_INT_COMPILES} values of an int that it reads at compile time, "
+            "in a closure cell or passed to a called function: one compile per "
+            "value. If such an int changes per call, read it as a value only, or "
+            "as a plain int or Python-number parameter of the kernel.",
+            stacklevel=2,
+        )
+
+
+def _key_ints_read_at_compile_time(BoundKernel: type, MLIRBackend: type) -> None:
+    """Keep an int read at compile time from reusing another value's compile.
+
+    A function the kernel calls is traced, so an ``if n > 2`` on an int in a closure
+    cell, or on an int argument passed to that function, takes the example value's
+    branch at compile time and records a guard. Helion keys an int by its type and
+    nothing acts on the guard: the next value ran that branch without an error. Such
+    an int is keyed by value through Helion's extras, with the other ints of its
+    cell or container argument; one without a guard, read as a value at run time or
+    in the kernel's own body, keeps one compile, as in Helion's model.
+
+    Helion asks for a signature's extras once, from its first bound kernel, but a
+    later compile may take another branch and record a guard on another int
+    (``if n > 2 and m > 2``) or reach an ``hl.specialize``. So the extras read what
+    every compile adds to: the kernel's list of guarded ints, which applies to any
+    closure of the signature, first seen before or after, and Helion's own extras of
+    each compile of the signature. Calls that reach one compile then agree on every
+    guard that compile recorded: its trace is theirs. A compile keyed before a list
+    grew stays reachable through the dispatch cache and is right for those calls;
+    ``bind()`` compiles such values once more. Any guard counts, also one the value
+    can't change the outcome of: that costs a compile per value, not a wrong result.
+
+    Guards are read at bind: a read of the value that records no guard then, in the
+    trace or later in lowering, or under the profiler, which suppresses guards,
+    stays stale. So do a global's reads. Reading the guards rather than changing
+    ``specialized_vars`` leaves the lowering as it is.
+
+    One race, in threads only, not fixed (it would need a lock around Helion's
+    ``bind``): a thread computes its key, another thread's first compile of a branch
+    stores itself under that same key and adds a guard, and the first thread's lookup
+    then finds that compile, for a value it took the other branch for, and the
+    dispatch cache keeps the wrong answer for those arguments. The window is between
+    ``_get_bound_kernel_cache_key`` and ``_bound_kernels.get`` in ``Kernel.bind``,
+    during a first compile of that branch; it was only seen forced.
+    """
+    original = BoundKernel._specialize_extra
+    if getattr(original, "_helion_mlir_guarded_ints", False):
+        return
+    original_init = BoundKernel.__init__
+
+    def extras_of(bound: object) -> dict[object, list[Callable[..., object]]]:
+        """Helion's extras of each compile of this signature, once per set of
+        sources: a later compile may specialize on what an earlier one didn't."""
+        env = bound.env  # type: ignore[attr-defined]
+        sources = env.shape_env.var_to_sources
+        kernel = bound.kernel  # type: ignore[attr-defined]
+        by_signature = kernel.__dict__.setdefault("_helion_mlir_extras", {})
+        collected = by_signature.setdefault(bound._base_spec_key, {})  # type: ignore[attr-defined]
+        what = (
+            sorted(sources[symbol][0].name for symbol in env.specialized_vars),
+            sorted(map(repr, env.specialized_strides)),
+            sorted(map(repr, env.tensor_descriptor_layout_guards)),
+        )
+        collected.setdefault(repr(what), original(bound))
+        return collected
+
+    def init(self: object, kernel: object, args: object, *rest: object) -> None:
+        original_init(self, kernel, args, *rest)
+        if isinstance(self.env.backend, MLIRBackend):  # type: ignore[attr-defined]
+            extras_of(self)
+            _note_guarded_ints(self)
+            _warn_on_many_int_compiles(self, args)  # type: ignore[arg-type]
+
+    def specialize_extra(self: object) -> list[Callable[..., object]]:
+        if not isinstance(self.env.backend, MLIRBackend):  # type: ignore[attr-defined]
+            return original(self)
+        kernel = self.kernel  # type: ignore[attr-defined]
+        parameters = kernel.signature.parameters
+        names = list(parameters)
+        collected = extras_of(self)
+
+        def helion_extras(args: Sequence[object]) -> object:
+            # A short call is keyed as made, but a later compile's extras may read a
+            # parameter it left to its default. A list: a compile in another thread
+            # may add to these meanwhile.
+            full = (
+                *args,
+                *(parameters[name].default for name in names[len(args) :]),
+            )
+            return tuple(
+                [extra(full) for extras in list(collected.values()) for extra in extras]
+            )
+
+        def guarded_ints(args: Sequence[object]) -> object:
+            return _guarded_ints(kernel, args)
+
+        return [helion_extras, guarded_ints]
+
+    specialize_extra._helion_mlir_guarded_ints = True  # type: ignore[attr-defined]
+    BoundKernel.__init__ = init
+    BoundKernel._specialize_extra = specialize_extra
+
+
 def _key_constexpr_by_type_and_bits(MLIRBackend: type) -> None:
     """Keep ``hl.constexpr`` values of different type or sign of zero apart.
 
@@ -256,7 +479,7 @@ def _key_constexpr_by_type_and_bits(MLIRBackend: type) -> None:
 
 _MAX_FAST_KEYS = 4096
 """Entries of a kernel's dispatch cache before the function path clears it: a
-float argument that changes per call would otherwise add one entry
+float argument or guarded int that changes per call would otherwise add one entry
 per call, for as long as the kernel lives. A cleared cache costs a ``bind()`` per
 key, nothing else."""
 
@@ -327,7 +550,8 @@ def _function_fast_key(kernel: object, fn: types.FunctionType) -> object:
 
 def _extended_fast_key(kernel: object, args: tuple[object, ...]) -> object | None:
     """``Kernel._fast_dispatch_key`` that also handles functions and
-    ``hl.constexpr`` arguments, part by part at least as fine as the full key:
+    ``hl.constexpr`` arguments, part by part at least as fine as the full key and
+    with the same guarded ints:
     two calls with one key bind to one ``BoundKernel``. ``None``: the call takes
     ``bind()``, which is always right."""
     annotations = kernel._annotations  # type: ignore[attr-defined]
@@ -361,6 +585,7 @@ def _extended_fast_key(kernel: object, args: tuple[object, ...]) -> object | Non
         return None
     if not has_tensor:
         return None
+    key += [_guarded_ints(kernel, args)]
     key.append(kernel._compute_is_distributed(args))  # type: ignore[attr-defined]
     if kernel._key_fn is not None:  # type: ignore[attr-defined]
         key.append(kernel._key_fn(*args))  # type: ignore[attr-defined]
