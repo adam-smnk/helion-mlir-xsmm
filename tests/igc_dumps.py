@@ -127,6 +127,11 @@ def elements_read_never_written(visaasm: Path) -> list[str]:
     for line in lines:
         code = line.split("///")[0]
         match = _VISA_OP.match(code)
+        if code.lstrip().startswith(".input"):
+            # The dispatch payload writes it. Whole, whatever its size says: no real dump has
+            # an input that is read past its ``size``.
+            opaque.update(root(v)[0] for v in re.findall(r"\bV\d+\b", code))
+            continue
         if code.lstrip().startswith("."):
             continue
         if not match or match["op"].startswith(_VISA_OPAQUE):

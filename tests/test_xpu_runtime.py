@@ -1285,7 +1285,8 @@ def test_clamp_family_propagates_nan(dtype: torch.dtype) -> None:
 def test_binary_minmax_propagates_nan(dtype: torch.dtype) -> None:
     x = nan_kernels.nan_inputs(64, 512, dtype=dtype, device=DEVICE)
     y = nan_kernels.nan_inputs(64, 512, dtype=dtype, device=DEVICE, seed=1)
-    y[0, :16] = 1.0  # NaN in x only (row 0), in y only (row 3)
+    # In row 0's first columns NaN is in x only; in row 3's, in y whatever x holds.
+    y[0, :16] = 1.0
     y[3, :16] = float("nan")
     outs = nan_kernels.binary_minmax(x, y)
     for out, ref in zip(outs, nan_kernels.binary_minmax_reference(x, y), strict=True):
@@ -1826,6 +1827,36 @@ def test_key_keeps_nan_in_other_uses_of_a_maximum(fn: Callable[..., object]) -> 
     expected_rows = out.cpu().isnan().any(-1, keepdim=True)
     assert expected_rows.any()
     assert torch.equal(maximum.cpu().isnan(), expected_rows)
+
+
+@pytest.mark.expect_violation("layouts")
+@pytest.mark.parametrize(
+    ("fn", "stored"),
+    [
+        (ir_kernels.attention_and_row_maximum, "scores"),
+        (ir_kernels.attention_and_output_maximum, "output"),
+    ],
+    ids=["stored", "output-row"],
+)
+def test_maximum_stored_without_a_layout_matches_fp64(
+    fn: Callable[..., object], stored: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The kernels and config of ``test_key_applies_to_reductions_that_only_shift``, on
+    lighthouse's layouts, whose ``xegpu.store`` of the row maximum is left to upstream's
+    propagation: every row's value, against fp64, so that a row stored out of place shows."""
+    monkeypatch.setenv("HELION_MLIR_XPU_LAYOUTS", "lighthouse")
+    generator = torch.Generator().manual_seed(0)
+    shape = 2, 2, 512, 64
+    q, k, v = (torch.randn(*shape, generator=generator).to(BF16) for _ in range(3))
+    kernel = _kernel(fn, [1, 1, 128, 64], xegpu_nan_ignoring_maxima=[True])
+    out, maximum = kernel(q.to(DEVICE), k.to(DEVICE), v.to(DEVICE))
+    scores = q.double() @ k.double().transpose(-1, -2) * 0.125
+    ref_out = torch.softmax(scores, -1) @ v.double()
+    ref = scores if stored == "scores" else ref_out
+    ref_maximum = ref.amax(-1, keepdim=True)
+    assert len(ref_maximum.unique()) > 1000
+    assert normalized_error(out.cpu(), ref_out) <= 2**-6
+    assert normalized_error(maximum.cpu(), ref_maximum) <= 2**-6
 
 
 @pytest.mark.parametrize("seq", [128, 256, 384, 512, 640, 768, 1024])

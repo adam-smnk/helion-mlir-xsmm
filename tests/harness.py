@@ -16,6 +16,8 @@ from lighthouse.pipeline.driver import BackendDriver
 import torch
 from torch._subclasses import FakeTensorMode
 
+from tests.inputs import same_values
+
 from helion_mlir_backend import generate_mlir
 from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
@@ -57,6 +59,33 @@ def load_example(relative_path: str) -> ModuleType:
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+@contextlib.contextmanager
+def visits(owner: object, *names: str, limit: int) -> Iterator[dict[str, int]]:
+    """Counts the calls of each ``owner.name`` in the block, and fails on call
+    ``limit + 1``: an analysis's work as a number, not a time, and an exponential
+    walk fails at once instead of running for its minutes."""
+    counts = dict.fromkeys(names, 0)
+
+    def counted(name: str, function: Callable[..., object]) -> Callable[..., object]:
+        def call(*args: object, **kwargs: object) -> object:
+            counts[name] += 1
+            assert counts[name] <= limit, f"{name} called over {limit} times"
+            return function(*args, **kwargs)
+
+        return call
+
+    patches = [
+        patch.object(owner, name, counted(name, getattr(owner, name))) for name in names
+    ]
+    for started in patches:
+        started.start()
+    try:
+        yield counts
+    finally:
+        for started in patches:
+            started.stop()
 
 
 def xpu_tensor(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
@@ -134,11 +163,14 @@ def check_kernel(
     pipeline: str | None = None,
     atol: float = 1e-5,
     rtol: float = 1e-5,
+    exact: bool = False,
 ) -> None:
     """Assert that ``kernel(*args)`` matches ``reference(*args)`` on every requested path.
 
     ``reference`` runs on clones so in-place kernels and references cannot see each
     other's writes. ``pipeline`` overrides the default lighthouse pipeline.
+    ``exact``: bit for bit (:func:`tests.inputs.same_values`), for exact ops and
+    inputs with NaN or signed zeros.
     """
     expected = reference(*_clone_args(args))
     for path in paths:
@@ -149,7 +181,10 @@ def check_kernel(
                 actual = run_generated(kernel, _clone_args(args), config=config)
             else:
                 raise ValueError(f"unknown execution path {path!r}")
-        torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, msg=path)
+        if exact:
+            same_values(actual, expected)
+        else:
+            torch.testing.assert_close(actual, expected, atol=atol, rtol=rtol, msg=path)
 
 
 def _clone_args(args: list[object]) -> list[object]:

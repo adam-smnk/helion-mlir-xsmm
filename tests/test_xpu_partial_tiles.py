@@ -341,6 +341,9 @@ def row_vector_broadcast(
     return o
 
 
+# An xegpu.load selected with its padding at a partial tile: the xevm stage has no legal
+# lowering for it and refuses the kernel, so this IR never reaches the device.
+@pytest.mark.expect_violation("layouts")
 @pytest.mark.isolated
 def test_row_vector_at_partial_rows_refused() -> None:
     kernel = pk.helion.kernel(

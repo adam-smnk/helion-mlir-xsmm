@@ -15,11 +15,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from tests.inputs import boundary_tile
+
 from helion_mlir_backend import generate_mlir
 from helion_mlir_backend._compiler.mlir.aten_bridge.nan_minmax import propagate_nan
 
 BF16 = torch.bfloat16
 TILE = helion.Config(block_sizes=[32, 256])
+_BOUNDS = (0.5, 1.0, 1.0 / 1.5, 3.0, 6.0)
 
 
 def _kernel(config: helion.Config) -> object:
@@ -89,16 +92,12 @@ def relu_and_where(
 def nan_inputs(
     *shape: int, dtype: torch.dtype, device: str = "cpu", seed: int = 0
 ) -> torch.Tensor:
-    """Normal values with NaN at the start of row 0, infinities in row 1 and
-    signed zeros in row 2."""
-    generator = torch.Generator().manual_seed(seed)
-    x = torch.randn(*shape, generator=generator).to(dtype)
-    x[0, :16] = float("nan")
-    x[1, :4] = float("inf")
-    x[1, 4:8] = -float("inf")
-    x[2, :4] = 0.0
-    x[2, 4:8] = -0.0
-    return x.to(device)
+    """The values these kernels turn on: the bounds of their clamps, of ``x * 1.5`` too,
+    and next to them, with NaN, infinities, signed zeros, ``tiny`` and ``max``. Rows and
+    16-column lanes differ (``inputs.lanes``), so a broadcast row or lane can't pass.
+    ``seed``: another placement of them."""
+    x = boundary_tile(_BOUNDS, *shape, dtype=dtype, device=device)
+    return x.roll(seed * 5, dims=-1)
 
 
 def assert_same_values(out: torch.Tensor, ref: torch.Tensor) -> None:
@@ -248,7 +247,8 @@ def test_clamp_family_propagates_nan(dtype: torch.dtype) -> None:
 def test_binary_minmax_propagates_nan() -> None:
     x = nan_inputs(64, 512, dtype=torch.float32)
     y = nan_inputs(64, 512, dtype=torch.float32, seed=1)
-    y[0, :16] = 1.0  # NaN in x only (row 0), in y only (row 3)
+    # In row 0's first columns NaN is in x only; in row 3's, in y whatever x holds.
+    y[0, :16] = 1.0
     y[3, :16] = float("nan")
     for out, ref in zip(
         binary_minmax(x, y), binary_minmax_reference(x, y), strict=True
@@ -259,5 +259,19 @@ def test_binary_minmax_propagates_nan() -> None:
 def test_where_keeps_its_value_at_nan() -> None:
     x = nan_inputs(64, 512, dtype=torch.float32)
     relu, where = relu_and_where(x, torch.empty_like(x), torch.empty_like(x))
-    assert torch.isnan(relu[0, :16]).all()
+    assert torch.isnan(relu[x.isnan()]).all()
+    # +0.0: -0.0 is the next test's.
+    assert_same_values(relu + 0.0, torch.relu(x) + 0.0)
     assert_same_values(where, torch.where(x > 0, x, 0.0))
+
+
+@pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason="relu(-0.0) is +0.0 here, -0.0 in torch: test_relu_keeps_negative_zero's "
+    "finding, 2026-11-03, also on the XPU (test_unit_clamps_match_torch's docstring)",
+)
+def test_relu_keeps_negative_zero() -> None:
+    x = nan_inputs(64, 512, dtype=torch.float32)
+    relu, _ = relu_and_where(x, torch.empty_like(x), torch.empty_like(x))
+    assert_same_values(relu, torch.relu(x))

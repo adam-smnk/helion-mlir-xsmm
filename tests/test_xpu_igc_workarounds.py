@@ -29,11 +29,15 @@ from tests import kernelbench_xpu as kb
 from tests import xpu_math_full_kernels as full_kernels
 from tests import scalar_compare_kernels as compares
 from tests import xpu_partial_kernels as pk
+from tests.harness import lower_xpu
 from tests.harness import xpu_tensor
 from tests.igc_dumps import elements_read_never_written
 from tests.igc_dumps import igc_dump_problems
 from tests.igc_dumps import vector_intrinsics
 from tests.igc_dumps import narrow_minmax
+from tests.inputs import boundary_tile
+from tests.ir_query import ops_named
+from tests.ir_query import parse
 
 from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler import xpu_transforms
@@ -636,6 +640,62 @@ def test_compare_kernels_leave_igc_nothing_to_fold(
         assert elements_read_never_written(visaasm) == [], visaasm.name
 
 
+@BINARIES
+@pytest.mark.parametrize(
+    ("fn", "form", "shape", "blocks"),
+    [
+        (full_kernels.nat_absf, "vector<16xf16>", (256, 512), [32, 32]),
+        (full_kernels.nat_softsign, "vector<16xf16>", (256, 512), [32, 32]),
+        (full_kernels.nat_absf, "vector<8xf16>", (16, 8192), [1, 8192]),
+        (full_kernels.nat_softsign, "vector<8xf16>", (16, 8192), [1, 8192]),
+    ],
+    ids=["abs-16", "softsign-16", "abs-8", "softsign-8"],
+)
+def test_vector_f16_fabs_stays_scalar_in_igc(
+    fn: object,
+    form: str,
+    shape: tuple[int, int],
+    blocks: list[int],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: pathlib.Path,
+) -> None:
+    """What ``ir_invariants._vector_f16_fabs`` rests on: IGC leaves no vector ``fabs`` of these
+    forms, so an IGC upgrade that does shows here."""
+    args = [xpu_tensor(*shape, dtype=F16), xpu_tensor(*shape, dtype=F16)]
+    final = parse(lower_xpu(_kernel(fn, blocks), args, "xevm-final"))
+    types = {str(op.results[0].type) for op in ops_named(final, "llvm.intr.fabs")}
+    assert types == {form}
+    dump = _igc_dump(monkeypatch, tmp_path, _kernel(fn, blocks), args)
+    assert _dump_problems(dump) == []
+    for visaasm in dump.glob("*.visaasm"):
+        assert elements_read_never_written(visaasm) == [], visaasm.name
+    codegen = "".join(path.read_text() for path in dump.glob("*_codegen.ll"))
+    assert "@llvm.fabs.f16(" in codegen
+    assert "@llvm.fabs.v" not in codegen
+
+
+def test_the_scan_counts_inputs_as_written_but_not_computed_values(
+    tmp_path: pathlib.Path,
+) -> None:
+    """An ``.input`` read through an alias, as 1D tiles feed their data pointers to ``add``
+    for a64 addresses: written by the dispatch payload. Regression: flagged. The row of a
+    computed variable that nothing writes is still found."""
+    visaasm = tmp_path / "k.visaasm"
+    visaasm.write_text(
+        ".decl V0034 v_type=G type=uq num_elts=1 align=qword\n"
+        ".decl V0070 v_type=G type=q num_elts=1 align=qword alias=<V0034, 0>\n"
+        ".decl V0071 v_type=G type=q num_elts=16 align=wordx32\n"
+        ".decl V0090 v_type=G type=f num_elts=32 align=wordx32\n"
+        ".decl V0092 v_type=G type=f num_elts=16 align=wordx32\n"
+        ".input V0034 offset=72 size=8\n"
+        "    add (M1, 16) V0071(0,0)<1> V0071(0,0)<1;1,0> V0070(0,0)<0;1,0>\n"
+        "    mov (M1, 16) V0090(0,0)<1> 0x0:f\n"
+        "    add (M1, 16) V0092(0,0)<1> V0090(0,0)<1;1,0> V0090(1,0)<1;1,0>\n"
+    )
+    found = elements_read_never_written(visaasm)
+    assert [line.split(":")[0] for line in found] == ["V0090"], found
+
+
 def test_the_scan_finds_a_vector_fabs_and_a_row_never_written(
     tmp_path: pathlib.Path,
 ) -> None:
@@ -755,8 +815,7 @@ def test_row_values_compared_are_right(name: str) -> None:
 def test_clamp_chain_clamps(dtype: torch.dtype) -> None:
     """Regression (exact kernel and config, bf16): ``clamp_max(clamp_min(x, 0.0),
     1.0)`` returned its input: 28528 of 32768 wrong, e.g. -3.375."""
-    torch.manual_seed(0)
-    x = (torch.randn(*CLAMP_SHAPE) * 3).to(dtype)
+    x = boundary_tile([0.0, 1.0, 3.0], *CLAMP_SHAPE, dtype=dtype)
     kernel = _unit_clamp("min_then_max")
     out = kernel(x.to("xpu"), torch.empty_like(x, device="xpu")).cpu()
     _assert_same_values(out, torch.clamp_max(torch.clamp_min(x, 0.0), 1.0))

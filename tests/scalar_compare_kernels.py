@@ -11,6 +11,7 @@ import tempfile
 from typing import TYPE_CHECKING
 
 import helion.language as hl
+import numpy
 import torch
 
 if TYPE_CHECKING:
@@ -419,11 +420,19 @@ INT_ABS_KERNELS: dict[str, Callable] = {
     "where": where_int_abs,
     "where_mirror": where_int_abs_mirror,
 }
+
+
+def _exact_sqrt(x: torch.Tensor) -> torch.Tensor:
+    """Not ``torch.sqrt``: MKL's threaded first call can be wrong in one chunk
+    (agent-wiki/pytorch/mkl-sqrt-first-call.md)."""
+    return torch.from_numpy(numpy.sqrt(x.cpu().numpy()))
+
+
 F64_KERNELS: dict[str, tuple[Callable, Callable]] = {
-    "sqrt_of_abs": (sqrt_of_abs_f64, lambda x: x.double().abs().sqrt().float()),
+    "sqrt_of_abs": (sqrt_of_abs_f64, lambda x: _exact_sqrt(x.double().abs()).float()),
     "sqrt_of_square": (
         sqrt_of_square_f64,
-        lambda x: (x.double() * x.double()).sqrt().float(),
+        lambda x: _exact_sqrt(x.double() * x.double()).float(),
     ),
     "abs_through_f64": (abs_through_f64, lambda x: x.abs()),
     "abs_of_computed_f64": (

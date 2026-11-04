@@ -6,7 +6,6 @@ from __future__ import annotations
 import ctypes
 import mmap
 import re
-import time
 from typing import TYPE_CHECKING
 from unittest.mock import patch
 
@@ -22,11 +21,13 @@ import pytest
 import torch
 
 from tests.harness import opt_pipeline
+from tests.harness import visits
 
 from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler.helion_transforms import first_touch_outputs
 from helion_mlir_backend._compiler.helion_transforms import mark_overwritten_args
 from helion_mlir_backend._compiler.mlir_transforms import OVERWRITTEN_ATTR_NAME
+from helion_mlir_backend._compiler.mlir_transforms import first_touch
 from helion_mlir_backend._compiler.mlir_transforms.first_touch import MIN_REDUCTION
 from helion_mlir_backend._compiler.mlir_transforms.first_touch import _fully_written
 from helion_mlir_backend._compiler.mlir_transforms.first_touch import _reduction_length
@@ -668,13 +669,13 @@ def _where_chain(levels: int) -> tuple[str, str]:
 def test_mark_overwritten_args_analyses_deep_epilogues_quickly() -> None:
     # Regression: the analysis visited every path through a 12-step where chain
     # (3^12 paths: 15-17 s per compile, past the compile timeout) and, capped,
-    # left the GEMM unmarked.
+    # left the GEMM unmarked. The chain has 36 ops: visits stay linear in them.
     tile, last = _where_chain(12)
     source = _tile_body(tile, last)
-    start = time.perf_counter()
-    marked = _marked(source)[0]
-    assert time.perf_counter() - start < 1.0
-    assert marked
+    # _ReductionLength is what walks the chain; _fully_written stops at its first op here.
+    with visits(first_touch._ReductionLength, "_length", limit=100) as counts:
+        assert _marked(source)[0]
+    assert counts["_length"] >= 36
 
 
 def test_mark_overwritten_args_keeps_reduction_tiles() -> None:

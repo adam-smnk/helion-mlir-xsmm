@@ -296,7 +296,7 @@ pre-commit run -a
 | `HELION_MLIR_DUMP_STAGES` | XPU: after each stage of the XeGPU pipeline |
 | `HELION_MLIR_PIPELINE=opt\|scalar` | Selects compilation pipeline (default: `opt`) |
 | `HELION_MLIR_TARGET=auto\|cpu\|xpu` | Selects the device target (default: `auto`, from the kernel's tensors; an explicit `target=` of `generate_mlir`/`compile_mlir`/`lower_mlir` wins). `meta` tensors need a named target |
-| `HELION_MLIR_XPU_STOP_AT=xegpu-wg\|xevm\|binary` | XPU: where lowerings stop by default (default: `binary`, the full lowering). Kernel calls then fail after lowering (nothing to run); `lower_mlir` returns the IR |
+| `HELION_MLIR_XPU_STOP_AT=xegpu-wg\|xevm\|xevm-final\|binary` | XPU: where lowerings stop by default (default: `binary`, the full lowering). Kernel calls then fail after lowering (nothing to run); `lower_mlir` returns the IR |
 
 ## License
 

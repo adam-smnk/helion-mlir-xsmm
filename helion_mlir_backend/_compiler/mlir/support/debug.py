@@ -13,9 +13,10 @@ TARGETS = ("auto", "cpu", "xpu")
 LOWERING_LOG_ATTR = "helion.lowering_log"
 """Module attribute: lines a lowering logged that its caller must see too, since a forked
 lowering's log doesn't reach the caller's process."""
-XPU_STOP_POINTS = ("xegpu-wg", "xevm", "binary")
+XPU_STOP_POINTS = ("xegpu-wg", "xevm", "xevm-final", "binary")
 """Where the XPU lowering can stop: annotated XeGPU, LLVM/XeVM without a device
-binary, and the full lowering with the binary."""
+binary, the same after the workaround stages (what becomes the binary), and the full
+lowering with the binary."""
 PIPELINE_CONFIG_KEY = "mlir_pipeline"
 """Config key naming the lighthouse pipeline (``opt``/``scalar``) of one config."""
 
@@ -65,7 +66,7 @@ def target_override() -> str | None:
 
 
 def xpu_stop_at() -> str | None:
-    """``HELION_MLIR_XPU_STOP_AT`` (``xegpu-wg``, ``xevm`` or ``binary``): where
+    """``HELION_MLIR_XPU_STOP_AT`` (one of :data:`XPU_STOP_POINTS`): where
     XPU lowerings that name no stop point stop; ``None`` (the full lowering) if
     unset."""
     stop_at = os.environ.get("HELION_MLIR_XPU_STOP_AT", "").strip() or None

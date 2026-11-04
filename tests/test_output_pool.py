@@ -14,6 +14,7 @@ import subprocess
 import sys
 import textwrap
 import threading
+from typing import TYPE_CHECKING
 
 import helion
 import helion.language as hl
@@ -26,6 +27,9 @@ from tests.harness import run_direct
 import helion_mlir_backend
 from helion_mlir_backend import output_pool
 from helion_mlir_backend._compiler import native
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _HUGE = 2 * 1024 * 1024
 
@@ -70,6 +74,23 @@ def _native_run(x: torch.Tensor) -> object:
     run = scaled.bind((x,))._run
     assert run.planned
     return run
+
+
+def _quiet_window_faults(work: Callable[[], None], budget: int) -> int:
+    """Minor faults of the quietest of a few runs of ``work``, stopping at the first
+    within ``budget``. The count covers the whole process: the NUMA balancer's scans
+    can fault resident pages back in (``x`` alone is 1024 4 KiB pages): about 1 run in
+    4000-50000 took 500-1200 faults with no pool miss, also with no kernel or pool at
+    all. Such noise only adds; a block that lost its pages faults in every run."""
+    fewest = None
+    for _ in range(5):
+        before = resource.getrusage(resource.RUSAGE_SELF).ru_minflt
+        work()
+        faults = resource.getrusage(resource.RUSAGE_SELF).ru_minflt - before
+        fewest = faults if fewest is None else min(fewest, faults)
+        if fewest < budget:
+            break
+    return fewest
 
 
 def test_freed_output_block_is_reused() -> None:
@@ -158,13 +179,16 @@ def test_two_buffers_per_call_do_not_refault() -> None:
         z = run(y)
         del y, z
 
+    def calls() -> None:
+        for _ in range(20):
+            call()
+
     for _ in range(3):
         call()
-    faults = resource.getrusage(resource.RUSAGE_SELF).ru_minflt
-    for _ in range(20):
-        call()
+    misses = _stats()["misses"]
     # A few pages for Python's and the runtime's own use; not 2048 per call.
-    assert resource.getrusage(resource.RUSAGE_SELF).ru_minflt - faults < 500
+    assert _quiet_window_faults(calls, 500) < 500
+    assert _stats()["misses"] == misses
 
 
 def test_limit_evicts_oldest_and_keeps_nothing_over_it() -> None:
@@ -498,7 +522,9 @@ def test_every_dtype_is_a_plain_multi_dim_tensor(dtype: torch.dtype) -> None:
 
 
 def test_in_place_and_autograd_as_a_plain_tensor() -> None:
-    made = output_pool.empty((256, 256), dtype=torch.float32, device=torch.device("cpu"))
+    made = output_pool.empty(
+        (256, 256), dtype=torch.float32, device=torch.device("cpu")
+    )
     source = torch.ones(256, 256, requires_grad=True)
     with torch.no_grad():
         no_grad = output_pool.empty(
@@ -572,16 +598,42 @@ def test_interpreter_shutdown_with_live_blocks(tmp_path: Path) -> None:
     assert "end" in done.stdout
 
 
+def test_quiet_window_faults_skips_noise_but_not_lost_pages() -> None:
+    def touch_fresh_pages() -> None:
+        pages = mmap.mmap(-1, 512 * mmap.PAGESIZE)
+        pages.madvise(mmap.MADV_NOHUGEPAGE)
+        for page in range(512):
+            pages[page * mmap.PAGESIZE] = 1
+        pages.close()
+
+    runs = []
+
+    def noisy_once() -> None:
+        runs.append(1)
+        if len(runs) == 1:
+            touch_fresh_pages()
+
+    assert _quiet_window_faults(noisy_once, 200) < 200
+    assert len(runs) >= 2
+    assert _quiet_window_faults(touch_fresh_pages, 200) >= 200
+
+
 def test_faults_only_on_first_use_of_a_block() -> None:
-    x = torch.randn(1024, 1024)
+    """64 MiB, over glibc's largest mmap threshold (32 MiB): without the pool every call
+    maps new pages. Smaller, glibc keeps one buffer and this would pass without the pool."""
+    x = torch.ones(4096, 4096)
     run = _native_run(x)
     out = run(x)
     del out
-    faults = resource.getrusage(resource.RUSAGE_SELF).ru_minflt
-    for _ in range(20):
-        out = run(x)
-        del out
-    assert resource.getrusage(resource.RUSAGE_SELF).ru_minflt - faults < 200
+
+    def calls() -> None:
+        for _ in range(20):
+            out = run(x)
+            del out
+
+    misses = _stats()["misses"]
+    assert _quiet_window_faults(calls, 200) < 200
+    assert _stats()["misses"] == misses
 
 
 def test_extension_gets_the_allocator_only_while_on() -> None:
@@ -787,7 +839,12 @@ def _dtype_none_pool_like(x: torch.Tensor) -> torch.Tensor:
 
 @pytest.mark.parametrize(
     "kernel",
-    [_dtype_none_empty, _dtype_none_empty_like, _dtype_none_pool, _dtype_none_pool_like],
+    [
+        _dtype_none_empty,
+        _dtype_none_empty_like,
+        _dtype_none_pool,
+        _dtype_none_pool_like,
+    ],
 )
 def test_dtype_none_in_a_kernel_as_on_base(kernel: helion.Kernel) -> None:
     x = torch.randn(256, 256)

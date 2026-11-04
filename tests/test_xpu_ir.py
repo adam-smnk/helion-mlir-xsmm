@@ -26,6 +26,9 @@ import torch
 from tests.harness import lower_xpu
 from tests.harness import lower_xpu_stages
 from tests.harness import xpu_tensor
+from tests.ir_query import layout_of
+from tests.ir_query import ops_named
+from tests.ir_query import parse
 from tests.kernelbench_xpu import attention
 from tests.test_nan_minmax import clamp_scaled
 
@@ -416,9 +419,15 @@ def xpu_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
 
 def _check_gemm_kernel(text: str, grid: tuple[int, int], threads: int) -> None:
     """One annotated GEMM kernel per launch of ``grid`` workgroups of ``threads``."""
-    for op in ("xegpu.dpas", "xegpu.load_nd", "xegpu.store_nd", "xegpu.prefetch_nd"):
-        assert op in text, op
-    assert "sg_layout" in text
+    module = parse(text)
+    for name in ("xegpu.load_nd", "xegpu.store_nd", "xegpu.prefetch_nd"):
+        assert ops_named(module, name), name
+    dpas = ops_named(module, "xegpu.dpas")
+    assert dpas
+    for op in dpas:
+        for attribute in ("layout_a", "layout_b", "layout_cd"):
+            layout = layout_of(op, attribute)
+            assert layout is not None and layout.sg_layout is not None
     assert f"known_block_size = array<i32: {threads}, 1, 1>" in text
     assert f"known_grid_size = array<i32: {grid[0]}, {grid[1]}, 1>" in text
     assert re.search(r"gpu\.launch_func\s+@\w+::@\w+ blocks in", text)
@@ -495,8 +504,13 @@ def test_matmul_transposed_b() -> None:
     text, lowered = lower_xpu_stages(matmul_transposed_b, _gemm_args())
     _check_gemm_kernel(text, grid=(4, 4), threads=512)
     # B tiles load as (N, K) tiles, transposed in registers for DPAS.
-    assert "vector.transpose" in text
-    assert "order = [0, 1]" in text
+    module = parse(text)
+    transposes = ops_named(module, "vector.transpose")
+    assert transposes
+    for transpose in transposes:
+        load = transpose.operands[0].owner
+        assert load.name == "xegpu.load_nd"
+        assert layout_of(load).order == (0, 1)
     _check_xevm(lowered, "matmul_transposed_b", launches=1)
 
 
@@ -951,8 +965,21 @@ def attention_row_gate(
     ("fn", "ignoring", "propagating"),
     [
         (attention, 1, 0),
-        (attention_and_row_maximum, 0, 1),
-        (attention_and_output_maximum, 1, 1),
+        # Their stored row maximum's xegpu.store is left to upstream's propagation, which
+        # production allows (check_anchors). Right on the device, against fp64:
+        # test_xpu_runtime.py's test_maximum_stored_without_a_layout_matches_fp64.
+        pytest.param(
+            attention_and_row_maximum,
+            0,
+            1,
+            marks=pytest.mark.expect_violation("layouts"),
+        ),
+        pytest.param(
+            attention_and_output_maximum,
+            1,
+            1,
+            marks=pytest.mark.expect_violation("layouts"),
+        ),
         (attention_hard, 0, 1),
         (attention_row_gate, 0, 1),
     ],
@@ -1602,10 +1629,19 @@ def test_attention_is_recognized_by_structure(
     rows = sg_rows or 16
     subgroups = expected.rows // rows
     assert f"known_block_size = array<i32: {subgroups * 16}, 1, 1>" in text
-    assert text.count("xegpu.dpas ") == 2
-    assert f"sg_layout = [{subgroups}, 1], sg_data = [{rows}, 64]" in text
-    kv = f"sg_data = [{expected.kv_tile}, 64]"
-    assert f"sg_layout = [1, 1], {kv}, order = [0, 1]" in text
+    module = parse(text)
+    assert len(ops_named(module, "xegpu.dpas")) == 2
+    loads = [layout_of(op) for op in ops_named(module, "xegpu.load_nd")]
+    assert any(
+        layout.sg_layout == (subgroups, 1) and layout.sg_data == (rows, 64)
+        for layout in loads
+    )
+    assert any(
+        layout.sg_layout == (1, 1)
+        and layout.sg_data == (expected.kv_tile, 64)
+        and layout.order == (0, 1)
+        for layout in loads
+    )
     assert "xegpu." not in lowered
     assert "intel_sub_group_bf16_bf16_matrix_mad_k16" in lowered
 
@@ -1808,9 +1844,10 @@ def test_xpu_target_without_an_xpu() -> None:
     assert isinstance(target, XpuTarget)
     assert target.pipelines == ("xegpu",)
     assert target.default_pipeline() == "xegpu"
-    assert target.stop_points == ("xegpu-wg", "xevm", "binary")
+    assert target.stop_points == ("xegpu-wg", "xevm", "xevm-final", "binary")
     target.validate_environment("xegpu-wg")
     target.validate_environment("xevm")
+    target.validate_environment("xevm-final")
     with pytest.raises(NotImplementedError, match="compiled for XPU tensors"):
         target.check_tensor("x", torch.empty(2))
     # No XPU tensors: nothing to synchronize.

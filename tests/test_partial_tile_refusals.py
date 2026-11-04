@@ -39,6 +39,8 @@ def mean_tile(x: torch.Tensor) -> torch.Tensor:
 
 
 def var_tile(x: torch.Tensor) -> torch.Tensor:
+    # float64: torch-mlir's decomposition of var and std computes in f64. On the CPU; on the
+    # XPU Helion stops these kernels before any IR (a bare AssertionError).
     m, n = x.shape
     bn = hl.register_block_size(n)
     out = torch.empty_like(x)
@@ -50,6 +52,8 @@ def var_tile(x: torch.Tensor) -> torch.Tensor:
 
 
 def std_tile(x: torch.Tensor) -> torch.Tensor:
+    # float64: torch-mlir's decomposition of var and std computes in f64. On the CPU; on the
+    # XPU Helion stops these kernels before any IR (a bare AssertionError).
     m, n = x.shape
     bn = hl.register_block_size(n)
     out = torch.empty_like(x)
@@ -129,6 +133,8 @@ def scan_min(x: torch.Tensor) -> torch.Tensor:
 
 
 def std_mean_tile(x: torch.Tensor) -> torch.Tensor:
+    # float64: torch-mlir's decomposition of var and std computes in f64. On the CPU; on the
+    # XPU Helion stops these kernels before any IR (a bare AssertionError).
     m, n = x.shape
     block_n = hl.register_block_size(n)
     out = torch.empty_like(x)
@@ -140,6 +146,8 @@ def std_mean_tile(x: torch.Tensor) -> torch.Tensor:
 
 
 def var_mean_tile(x: torch.Tensor) -> torch.Tensor:
+    # float64: torch-mlir's decomposition of var and std computes in f64. On the CPU; on the
+    # XPU Helion stops these kernels before any IR (a bare AssertionError).
     m, n = x.shape
     block_n = hl.register_block_size(n)
     out = torch.empty_like(x)

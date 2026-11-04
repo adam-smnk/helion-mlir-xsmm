@@ -12,6 +12,7 @@ import torch
 
 from tests.harness import check_kernel
 from tests.harness import run_direct
+from tests.inputs import boundary_tile
 
 from helion_mlir_backend import generate_mlir
 from helion_mlir_backend._compiler.mlir import driver
@@ -73,7 +74,8 @@ def test_bool_scalar(flag: bool) -> None:
     check_kernel(
         scale_positive,
         lambda x, f: torch.where(x > 0, x * f, x),
-        [torch.randn(32), flag],
+        [boundary_tile([0.0, 1.0], 32, dtype=torch.float32), flag],
+        exact=True,
     )
 
 

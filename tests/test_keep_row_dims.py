@@ -5,11 +5,17 @@ rank-1 buffer become ``[rows, 1]`` stores into the buffer expanded to
 from __future__ import annotations
 
 import re
-import time
 
 from mlir import ir
 import pytest
 
+from tests.harness import visits
+from tests.ir_query import ops_named
+from tests.ir_query import parse
+
+from helion_mlir_backend._compiler.mlir_transforms import (
+    keep_row_dims as keep_row_dims_module,
+)
 from helion_mlir_backend._compiler.mlir_transforms.keep_row_dims import keep_row_dims
 
 
@@ -134,8 +140,10 @@ _RUNNING = """%r = scf.for %c = %i to %i step %i iter_args(%a = %init) -> (vecto
 def test_loop_carried_row_results_are_stored_as_columns(body: str, args: str) -> None:
     count, _, text = _rewrite(_gpu_module(body, args))
     assert count == 1, text
-    assert "memref<128x1xf32>" in text
-    assert ": vector<64xf32>, memref<128xf32>" not in text
+    module = parse(text)
+    writes = ops_named(module, "vector.transfer_write")
+    stored = {str(write.operands[1].type) for write in writes}
+    assert stored == {"memref<128x1xf32>"}, text
 
 
 _TWO_ITER_ARGS = """%r:2 = scf.for %c = %i to %i step %i iter_args(%a = %init, %b = %init) -> (vector<64xf32>, vector<64xf32>) {{
@@ -183,16 +191,18 @@ def test_both_iter_args_swapped_are_rewritten() -> None:
 
 def test_a_deep_chain_with_no_row_result_is_quick() -> None:
     """A value used twice by each op of a chain: every path is looked at once
-    (2^24 paths otherwise, minutes: not 5 s)."""
+    (2^24 paths otherwise, minutes)."""
     body = "%v0 = vector.transfer_read %out[%i], %f {in_bounds = [true]} : memref<128xf32>, vector<64xf32>\n"
     for depth in range(24):
         body += f"%v{depth + 1} = arith.addf %v{depth}, %v{depth} : vector<64xf32>\n"
     body += "vector.transfer_write %v24, %out[%i] {in_bounds = [true]} : vector<64xf32>, memref<128xf32>"
-    start = time.monotonic()
-    count, before, after = _rewrite(_gpu_module(body, "%out: memref<128xf32>, %f: f32"))
-    assert time.monotonic() - start < 5
+    with visits(keep_row_dims_module, "_compute_row_result", limit=500) as counts:
+        count, before, after = _rewrite(
+            _gpu_module(body, "%out: memref<128xf32>, %f: f32")
+        )
     assert count == 0
     assert after == before
+    assert counts["_compute_row_result"] >= 24
 
 
 def test_contiguous_strided_buffer_is_stored_as_a_column() -> None:

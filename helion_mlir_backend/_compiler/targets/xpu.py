@@ -105,7 +105,7 @@ _CPU = "target='cpu' (CPU tensors)"
 _NO_PATTERN = "Could not apply any of the defined patterns"
 """Lighthouse's failure when no kernel class (GEMM, attention, reduction, or the
 backend's elementwise class) matches."""
-_IR_ONLY = "HELION_MLIR_XPU_STOP_AT=xegpu-wg or xevm (IR only)"
+_IR_ONLY = "HELION_MLIR_XPU_STOP_AT=xegpu-wg, xevm or xevm-final (IR only)"
 _LLVM_BUILD = (
     "an LLVM built with -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=SPIRV "
     "-DMLIR_ENABLE_LEVELZERO_RUNNER=1 and Python bindings, at the commit of the "
@@ -241,7 +241,7 @@ def _stages(
         if any(kernel.derives_layouts for kernel in kernels):
             lowering = _LayoutWarningsAreErrors(lowering)
         stages[index] = ("xevm", lowering)
-    if stop_at == "binary":
+    if stop_at in ("xevm-final", "binary"):
         # Between the LLVM/XeVM lowering and the binary: see xevm_alloca_arrays,
         # xevm_nsz_minmax, xevm_unit_clamps, xevm_bf16_extensions, xevm_fabs,
         # xevm_lane_compares and xevm_lane_conversions;
@@ -256,9 +256,10 @@ def _stages(
                 ("xevm-fabs", _FabsAsIntegerMin()),
                 ("xevm-lane-compares", _CompareLanes()),
                 ("xevm-lane-conversions", _LaneConversions()),
-                ("binary", _ToBinary(_kernels_by_module(entry, kernels))),
             ]
         )
+    if stop_at == "binary":
+        stages.append(("binary", _ToBinary(_kernels_by_module(entry, kernels))))
     return stages
 
 
@@ -957,10 +958,10 @@ class XpuTarget(MLIRTarget):
         search_space(config_spec, device_ir)
 
     def validate_environment(self, stop_at: str | None = None) -> None:
-        """Lowering to ``xegpu-wg`` or ``xevm`` needs nothing; binaries need
+        """Lowering short of the binary needs nothing; binaries need
         bindings with the SPIR-V target, running also an XPU and the Level Zero
         runtime library."""
-        if stop_at in ("xegpu-wg", "xevm"):
+        if stop_at in ("xegpu-wg", "xevm", "xevm-final"):
             return
         if not bindings_emit_spirv():
             raise UnsupportedTargetError(

@@ -8,6 +8,7 @@ import multiprocessing
 import multiprocessing.forkserver
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 
@@ -26,6 +27,7 @@ _PRELOAD = [
     "helion_mlir_backend._compiler.execution",
     "helion_mlir_backend._compiler.mlir.driver",
     "tests.harness",
+    "tests.ir_invariants",
 ]
 _context: multiprocessing.context.ForkServerContext | None = None
 _SKIP_EXIT = 77
@@ -39,6 +41,8 @@ if (_workers := os.environ.get("PYTEST_XDIST_WORKER_COUNT")) is not None:
     )
 # Test kernels run fixed configs; autotuning tests re-enable the search explicitly.
 os.environ["HELION_DISALLOW_AUTOTUNING"] = "1"
+# IR invariants on every lowering of the suite: see tests/ir_invariants.py.
+_MODE = os.environ.setdefault("HELION_MLIR_TEST_IR_CHECKS", "fail")
 
 
 def _isolated_context() -> multiprocessing.context.ForkServerContext:
@@ -59,6 +63,10 @@ def _run_isolated(
     os.dup2(fd, 2)
     os.environ.clear()
     os.environ.update(env)
+    # The fork server does not run pytest's session hooks.
+    from tests import ir_invariants
+
+    ir_invariants.install()
     try:
         getattr(importlib.import_module(module), name)(**kwargs)
     except pytest.skip.Exception as skipped:
@@ -67,6 +75,37 @@ def _run_isolated(
         os._exit(_SKIP_EXIT)
     sys.stdout.flush()
     sys.stderr.flush()
+
+
+def _bounded(command: list[str]) -> str:
+    """``command``'s output, whatever becomes of it: a hung machine still fails the test."""
+    try:
+        return subprocess.run(
+            command, capture_output=True, text=True, check=False, timeout=10
+        ).stdout
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"{command[0]}: {error}\n"
+
+
+def _live_processes(pid: int) -> str:
+    """A hung child and its own children (a forked lowering), by what ``ps`` shows: a
+    non-dumpable child can't be attached to."""
+    columns = "pid,ppid,etimes,time,stat,nlwp,comm"
+    return (
+        _bounded(["ps", "-o", columns, "-p", str(pid)])
+        + _bounded(["ps", "-o", columns, "--no-headers", "--ppid", str(pid)])
+    ).rstrip()
+
+
+def _kill_hung(process: multiprocessing.Process) -> str:
+    """Kills ``process`` and its children, and returns what they were: read before the kill,
+    as its children are no longer its children after it. Bounded, and the kill always runs."""
+    try:
+        return _live_processes(process.pid)
+    finally:
+        _bounded(["pkill", "-KILL", "-P", str(process.pid)])
+        process.kill()
+        process.join()
 
 
 def _disable_core_dumps() -> None:
@@ -84,7 +123,47 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+class _ExpectedViolations:
+    """``expect_violation``: the call must hit the check, also in a fork or isolated child,
+    so a named exemption that no longer fires fails instead of going stale."""
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_pyfunc_call(self, pyfuncitem: pytest.Function) -> object:
+        marker = pyfuncitem.get_closest_marker("expect_violation")
+        if marker is None or _MODE == "off":
+            return (yield)
+        with tempfile.NamedTemporaryFile(suffix=".fired", delete=False) as handle:
+            fired = pathlib.Path(handle.name)
+        os.environ["HELION_MLIR_TEST_EXPECTED_VIOLATION"] = f"{marker.args[0]}:{fired}"
+        try:
+            result = yield
+            if not fired.read_text():
+                pytest.fail(
+                    f"expect_violation({marker.args[0]!r}) did not fire", pytrace=False
+                )
+            return result
+        finally:
+            del os.environ["HELION_MLIR_TEST_EXPECTED_VIOLATION"]
+            fired.unlink()
+
+
+def pytest_report_header() -> str:
+    return f"IR invariants (HELION_MLIR_TEST_IR_CHECKS): {_MODE}"
+
+
 def pytest_configure(config: pytest.Config) -> None:
+    from tests import ir_invariants
+
+    if not ir_invariants.valid_mode(_MODE):
+        raise pytest.UsageError(
+            f"HELION_MLIR_TEST_IR_CHECKS={_MODE!r}; expected fail, off or report:PATH"
+        )
+    config.pluginmanager.register(_ExpectedViolations())
+    config.addinivalue_line(
+        "markers",
+        "expect_violation(check): the test's kernel breaks that IR invariant, for a reason "
+        "stated by the test; the test fails if the check doesn't fire",
+    )
     config.addinivalue_line(
         "markers",
         "isolated(timeout=None): run the test body in a forked child process so a "
@@ -120,8 +199,11 @@ def pytest_xdist_auto_num_workers(config: pytest.Config) -> int | None:
 def pytest_sessionstart(session: pytest.Session) -> None:
     """A native extension that fails to build only logs a warning, and its tests
     skip: fail unless it is disabled on purpose (``HELION_MLIR_NATIVE_CALL=0``)."""
+    from tests import ir_invariants
+
     from helion_mlir_backend._compiler import native
 
+    ir_invariants.install()
     if native.enabled() and native.module() is None:
         raise pytest.UsageError(
             f"the native extension could not be built: {native.load_error()}; set "
@@ -195,8 +277,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
         process.join(marker.kwargs.get("timeout"))
         hung = process.is_alive()
         if hung:
-            process.kill()
-            process.join()
+            children = _kill_hung(process)
         output = pathlib.Path(log).read_text()
     finally:
         os.unlink(log)
@@ -204,7 +285,7 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
         tail = "\n".join(output.splitlines()[-25:])
         pytest.fail(
             f"isolated test still running after {marker.kwargs['timeout']} s, killed:\n"
-            f"{tail}",
+            f"{children}\n{tail}",
             pytrace=False,
         )
     if process.exitcode == _SKIP_EXIT:

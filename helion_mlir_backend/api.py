@@ -77,7 +77,8 @@ def lower_mlir(
     defaults to the config's ``mlir_pipeline``, then the target's; the config's
     ``xegpu_*`` keys apply on the XPU). ``stop_at`` is
     a stage of the target's lowering: on the XPU ``"xegpu-wg"`` (annotated
-    XeGPU), ``"xevm"`` (LLVM/XeVM, no device binary) or ``"binary"``; default:
+    XeGPU), ``"xevm"`` (LLVM/XeVM, no device binary), ``"xevm-final"`` (the same after
+    the workaround stages: what becomes the binary) or ``"binary"``; default:
     ``HELION_MLIR_XPU_STOP_AT`` on the XPU, else the full lowering (the LLVM
     dialect on the CPU). Unsupported kernels raise ``UnsupportedOperationError``.
     """
