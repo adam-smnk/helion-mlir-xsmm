@@ -5,6 +5,7 @@ from __future__ import annotations
 from .elementwise import leaky_relu
 from .elementwise import relu
 from .elementwise import scalar_mul
+from .kernels import per_config
 from .linear import CACHE_PREPACKED_WEIGHTS_ENV
 from .linear import AffineLinearCache
 from .linear import LinearCache
@@ -56,6 +57,7 @@ __all__ = [
     "pack_b_blocked_vnni",
     "pack_b_blocked_vnni_t",
     "pack_b_vnni_t",
+    "per_config",
     "relu",
     "row_dot",
     "row_sum",

@@ -55,7 +55,9 @@ def test_f32_rows_kernel_matches_blocked_path(
     out = mm.matmul_prepacked_b(a, b4, n, b, torch.relu)
     assert torch.equal(out, _old_blocked(a, b4, n, b, torch.relu))
     if k % mm.BLOCK_K == 0:
-        assert mm._ROWS_KERNELS, "the rows kernel ran"
+        assert mm._matmul_prepacked_rows.cache_info().currsize > 0, (
+            "the rows kernel ran"
+        )
     expected = torch.relu(a @ w.T + (0 if b is None else b))
     torch.testing.assert_close(out, expected, atol=1e-4, rtol=1e-4)
 
@@ -265,7 +267,7 @@ def test_row_sum_binds_once_per_shape_and_epilogue() -> None:
     assert torch.equal(out, out2)
     # The unbound kernel call (the previous path) gives the same bits.
     (block_sizes,) = {key[0] for key in red._ROW_SUM_BOUND}
-    assert torch.equal(out, red._ROW_SUM_KERNELS[block_sizes](x, half))
+    assert torch.equal(out, red._row_sum_kernel(block_sizes)(x, half))
     red.row_sum(x, identity_epilogue)
     red.row_sum(torch.randn(8, 96, dtype=torch.bfloat16), half)
     assert len(red._ROW_SUM_BOUND) == 3
@@ -381,7 +383,9 @@ def test_prepared_call_keeps_the_closure_for_padded_columns() -> None:
         (16384, 256, 64, 256),  # 128x32768x32768: 256 KiB chunks, as before
     ],
 )
-def test_prepacked_k_chunk(pairs_even: int, panel: int, tile_m: int, chunk: int) -> None:
+def test_prepacked_k_chunk(
+    pairs_even: int, panel: int, tile_m: int, chunk: int
+) -> None:
     assert mm._prepacked_k_chunk(pairs_even, panel, tile_m) == chunk
 
 
@@ -581,7 +585,7 @@ def test_one_k_chunk_matches_chunked_bits(k: int) -> None:
     assert mm._prepacked_k_chunk(pairs_even, panel, m) == pairs_even
     one = mm.prepacked_b_call(a, b4, n, bias, torch.relu)(a)
     kernel = helion.kernel(
-        mm._matmul_prepacked_vnni,
+        mm._matmul_prepacked_vnni.body,
         backend="mlir",
         config=helion.Config(block_sizes=[m, 1, 512, 32]),
         ignore_warnings=mm._OUT_CHECK_WARNINGS,
@@ -700,7 +704,7 @@ def test_two_k_chunks_and_tail_match_forced_chunks(
     out = mm.prepacked_b_call(a, b4, n, bias, torch.relu)(a)
     chunked = pairs_even // forced * forced
     kernel = helion.kernel(
-        mm._matmul_prepacked_vnni,
+        mm._matmul_prepacked_vnni.body,
         backend="mlir",
         config=helion.Config(
             block_sizes=[m, 1, forced, max(pairs_even - chunked, mm.BLOCK_K)]

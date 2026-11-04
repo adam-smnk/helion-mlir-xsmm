@@ -40,8 +40,12 @@ import helion.language as hl
 import torch
 from torch import Tensor
 
+from .kernels import per_config
 import helion_mlir_backend  # noqa: F401
 from helion_mlir_backend import output_pool
+
+# Helion flags the host-side `out is None` check as an unfused tensor operation.
+_OUT_CHECK_WARNINGS = [helion.exc.TensorOperationInWrapper]
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -252,6 +256,7 @@ def _chunk_dot(
     return torch.einsum("mcv,cnv->mn", a3, b3)
 
 
+@per_config(backend="mlir", ignore_warnings=_OUT_CHECK_WARNINGS)
 def _matmul_fused_pack(
     a: Tensor,
     b: Tensor,
@@ -323,9 +328,6 @@ def _matmul_fused_pack(
     return result
 
 
-_FUSED_PACK_KERNELS: dict[tuple[int, ...], helion.Kernel] = {}
-# Helion flags the host-side `out is None` check as an unfused tensor operation.
-_OUT_CHECK_WARNINGS = [helion.exc.TensorOperationInWrapper]
 # LRU: epilogues created per call must not pile up (each entry pins its epilogue).
 _FUSED_PACK_BOUND: OrderedDict[
     tuple[object, ...], tuple[BoundKernel, tuple[hl.constexpr, ...]]
@@ -509,20 +511,13 @@ def _matmul_fused_pack_bound(
         _FUSED_PACK_BOUND.move_to_end(key)
         return cached
     block_sizes, k_chunked, k_even = _fused_pack_tiles(m, n, k, trans_a, tiles)
-    if (config := tuple(block_sizes)) not in _FUSED_PACK_KERNELS:
-        _FUSED_PACK_KERNELS[config] = helion.kernel(
-            _matmul_fused_pack,
-            backend="mlir",
-            config=helion.Config(block_sizes=block_sizes),
-            ignore_warnings=_OUT_CHECK_WARNINGS,
-        )
     consts = (
         hl.constexpr(k_chunked),
         hl.constexpr(k_even),
         hl.constexpr(trans_a),
         hl.constexpr(trans_b),
     )
-    bound = _FUSED_PACK_KERNELS[config].bind(
+    bound = _matmul_fused_pack(tuple(block_sizes)).bind(
         (a, b, bias, scale, shift, epilogue, *consts, out)
     )
     cached = _FUSED_PACK_BOUND[key] = (bound, consts)
@@ -539,6 +534,7 @@ def _panel_dot(
     )
 
 
+@per_config(backend="mlir", ignore_warnings=_OUT_CHECK_WARNINGS)
 def _matmul_prepacked_vnni(
     a3: Tensor,
     b4: Tensor,
@@ -597,6 +593,7 @@ def _matmul_prepacked_vnni(
     return result
 
 
+@per_config(backend="mlir", ignore_warnings=_OUT_CHECK_WARNINGS)
 def _matmul_prepacked_rows(
     a: Tensor,
     b3: Tensor,
@@ -638,7 +635,6 @@ def _matmul_prepacked_rows(
 # of a 32-row tile from L1 (128x4096x4096 on EMR: 605 us; 512: 1140 us, the
 # chunk no longer fits; 128: 595 us).
 _ROWS_K_CHUNK = 256
-_ROWS_KERNELS: dict[int, helion.Kernel] = {}
 
 
 def _rows_bound(
@@ -667,15 +663,10 @@ def _rows_bound(
         # The largest multiple of BK up to _ROWS_K_CHUNK dividing K: a ragged
         # chunk would be masked.
         chunk = next(c for c in range(_ROWS_K_CHUNK, 0, -BLOCK_K) if k % c == 0)
-        if chunk not in _ROWS_KERNELS:
-            _ROWS_KERNELS[chunk] = helion.kernel(
-                _matmul_prepacked_rows,
-                backend="mlir",
-                config=helion.Config(block_sizes=[BLOCK_M, 1, chunk]),
-                ignore_warnings=_OUT_CHECK_WARNINGS,
-            )
         cached = _FUSED_PACK_BOUND[key] = (
-            _ROWS_KERNELS[chunk].bind((a, b3, bias2, epilogue, out)),
+            _matmul_prepacked_rows((BLOCK_M, 1, chunk)).bind(
+                (a, b3, bias2, epilogue, out)
+            ),
             (),
         )
         if len(_FUSED_PACK_BOUND) > _FUSED_PACK_BOUND_SIZE:
@@ -734,9 +725,6 @@ def _matmul_prepacked_rows_call(
     return out if n == n_pad else out[:, :n]
 
 
-_PREPACKED_KERNELS: dict[tuple[int, ...], helion.Kernel] = {}
-
-
 def _matmul_prepacked_vnni_call(
     a: Tensor,
     b4: Tensor,
@@ -786,7 +774,9 @@ def _matmul_prepacked_vnni_call(
         return out if n == n_pad else out[:, :n]
 
     rest = _round_up(m - bulk, BLOCK_M)
-    out3 = output_pool.empty((bulk + rest, panels, panel), dtype=a.dtype, device=a.device)
+    out3 = output_pool.empty(
+        (bulk + rest, panels, panel), dtype=a.dtype, device=a.device
+    )
     if bulk:
         bound, consts = _prepacked_bound(a3[:bulk], *operands, tile_m, out3[:bulk])
         bound(a3[:bulk], *operands, *consts, out3[:bulk])
@@ -862,15 +852,8 @@ def _prepacked_bound(
         chunk = _prepacked_k_chunk(pairs_even, panel, tile_m)
         pairs_chunked = pairs_even // chunk * chunk
         tiles = (tile_m, 1, chunk, max(pairs_even - pairs_chunked, BLOCK_K))
-        if tiles not in _PREPACKED_KERNELS:
-            _PREPACKED_KERNELS[tiles] = helion.kernel(
-                _matmul_prepacked_vnni,
-                backend="mlir",
-                config=helion.Config(block_sizes=list(tiles)),
-                ignore_warnings=_OUT_CHECK_WARNINGS,
-            )
         consts = (hl.constexpr(pairs_chunked), hl.constexpr(pairs_even))
-        bound = _PREPACKED_KERNELS[tiles].bind(
+        bound = _matmul_prepacked_vnni(tiles).bind(
             (a3, b4, bias2, scale2, shift2, epilogue, *consts, out)
         )
         cached = _FUSED_PACK_BOUND[key] = (bound, consts)
@@ -991,6 +974,7 @@ def pack_b_blocked_vnni_t(
     return _pack_b_vnni_kernel_t(b_t, hl.constexpr(k_target), hl.constexpr(n_target))
 
 
+@per_config(backend="mlir")
 def _pack_b_vnni_panels_kernel_t(b3_t: Tensor, panel: hl.constexpr) -> Tensor:
     """``[N, K/2, 2]`` K pairs of transposed B (N a multiple of ``panel``) into
     VNNI panels ``[N/panel, K/2, panel, 2]``."""
@@ -1002,9 +986,6 @@ def _pack_b_vnni_panels_kernel_t(b3_t: Tensor, panel: hl.constexpr) -> Tensor:
     for tp, tn in hl.tile([pairs, n]):
         out[tn.id, tp, :, :] = b3_t[tn, tp, :].permute(1, 0, 2)
     return out
-
-
-_PANEL_PACK_KERNELS: dict[int, helion.Kernel] = {}
 
 
 # A GEMM of few rows runs one tile per thread from this K and these bytes of A
@@ -1158,9 +1139,7 @@ def tall_output_tiles(m: int, n: int, k: int) -> tuple[int, int, int] | None:
     return rows, n, k
 
 
-def whole_row_tiles(
-    m: int, n: int, panel: int | None = None
-) -> tuple[int, int] | None:
+def whole_row_tiles(m: int, n: int, panel: int | None = None) -> tuple[int, int] | None:
     """``(rows, columns)`` of bf16 VNNI tiles with which each thread computes
     whole rows of an ``[m, n]`` output: one row of tiles per thread, every
     panel of it (the static schedule gives a thread consecutive tiles, panels
@@ -1201,13 +1180,7 @@ def pack_b_vnni_t(b_t: Tensor, panel: int = _VNNI_PANEL) -> Tensor:
     b_t = b_t.contiguous()
     if (n_pad, k_pad) != (n, k):
         b_t = pad_2d(b_t, n_pad, k_pad)
-    if panel not in _PANEL_PACK_KERNELS:
-        _PANEL_PACK_KERNELS[panel] = helion.kernel(
-            _pack_b_vnni_panels_kernel_t,
-            backend="mlir",
-            config=helion.Config(block_sizes=[_PANEL_PAIRS, panel]),
-        )
-    return _PANEL_PACK_KERNELS[panel](
+    return _pack_b_vnni_panels_kernel_t((_PANEL_PAIRS, panel))(
         b_t.view(n_pad, k_pad // 2, 2), hl.constexpr(panel)
     )
 

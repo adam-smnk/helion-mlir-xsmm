@@ -64,7 +64,7 @@ def test_partial_tile_pads_only_edge_register_tiles(monkeypatch) -> None:
     tile_m, chunk = block_sizes[0], block_sizes[2]
     assert m % tile_m > 32  # a partial tile with a full and a partial register tile
     kernel = helion.kernel(
-        mm._matmul_fused_pack,
+        mm._matmul_fused_pack.body,
         static_shapes=True,
         backend="mlir",
         config=helion.Config(block_sizes=block_sizes),
@@ -114,7 +114,7 @@ def test_prepacked_ragged_k_contracts_only_with_amx(monkeypatch) -> None:
     pairs = k // 2
     pairs_even = pairs // 32 * 32
     kernel = helion.kernel(
-        mm._matmul_prepacked_vnni,
+        mm._matmul_prepacked_vnni.body,
         static_shapes=True,
         backend="mlir",
         config=helion.Config(block_sizes=[32, 1, pairs_even, 32]),

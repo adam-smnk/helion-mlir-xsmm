@@ -10,11 +10,11 @@ from __future__ import annotations
 import os
 from typing import Callable
 
-import helion
 import helion.language as hl
 import torch
 from torch import Tensor
 
+from .kernels import per_config
 import helion_mlir_backend  # noqa: F401
 from helion_mlir_backend import output_pool
 
@@ -26,6 +26,7 @@ _TILE_ELEMENTS = 1 << 16
 _IN_PLACE_TILE_ELEMENTS = 1 << 12
 
 
+@per_config(backend="mlir")
 def _softmax_kernel(
     x: Tensor, whole: hl.constexpr, in_place: hl.constexpr = hl.constexpr(False)
 ) -> Tensor:
@@ -73,6 +74,7 @@ def _softmax_kernel(
     return out
 
 
+@per_config(backend="mlir")
 def _softmax_one_kernel(x: Tensor) -> Tensor:
     """Softmax of one-column rows ``[M, 1]``: ``x - x + 1``, so 1, and NaN
     where ``x`` is NaN or infinite, as ``exp(x - max) / sum`` gives. The
@@ -90,6 +92,7 @@ def _second_operand(y: Tensor, extra: Tensor) -> Tensor:
     return y
 
 
+@per_config(backend="mlir")
 def _group_norm_kernel(
     x3: Tensor,
     weight: Tensor,
@@ -121,18 +124,6 @@ def _group_norm_kernel(
     return out
 
 
-_KERNELS: dict[tuple, helion.Kernel] = {}
-
-
-def _kernel(fn: Callable, block_sizes: list[int]) -> helion.Kernel:
-    key = (fn.__name__, *block_sizes)
-    if key not in _KERNELS:
-        _KERNELS[key] = helion.kernel(
-            fn, backend="mlir", config=helion.Config(block_sizes=block_sizes)
-        )
-    return _KERNELS[key]
-
-
 def _threads() -> int:
     return int(os.environ.get("OMP_NUM_THREADS", torch.get_num_threads()))
 
@@ -153,13 +144,13 @@ def softmax(x: Tensor, in_place: bool = False) -> Tensor:
         raise ValueError(f"softmax() expects a 2-D tensor, got {tuple(x.shape)}")
     m, n = map(int, x.shape)
     if n == 1:
-        return _kernel(_softmax_one_kernel, [_row_tile(m, 1)])(x.contiguous())
+        return _softmax_one_kernel((_row_tile(m, 1),))(x.contiguous())
     block_n = min(n, 128)
     whole = hl.constexpr(n // block_n * block_n)
     # The column block is registered first.
     elements = _IN_PLACE_TILE_ELEMENTS if in_place else _TILE_ELEMENTS
     tile_m = _row_tile(m, block_n, elements=elements)
-    kernel = _kernel(_softmax_kernel, [block_n, tile_m])
+    kernel = _softmax_kernel((block_n, tile_m))
     return kernel(x.contiguous(), whole, hl.constexpr(in_place))
 
 
@@ -193,7 +184,7 @@ def group_norm(
         num_groups // groups_per_tile,
         _IN_PLACE_TILE_ELEMENTS if in_place else _TILE_ELEMENTS,
     )
-    kernel = _kernel(_group_norm_kernel, [tile_m, groups_per_tile])
+    kernel = _group_norm_kernel((tile_m, groups_per_tile))
     channels = (num_groups, group_size)
     return kernel(
         x.contiguous().view(m, num_groups, group_size),

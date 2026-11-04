@@ -13,11 +13,12 @@ from typing import Callable
 
 import helion
 import helion.language as hl
-from helion_mlir_backend import output_pool
 import torch
 from torch import Tensor
 
+from .kernels import per_config
 from .matmul import identity_epilogue
+from helion_mlir_backend import output_pool
 
 
 @helion.kernel(backend="mlir", config=helion.Config(block_sizes=[32, 32]))
@@ -75,6 +76,7 @@ def _row_tile(m: int, threads: int) -> int:
     return rows if m % rows == 0 else 1
 
 
+@per_config(backend="mlir")
 def _row_sum_kernel(x: Tensor, epilogue: Callable[[Tensor], Tensor]) -> Tensor:
     """``epilogue`` of the f32 row sums of ``[M, N]``, as ``[M, 1]``."""
     m, n = x.shape
@@ -89,7 +91,6 @@ def _row_sum_kernel(x: Tensor, epilogue: Callable[[Tensor], Tensor]) -> Tensor:
     return out
 
 
-_ROW_SUM_KERNELS: dict[tuple[int, int], helion.Kernel] = {}
 # Least recently used bound kernels, evicted past _ROW_SUM_BOUND_SIZE.
 _ROW_SUM_BOUND: OrderedDict[tuple, object] = OrderedDict()
 _ROW_SUM_BOUND_SIZE = 64
@@ -112,13 +113,7 @@ def row_sum(
     # 27 us per call, 8 us of it the kernel).
     key = (block_sizes, m, n, x.dtype, x.device, epilogue)
     if (bound := _ROW_SUM_BOUND.get(key)) is None:
-        if block_sizes not in _ROW_SUM_KERNELS:
-            _ROW_SUM_KERNELS[block_sizes] = helion.kernel(
-                _row_sum_kernel,
-                backend="mlir",
-                config=helion.Config(block_sizes=list(block_sizes)),
-            )
-        bound = _ROW_SUM_KERNELS[block_sizes].bind((x, epilogue))
+        bound = _row_sum_kernel(block_sizes).bind((x, epilogue))
         _ROW_SUM_BOUND[key] = bound
         if len(_ROW_SUM_BOUND) > _ROW_SUM_BOUND_SIZE:
             _ROW_SUM_BOUND.popitem(last=False)
@@ -127,6 +122,7 @@ def row_sum(
     return bound(x, epilogue)
 
 
+@per_config(backend="mlir")
 def _column_sum_kernel(x: Tensor) -> Tensor:
     """The f32 sums of the columns of ``[M, N]``, as ``[N]``."""
     m, n = x.shape
@@ -141,7 +137,6 @@ def _column_sum_kernel(x: Tensor) -> Tensor:
     return out
 
 
-_COLUMN_SUM_KERNELS: dict[tuple[int, int], helion.Kernel] = {}
 _COLUMN_SUM_BOUND: OrderedDict[tuple, object] = OrderedDict()
 
 
@@ -160,13 +155,7 @@ def column_sum(x: Tensor) -> Tensor:
     x = x.contiguous()
     key = (block_sizes, m, n, x.dtype, x.device)
     if (bound := _COLUMN_SUM_BOUND.get(key)) is None:
-        if block_sizes not in _COLUMN_SUM_KERNELS:
-            _COLUMN_SUM_KERNELS[block_sizes] = helion.kernel(
-                _column_sum_kernel,
-                backend="mlir",
-                config=helion.Config(block_sizes=list(block_sizes)),
-            )
-        bound = _COLUMN_SUM_KERNELS[block_sizes].bind((x,))
+        bound = _column_sum_kernel(block_sizes).bind((x,))
         _COLUMN_SUM_BOUND[key] = bound
         if len(_COLUMN_SUM_BOUND) > _ROW_SUM_BOUND_SIZE:
             _COLUMN_SUM_BOUND.popitem(last=False)
@@ -175,6 +164,7 @@ def column_sum(x: Tensor) -> Tensor:
     return bound(x)
 
 
+@per_config(backend="mlir")
 def _row_dot_kernel(
     x: Tensor, v: Tensor, epilogue: Callable[[Tensor], Tensor]
 ) -> Tensor:
@@ -193,7 +183,6 @@ def _row_dot_kernel(
     return out
 
 
-_ROW_DOT_KERNELS: dict[tuple[int, int], helion.Kernel] = {}
 _ROW_DOT_BOUND: OrderedDict[tuple, object] = OrderedDict()
 
 
@@ -215,13 +204,7 @@ def row_dot(
     x = x.contiguous()
     key = (block_sizes, m, n, x.dtype, x.device, epilogue)
     if (bound := _ROW_DOT_BOUND.get(key)) is None:
-        if block_sizes not in _ROW_DOT_KERNELS:
-            _ROW_DOT_KERNELS[block_sizes] = helion.kernel(
-                _row_dot_kernel,
-                backend="mlir",
-                config=helion.Config(block_sizes=list(block_sizes)),
-            )
-        bound = _ROW_DOT_KERNELS[block_sizes].bind((x, v, epilogue))
+        bound = _row_dot_kernel(block_sizes).bind((x, v, epilogue))
         _ROW_DOT_BOUND[key] = bound
         if len(_ROW_DOT_BOUND) > _ROW_SUM_BOUND_SIZE:
             _ROW_DOT_BOUND.popitem(last=False)
