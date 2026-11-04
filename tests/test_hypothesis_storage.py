@@ -1,9 +1,10 @@
-"""Hypothesis keeps its files off NFS, in every kind of test process."""
+"""Hypothesis and bytecode stay off NFS, in every kind of test process."""
 
 from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 
 from hypothesis.configuration import storage_directory
 import pytest
@@ -26,3 +27,17 @@ def test_storage_is_the_configured_directory() -> None:
 @pytest.mark.isolated
 def test_storage_is_the_configured_directory_in_an_isolated_child() -> None:
     _check_storage()
+
+
+def _check_no_bytecode() -> None:
+    assert sys.dont_write_bytecode
+    assert os.environ["PYTHONDONTWRITEBYTECODE"] == "1"
+
+
+def test_no_bytecode_is_written() -> None:
+    _check_no_bytecode()
+
+
+@pytest.mark.isolated
+def test_no_bytecode_is_written_in_an_isolated_child() -> None:
+    _check_no_bytecode()

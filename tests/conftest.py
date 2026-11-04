@@ -49,6 +49,10 @@ HYPOTHESIS_STORAGE_NAMED = "HYPOTHESIS_STORAGE_DIRECTORY" in os.environ
 os.environ.setdefault(
     "HYPOTHESIS_STORAGE_DIRECTORY", f"/dev/shm/hypothesis-{os.getuid()}"
 )
+# The same hang on bytecode, which workers write by replacing files next to the sources.
+# The variable reaches xdist workers, the fork server and subprocesses.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
 
 def _isolated_context() -> multiprocessing.context.ForkServerContext:
