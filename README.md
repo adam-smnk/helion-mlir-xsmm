@@ -249,23 +249,29 @@ Where it goes matters to the code around it:
 | A label, in a tile loop | prints; path kept in the kernels tried | prints; XeGPU ops unchanged |
 | A tile of an input the kernel only reads | prints | prints; XeGPU ops unchanged |
 | The output tile, after storing it | prints | prints; not synchronized (see below) |
-| A tile of a buffer the kernel also stores, before that store or in a loop | prints | prints, maybe wrong values, with a warning (see below) |
+| A tile of a buffer the kernel also stores, before that store or in a K loop | prints | prints, with barriers (see below) |
+| The same, in a kernel's `if` or a tile the rule can't call its own | prints | prints, maybe wrong values, with a warning (see below) |
 | A tile computed in the kernel, or partial | prints | refused (see below) |
 | In a K loop | prints; may repeat, may change path (see below) | prints what the rows above allow |
 | Between two elementwise ops | prints; they may no longer fuse | refused, as computed |
 
 Limits:
 
-- **Buffers the kernel stores, on the XPU:** a print of one that isn't provably after the
-  store of that tile, in the tile loop's body and with no other store to that buffer,
-  compiles and runs with a Python warning at compile time: its values may be wrong,
-  because thread 0 reads while the other hardware threads store (11549 of 16384 values
-  were wrong in one such print on an Arc B50). The kernel's results aren't affected. Print
-  after the store, or print an input. After the store there's no warning, but it is **not
-  synchronized** either: the first thread can read shares the others haven't stored yet;
-  no stale value was seen in the runs tried, which is observed, not guaranteed. An input
-  that overlaps an output at the call is passed as a copy, so its print shows its values
-  at the call.
+- **Buffers the kernel stores, on the XPU:** thread 0 reads the whole tile while the other
+  hardware threads store their shares, which printed wrong values (11549 of 16384 in one
+  such print on an Arc B50). So a print of a kernel's own tile that isn't provably after its
+  store gets a workgroup barrier on each side of its loops, and prints the tile as it stands
+  there: no wrong value in the runs tried, and results stayed bit-identical. Labels,
+  inputs and prints after the store get no barrier.
+- **Where a barrier isn't proven right, a warning.** In a kernel's `if` or a loop with
+  runtime bounds, not every thread may reach a barrier; and a barrier orders one workgroup,
+  so a read that may be of another's tile isn't helped. These compile with no barrier and a
+  Python warning at compile time: the printed values may be wrong; the kernel's results
+  aren't affected. Print after the store, or print an input.
+- **After the store** there's no barrier and no warning, and it is **not synchronized**: the
+  first thread can read shares the others haven't stored yet. No stale value was seen in
+  the runs tried, which is observed, not guaranteed. An input that overlaps an output at the
+  call is passed as a copy, so its print shows its values at the call.
 - **Computed and partial tiles on the XPU** are refused with an error naming
   `hl.device_print`: reading one needs a buffer in the kernel, which cannot allocate.
   Print a full loaded tile, or the output after storing it, or use `target="cpu"`.

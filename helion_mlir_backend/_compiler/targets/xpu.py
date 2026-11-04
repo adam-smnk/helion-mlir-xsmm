@@ -60,9 +60,9 @@ from ..mlir_transforms.keep_row_dims import keep_row_dims
 from ..mlir_transforms.legalize_host_ops import HOST_OPS_ERROR
 from ..mlir_transforms.legalize_host_ops import KERNEL_ARGUMENT
 from ..mlir_transforms.prints import guard_prints
-from ..mlir_transforms.prints import prints_of_stored_buffers
-from ..mlir_transforms.prints import warn_print_is_experimental
 from ..mlir_transforms.prints import refuse_prints_needing_allocation
+from ..mlir_transforms.prints import settle_prints_of_stored_buffers
+from ..mlir_transforms.prints import warn_print_is_experimental
 from ..mlir_transforms.row_maxima import restore_nan_propagating_maxima
 from ..mlir_transforms.xegpu_attention_loops import copy_attention_layouts
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
@@ -213,8 +213,9 @@ def _stages(
         ("grid-mappings", _StripGridMappings()),
         # Lighthouse's outline_gpu_func and annotate_layouts schedules, per kernel.
         ("gpu-outlining", xpu_transforms.outline_kernels(entry, kernels, columns)),
-        # Prints a kernel can't do, or may do wrong: see prints.
-        ("print-reads", _RefusePrintsNeedingAllocation()),
+        # Prints a kernel can't do, or that need ordering: after bufferization, which
+        # refuses a barrier's unknown effects. See prints.
+        ("print-reads", _CheckPrints()),
         # Row results stored as [rows, 1] columns: see keep_row_dims.
         ("row-results", _KeepRowDims()),
         # A SPIR-V backend abort on bool to float casts: see xpu_bool_casts.
@@ -708,13 +709,13 @@ class _FabsAsIntegerMin(Stage):
         return module
 
 
-class _RefusePrintsNeedingAllocation(Stage):
+class _CheckPrints(Stage):
     """A print that needs a buffer in the kernel is refused; one that can see other threads'
-    stores gets a warning (:mod:`prints`)."""
+    stores gets barriers, or a warning where they aren't proven right (:mod:`prints`)."""
 
     def apply(self, module: ir.Module) -> ir.Module:
         refuse_prints_needing_allocation(module)
-        warnings_found = prints_of_stored_buffers(module)
+        warnings_found = settle_prints_of_stored_buffers(module)
         if warnings_found:
             module.operation.attributes[LOWERING_WARNINGS_ATTR] = ir.ArrayAttr.get(
                 [ir.StringAttr.get(line) for line in warnings_found]
