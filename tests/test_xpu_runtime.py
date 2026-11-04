@@ -983,9 +983,7 @@ def test_log_softmax_offset_rows(form: str, offset: float) -> None:
 def test_l1_norm_tiny_inputs() -> None:
     """Regression (review): the three-kernel L1 norm of subnormal inputs
     (``1e-40 * randn``) divides by the row mean, ``x / (sum / n)``; the former
-    ``x * (n / sum)`` overflowed ``n / sum`` to inf. (The single-kernel
-    fallback still gives inf there: its row mean of subnormals comes out 0 on
-    the B50.)"""
+    ``x * (n / sum)`` overflowed ``n / sum`` to inf."""
     x = _randn(*_ROW_REDUCTION_SHAPE, dtype=F32) * 1e-40
     out = kb.row_reduction("38_L1Norm_", x)
     ref = x.double() / x.double().abs().mean(dim=1, keepdim=True)

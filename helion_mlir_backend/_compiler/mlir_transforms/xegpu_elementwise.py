@@ -444,7 +444,7 @@ def _gather_scatter_operands(op: ir.Operation) -> tuple[ir.Value, ir.Value] | No
     return op.operands[index], op.operands[index + 1]
 
 
-def _is_contiguous_1d(op: ir.Operation) -> bool:
+def is_contiguous_1d(op: ir.Operation) -> bool:
     """A 1D tile access ``op`` covers neighbouring elements: a gather or
     scatter at :func:`_contiguous_offsets` under an all-true constant mask."""
     operands = _gather_scatter_operands(op)
@@ -478,7 +478,7 @@ def _only_offsets(value: ir.Value, accesses: list[ir.Operation]) -> bool:
 def _chunkable_1d(target: ir.Operation, accesses: list[ir.Operation]) -> bool:
     """The 1D tile ``accesses`` of the kernel ``target`` may take several
     neighbouring elements per work item: each is contiguous
-    (:func:`_is_contiguous_1d`), and every other op on vectors is an
+    (:func:`is_contiguous_1d`), and every other op on vectors is an
     elementwise ``arith``/``math`` op, a splat constant, a scalar broadcast, or
     part of the offsets (``vector.step`` and index additions used only as
     offsets).
@@ -488,7 +488,7 @@ def _chunkable_1d(target: ir.Operation, accesses: list[ir.Operation]) -> bool:
     arange) is distributed with the chunked lane layout into per-work-item
     vectors of more than 16 components read with dynamic ``extractelement``,
     which LLVM's SPIR-V backend crashes on (``Index < this->size()``)."""
-    if not accesses or not all(_is_contiguous_1d(op) for op in accesses):
+    if not accesses or not all(is_contiguous_1d(op) for op in accesses):
         return False
     fits = [True]
 

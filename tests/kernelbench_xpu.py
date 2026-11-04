@@ -346,9 +346,7 @@ def _log_softmax(x: torch.Tensor) -> torch.Tensor:
 
 
 def _l1_norm(x: torch.Tensor) -> torch.Tensor:
-    """``x / mean(|x|, dim=1, keepdim=True)`` (KernelBench 38), in two passes.
-    Subnormal inputs (``1e-40 * randn``) give inf: the row mean comes out 0
-    on the B50 (the three kernels compute it)."""
+    """``x / mean(|x|, dim=1, keepdim=True)`` (KernelBench 38), in two passes."""
     m, n = x.shape
     block_n = hl.register_block_size(n)
     out = torch.empty_like(x)

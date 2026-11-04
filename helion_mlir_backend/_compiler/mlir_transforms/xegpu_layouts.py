@@ -11,8 +11,9 @@ kernel classes. A layout is legal or not by what the ops require:
    permutation, a broadcast's aligned dims, loop-carried values, the kept dims
    of a reduction, and accesses of one buffer at one offset.
 2. **Pinned classes**: a contracted dim must be whole on each subgroup, and so
-   must a reduced dim unless a cross-subgroup reduction is wanted (upstream has
-   one, through SLM and ``gpu.barrier``; not used here). The rest are free.
+   must a reduced dim, but in a one-row kernel (:func:`plan_row_reduction`), whose
+   columns are split across the subgroups with upstream's cross-subgroup reduction
+   through SLM and ``gpu.barrier``. The rest are free.
 3. **Grids** (:func:`legal_grids`): the output's two dims are the grid's axes.
    A grid ``(fx, fy)`` is legal if its factors divide every value of their class,
    leave DPAS and 2D block sizes on each subgroup, and fit the thread limit.
@@ -49,6 +50,7 @@ from .xegpu_elementwise import block_load_tile
 from .xegpu_elementwise import block_store_tile
 from .xegpu_elementwise import elementwise_layout
 from .xegpu_elementwise import find_tiles
+from .xegpu_elementwise import is_contiguous_1d
 from .xegpu_tile_forms import buffer_root
 from .xegpu_tile_forms import expand_elementwise_contractions
 from .xegpu_tile_forms import hoist_transposes
@@ -64,7 +66,8 @@ _HINT_KEYS = ("sg_tile", "load_tiles", "prefetch_tiles", "prefetch_depths")
 HINTS_ATTR = "xegpu_layouts.hints"
 """Dictionary on a ``gpu.func``, read and removed by :func:`annotate_layouts`:
 
-- ``sg_tile``: ``[rows, cols]``; ``[rows, 0]``: all subgroups on the rows;
+- ``sg_tile``: ``[rows, cols]``; ``[rows, 0]``: all subgroups on the rows; ``[1, cols]``
+  of a one-row tile (:func:`plan_row_reduction`);
 - ``load_tiles``: ``[a_m, a_k, b_k, b_n]`` of DPAS operands, ``[m, n]`` of other
   tiles;
 - ``prefetch_tiles``: ``[a_m, a_k, b_k, b_n]``, as the operands are stored;
@@ -961,6 +964,8 @@ class Plan:
     """Clean the kernel up afterwards."""
     licm: bool = False
     """Hoist out of the DPAS loops afterwards (what prefetches leave in them)."""
+    reductions_to_separate: list[ir.Operation] = field(default_factory=list)
+    """Reductions :func:`annotate_layouts` gives :func:`_separate_reduction_source`."""
 
 
 def plan_layouts(kernel: KernelIR, hints: Hints) -> Plan:
@@ -1307,6 +1312,215 @@ def _plan_other_load(
     plan.anchors.append((access.op, "layout", _layout_text(layout, tile, order)))
 
 
+# --- One row per workgroup ---------------------------------------------------------
+
+ROW_SPLIT_SUBGROUPS = (32, 16, 1)
+"""What a reduced dim can be split over, in order of preference. A subgroup reads the
+other subgroups' partial results as one vector and reduces it across its lanes: upstream
+lowers that for whole lanes only, 32 or 16 elements (:mod:`.xevm_lane_reductions` refuses
+reductions over part of a subgroup), and 1 subgroup has nothing to read."""
+ROW_MIN_SG_COLS = 32
+"""A subgroup's columns, where that leaves a split at all. 32 subgroups of one 64-byte
+gather per K tile stall: 8192x65536 on the B50, sustained, device time, 512-column tiles:
+68.6 ms over 32 subgroups, 22.9 over 16; 32768x65536 on the B70: 107.2, 35.8."""
+ROW_REDUCTION_KINDS = frozenset({"add", "maximumf", "minimumf"})
+"""The kinds whose partial results through SLM are checked, on the B50 and the B70."""
+ROW_REDUCTION_BITS = 32
+"""A reduction's elements here: upstream's SLM reads and writes are checked on f32."""
+ROW_LANE_TILE = (SUBGROUP_SIZE,)
+"""The ``inst_data`` of every access: one element per lane.
+
+A tile that reaches a reduction has no choice: the cross-lane reduction forces
+``lane_data = [1]``, and a gather of more elements per lane under that consumer takes
+wrong elements silently (:func:`.xegpu_elementwise.chunk_1d`). The other tiles could take
+more, and don't: a division by the row result, a uniform value, then is a vector ``fdiv``,
+which IGC emits as a bare ``math.inv``, and a subnormal divisor gives inf
+(``agent-wiki/upstream-repro/igc-vector-fdiv`` in helion-mlir-dev; ``1e-40 * randn`` through
+an L1 norm). What the wider gathers would gain: 8192x65536 L1 on the B50, device time, 22.06
+against 22.34 ms at 2048 columns, 22.18 against 22.93 at 1024."""
+_ROW_MEMORY_FORMS = frozenset(
+    {
+        "memref.subview",
+        "memref.collapse_shape",
+        "memref.expand_shape",
+        "memref.extract_strided_metadata",
+        "memref.extract_aligned_pointer_as_index",
+    }
+)
+_ROW_VECTOR_OPS = frozenset(
+    {
+        "xegpu.load",
+        "xegpu.store",
+        "vector.multi_reduction",
+        "vector.broadcast",
+        "vector.step",
+        "scf.for",
+        "scf.yield",
+    }
+)
+
+
+def _row_refusal(kernel: KernelIR) -> str | None:
+    """Why ``kernel``'s reductions of one-row tiles can't be split across subgroups:
+    the ops :func:`plan_row_reduction` has reasoned about, nothing else."""
+    tile = _shape(kernel.primary)
+    for op in _walk(kernel.func):
+        name = op.name
+        if name in ("xegpu.load", "xegpu.store"):
+            if not is_contiguous_1d(op):
+                return f"a '{name}' of a one-row tile that isn't whole columns"
+        elif name == "vector.multi_reduction":
+            source = op.operands[0]
+            kind = str(op.attributes["kind"]).removeprefix("#vector.kind<").rstrip(">")
+            if kind not in ROW_REDUCTION_KINDS:
+                return f"a '{kind}' reduction across subgroups"
+            if ir.VectorType(source.type).element_type.width != ROW_REDUCTION_BITS:
+                return f"a reduction across subgroups of {source.type}"
+            if _shape(op.results[0]) is not None:
+                return "a reduction of a one-row tile that keeps a dim"
+            # One SLM array per reduction, and no barrier after its reads: the next
+            # iteration's stores would race with a slower subgroup's reads.
+            if op.parent.operation.name == "scf.for":
+                return "a reduction across subgroups inside a loop"
+        elif op.regions and name != "scf.for":
+            return f"'{name}' in a kernel with a reduction across subgroups"
+        elif name == "memref.store" or (
+            name.startswith("memref.")
+            and name not in _ROW_MEMORY_FORMS
+            and any(isinstance(v.type, ir.VectorType) for v in op.results)
+        ):
+            return f"'{name}' of a row result: only tiles are stored"
+        elif name == "arith.constant":
+            attr = op.attributes["value"]
+            if isinstance(attr, ir.DenseElementsAttr) and not (
+                ir.DenseElementsAttr(attr).is_splat
+            ):
+                return "a constant that isn't a splat on a one-row tile"
+        elif not name.startswith(("arith.", "math.")) and name not in _ROW_VECTOR_OPS:
+            if any(_shape(v) for v in [*op.operands, *op.results]):
+                return f"'{name}' on a one-row tile"
+        for value in [*op.operands, *op.results]:
+            shape = _shape(value)
+            if shape == ():
+                return "a row result carried or stored as a 0-D vector"
+            if shape not in (None, tile):
+                return f"a vector of shape {list(shape)} next to tiles of {list(tile)}"
+    return None
+
+
+def _row_subgroups(columns: int, hints: Hints) -> int:
+    """How many subgroups split a one-row tile of ``columns``: the first of
+    :data:`ROW_SPLIT_SUBGROUPS` leaving each a multiple of 16 elements and no more
+    than :data:`MAX_SG_ELEMENTS`, and at least :data:`ROW_MIN_SG_COLS` if some split
+    does; or a hint's."""
+    legal = [
+        s
+        for s in ROW_SPLIT_SUBGROUPS
+        if columns % (s * BLOCK_COLS) == 0 and columns // s <= MAX_SG_ELEMENTS
+    ]
+    if hints.sg_tile is not None:
+        sg_columns = hints.sg_tile[-1]
+        if (
+            sg_columns == 0
+            or any(rows != 1 for rows in hints.sg_tile[:-1])
+            or columns % sg_columns
+            or columns // sg_columns not in legal
+        ):
+            raise HintError(
+                "sg_tile",
+                f"subgroup tile {list(hints.sg_tile)} of a one-row tile of {columns} "
+                f"columns: it takes {[columns // s for s in legal]}",
+            )
+        return columns // sg_columns
+    if not legal:
+        raise LayoutError(
+            f"no subgroup split of a one-row tile of {columns} columns: "
+            f"{list(ROW_SPLIT_SUBGROUPS)} subgroups of a multiple of {BLOCK_COLS} and at "
+            f"most {MAX_SG_ELEMENTS} columns"
+        )
+    return next(
+        (s for s in legal if s > 1 and columns // s >= ROW_MIN_SG_COLS), legal[0]
+    )
+
+
+def plan_row_reduction(kernel: KernelIR, hints: Hints) -> Plan | None:
+    """A kernel that reduces one-row tiles: a workgroup per row, its columns split
+    across the subgroups (:data:`ROW_SPLIT_SUBGROUPS`). ``None`` if ``kernel`` isn't one:
+    its reductions have 1D sources (the unit row dim folded) and all its tiles are 1D
+    gathers and scatters. :class:`LayoutError` for one this module can't reason about.
+
+    Only such a kernel gets here. A 2D tile keeps its pinned reduced dims. Each
+    subgroup reduces its columns, writes the result to SLM at its id and waits at a
+    ``gpu.barrier``; then all read the same partial results and reduce them the same
+    way, so all hold the same bits. The SLM array comes from the ``memref.alloca`` of
+    upstream's distribution, which the lowering makes a global of the workgroup address
+    space.
+
+    Why split: time on the B50 and B70 follows the threads per row, not the tile's
+    size (``helion_mlir_xpu_utils.normalization``)."""
+    primary = kernel.primary
+    if (
+        not kernel.reductions
+        or kernel.dpas
+        or kernel.loads
+        or kernel.stores
+        or len(_shape(primary) or ()) != 1
+    ):
+        return None
+    refusal = _row_refusal(kernel)
+    if refusal is not None:
+        raise LayoutError(f"a reduction across subgroups: {refusal}")
+    if hints.prefetch_tiles is not None or hints.prefetch_depths is not None:
+        raise HintError(
+            "prefetch_tiles" if hints.prefetch_tiles is not None else "prefetch_depths",
+            "prefetch tiles and depths apply to loads of DPAS operands in a K loop; "
+            "this kernel has none",
+        )
+    columns = _shape(primary)[0]
+    subgroups = _row_subgroups(columns, hints)
+    sg = ValueLayout((subgroups,), (columns // subgroups,))
+    _check_row_load_tile(hints)
+    plan = Plan(Grid(subgroups, 1), subgroups * SUBGROUP_SIZE)
+    for op in _walk(kernel.func):
+        if op.name in ("xegpu.load", "xegpu.store"):
+            plan.anchors.append((op, "layout", _layout_text(sg, ROW_LANE_TILE)))
+    plan.reductions_to_separate = list(kernel.reductions)
+    return plan
+
+
+def _check_row_load_tile(hints: Hints) -> None:
+    if hints.load_tiles is not None and hints.load_tiles[-1] != ROW_LANE_TILE[0]:
+        raise HintError(
+            "load_tiles",
+            f"load tile {list(hints.load_tiles)} of a one-row tile: only "
+            f"{list(ROW_LANE_TILE)}",
+        )
+
+
+def _separate_reduction_source(reduction: ir.Operation) -> None:
+    """A bitcast round trip between ``reduction`` and its source, for
+    ``xegpu-sg-to-lane-distribute`` to lower it to a scalar: a workaround, removed by its
+    own canonicalization (no code is left).
+
+    The pass leaves such a reduction illegal when its source has a layout of its own,
+    as an ``scf.for`` result has: ``agent-wiki/upstream-repro/xpu-reduction-of-loop-result``
+    in helion-mlir-dev. Remove it when ``repro.mlir`` there lowers."""
+    source = reduction.operands[0]
+    source_type = ir.VectorType(source.type)
+    integers = ir.VectorType.get(
+        source_type.shape,
+        ir.IntegerType.get_signless(source_type.element_type.width),
+    )
+    with ir.InsertionPoint(reduction):
+        to_int = ir.Operation.create(
+            "arith.bitcast", results=[integers], operands=[source]
+        )
+        back = ir.Operation.create(
+            "arith.bitcast", results=[source_type], operands=[to_int.results[0]]
+        )
+    reduction.operands[0] = back.results[0]
+
+
 def plan_elementwise(func: ir.Operation, hints: Hints) -> Plan | None:
     """``xegpu_elementwise``'s layout, if ``func`` is an elementwise kernel."""
     tiles = find_tiles(func)
@@ -1394,7 +1608,8 @@ def plan_kernel(func: ir.Operation, hints: Hints) -> Plan:
             plan = None if _reads_transposed(func) else plan_elementwise(func, hints)
             _refuse_transposes_the_lowering_aborts_on(func)
             if plan is None:
-                plan = plan_layouts(analyze(func), hints)
+                kernel = analyze(func)
+                plan = plan_row_reduction(kernel, hints) or plan_layouts(kernel, hints)
         except HintError as exc:
             if getattr(hints, exc.key) is None:
                 raise LayoutError(str(exc)) from exc
@@ -1493,6 +1708,8 @@ def annotate_layouts(module: ir.Operation, func: ir.Operation) -> Plan:
     i64 = ir.IntegerType.get_signless(64)
     for op, name, text in plan.anchors:
         op.attributes[name] = ir.Attribute.parse(text)
+    for reduction in plan.reductions_to_separate:
+        _separate_reduction_source(reduction)
     for number, (op, _) in enumerate(plan.prefetches):
         op.attributes[PREFETCH_ATTR] = ir.IntegerAttr.get(i64, number)
     set_threads(module, func, plan.threads)
