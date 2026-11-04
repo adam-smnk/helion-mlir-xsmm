@@ -43,6 +43,12 @@ if (_workers := os.environ.get("PYTEST_XDIST_WORKER_COUNT")) is not None:
 os.environ["HELION_DISALLOW_AUTOTUNING"] = "1"
 # IR invariants on every lowering of the suite: see tests/ir_invariants.py.
 _MODE = os.environ.setdefault("HELION_MLIR_TEST_IR_CHECKS", "fail")
+# Node-local, as on NFS a worker can hang in nfs_lookup_revalidate, and with it the whole run.
+# Hypothesis reads this at first use, after its pytest plugin has loaded and after this file.
+HYPOTHESIS_STORAGE_NAMED = "HYPOTHESIS_STORAGE_DIRECTORY" in os.environ
+os.environ.setdefault(
+    "HYPOTHESIS_STORAGE_DIRECTORY", f"/dev/shm/hypothesis-{os.getuid()}"
+)
 
 
 def _isolated_context() -> multiprocessing.context.ForkServerContext:
