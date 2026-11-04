@@ -8,11 +8,14 @@ memref-ABI entry (runtime scalars by value), then finishes the host code and ret
 from __future__ import annotations
 
 import bisect
+import difflib
 from itertools import starmap
 import keyword
 import operator
 from typing import TYPE_CHECKING
+import warnings
 
+import helion.autotuner.config_spec as helion_config_spec
 import sympy
 import torch
 
@@ -41,6 +44,34 @@ if TYPE_CHECKING:
     from ..targets import MLIRTarget
 
 
+_SPELLING_CUTOFF = 0.8
+"""``difflib`` ratio from which an unknown config key counts as a misspelling. Every typo
+tried of a valid key is above it (``xegpu_sg_tile``, ``xepgu_sg_tiles``, ``block_size``,
+``mlir_pipline``), and none of the keys that AI-bench and this repo's tests, examples and
+tools pass or name; at 0.7 ``xegpu_ops`` and ``reduce_block_sizes`` would match."""
+_warned_spellings: set[tuple[str, str]] = set()
+"""``(kernel, key)`` pairs warned about, so a kernel warns once however often it compiles."""
+
+
+def warn_misspelt_config_keys(
+    kernel: str, config: Config, env: CompileEnvironment
+) -> None:
+    """Warn once per kernel and key about a config key that looks like a typo of a valid
+    one, since the MLIR backend ignores keys it doesn't read. Any other unknown key stays
+    silent and nothing raises: a kernel may carry keys meant for another backend."""
+    valid = helion_config_spec.VALID_KEYS | env.config_spec.user_defined_tunables.keys()
+    for key in config:
+        if key in valid or (kernel, key) in _warned_spellings:
+            continue
+        close = difflib.get_close_matches(key, valid, n=1, cutoff=_SPELLING_CUTOFF)
+        if close:
+            _warned_spellings.add((kernel, key))
+            warnings.warn(
+                f"{kernel}: config key {key!r} is being ignored; did you mean {close[0]!r}?",
+                stacklevel=2,
+            )
+
+
 def mlir_compile_config(
     bound_kernel: BoundKernel,
     config: Config | None = None,
@@ -53,6 +84,7 @@ def mlir_compile_config(
     config = bound_kernel._normalize_config(config)
     if (run := bound_kernel._compile_cache.get(config)) is not None:
         return run
+    warn_misspelt_config_keys(bound_kernel.host_function.name, config, bound_kernel.env)
     run = compile_kernel(bound_kernel.host_function, config, bound_kernel.env)
     bound_kernel._compile_cache[config] = run
     if call_trace.enabled():

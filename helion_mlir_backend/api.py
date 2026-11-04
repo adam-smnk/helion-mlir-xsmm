@@ -117,6 +117,8 @@ def _compile(
     from helion.runtime.settings import Settings
     import torch
 
+    from helion_mlir_backend._compiler.mlir.driver import warn_misspelt_config_keys
+
     fn = getattr(kernel, "fn", None)
     if fn is None:
         raise ValueError(
@@ -146,4 +148,5 @@ def _compile(
         host_function = KernelCompiler(env).compile(fn, fake_args, {})
         if config is None:
             config = env.config_spec.default_config()
+    warn_misspelt_config_keys(host_function.name, config, env)
     return host_function, config, env

@@ -35,6 +35,9 @@ Selects compilation pipeline:
 **xegpu\_prefetch\_depths**: XeGPU parameters per GPU kernel on the XPU, ignored on
 the CPU (see [XeGPU parameters](#xegpu-parameters)).
 
+Keys the MLIR backend doesn't read are ignored, since a kernel may carry keys for another
+backend. A key that looks like a typo of a valid one (`xegpu_sg_tile`) warns once per kernel.
+
 ## XPU (experimental)
 
 Kernels on `xpu` tensors (or with `target="xpu"` / `HELION_MLIR_TARGET=xpu`) use the
