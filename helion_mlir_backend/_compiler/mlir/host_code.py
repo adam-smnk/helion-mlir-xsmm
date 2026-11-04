@@ -91,9 +91,9 @@ def build_host_function(
     factory_code = next(c for c in code.co_consts if isinstance(c, types.CodeType))
     function = types.FunctionType(factory_code, hf.fn.__globals__)(*aliases.values())
     function._helion_mlir_aliases = aliases  # type: ignore[attr-defined]
-    function._helion_mlir_metadata_only = _MetadataOnly(  # type: ignore[attr-defined]
-        hf.definition.args, hf.fn.__globals__
-    ).check(body)
+    metadata_only = _MetadataOnly(hf.definition.args, hf.fn.__globals__)
+    function._helion_mlir_metadata_only = metadata_only.check(body)  # type: ignore[attr-defined]
+    function._helion_mlir_host_refusal = metadata_only.refusal  # type: ignore[attr-defined]
     return function  # type: ignore[return-value]
 
 
@@ -209,12 +209,22 @@ class _MetadataOnly:
             arg.arg for arg in (*args.posonlyargs, *args.args, *args.kwonlyargs)
         }
         self.ok = not (args.vararg or args.kwarg)
+        self.refusal: str | None = None
+        """Why :meth:`check` failed: the first top-level statement it refused."""
 
     def check(self, body: list[ast.stmt]) -> bool:
-        try:
-            return self.ok and all(self.statement(stmt) for stmt in body)
-        except RecursionError:
+        if not self.ok:
+            self.refusal = "the kernel takes *args or **kwargs"
             return False
+        try:
+            for stmt in body:
+                if not self.statement(stmt):
+                    self.refusal = ast.unparse(stmt)
+                    return False
+        except RecursionError:
+            self.refusal = "host code nested too deeply to check"
+            return False
+        return True
 
     def statement(self, stmt: ast.stmt) -> bool:
         if isinstance(stmt, ast.Expr):

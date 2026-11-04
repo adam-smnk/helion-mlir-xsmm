@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 import sympy
 import torch
 
+from .. import call_trace
 from .. import native
 from ..execution import compile_entry
 from ..targets import resolve_target
@@ -54,6 +55,8 @@ def mlir_compile_config(
         return run
     run = compile_kernel(bound_kernel.host_function, config, bound_kernel.env)
     bound_kernel._compile_cache[config] = run
+    if call_trace.enabled():
+        call_trace.note_compile(bound_kernel, config, run)
     return run
 
 
@@ -158,6 +161,7 @@ def _native_run(
     qualifies: its first call records a plan (:func:`_plan`); later calls
     whose arguments match it run natively, all others take ``run``. The first
     call decides: one that can't be planned leaves every call on ``run``."""
+    run.__name__ = entry.name  # names it in the call trace
     native_call = getattr(entry, "_native", None)
     if (
         native_call is None
@@ -166,6 +170,9 @@ def _native_run(
         or any(name is None for name, _ in arg_sources)
         or (extension := native.module()) is None
     ):
+        call_trace.set_no_native(
+            run, _no_native_reason(entry, host_function, arg_sources, symbolic_sizes)
+        )
         return run
     names = [name for name, _ in arg_sources]
     defaults = (
@@ -179,6 +186,37 @@ def _native_run(
         )
 
     return extension.KernelRun(run, planner)
+
+
+def _no_native_reason(
+    entry: CompiledEntry,
+    host_function: Callable[..., object],
+    arg_sources: list[tuple[str | None, object]],
+    symbolic_sizes: object,
+) -> str:
+    """Why a compiled kernel gets no ``KernelRun``, for :mod:`~..call_trace`. Loads
+    nothing: a target without native paths must not bring the extension in."""
+    if not entry.target.native_in_place:
+        return f"target {type(entry.target).__name__} has no native call path"
+    if not native.enabled():
+        return "native calls are off (set_native_call, HELION_MLIR_NATIVE_CALL)"
+    if (error := native.load_error()) is not None:
+        return f"the native extension is unavailable: {error}"
+    if getattr(entry, "_native", None) is None:
+        static = getattr(entry, "_static", None)
+        if static is None:
+            return "an entry argument has no static shape"
+        if static.scalars:
+            names = ", ".join(str(host) for _, host in entry.scalar_exprs)
+            return f"the entry takes run-time scalars ({names})"
+        return "the entry has no native call"
+    if symbolic_sizes is not None:
+        return "array sizes are computed from symbols and checked per call"
+    if not getattr(host_function, "_helion_mlir_metadata_only", False):
+        refusal = getattr(host_function, "_helion_mlir_host_refusal", None)
+        return f"host code does more than read metadata: {refusal}"
+    names = [str(expr) for name, expr in arg_sources if name is None]
+    return f"an entry argument is not a host local: {', '.join(names)}"
 
 
 _ScalarTypes = (int, float, bool, str, type(None))
@@ -201,11 +239,14 @@ def _plan(
     tensor (not a default argument), tensor arguments are plain CPU tensors
     and other arguments immutable scalars, scalar ``hl.constexpr`` values or
     functions. Without a plan, every call takes ``run``."""
+    why: list[str] = []
     try:
-        params = _plan_params(args)
-    except Exception:
+        params = _plan_params(args, why)
+    except Exception as exc:
         params = None
+        why.append(f"reading the arguments raised {type(exc).__name__}: {exc}")
     if params is None:
+        call_trace.set_no_plan(run, why[0] if why else "the arguments can't be planned")
         return run(*args)
     host = host_function(*args)
     try:
@@ -213,6 +254,8 @@ def _plan(
         if not all(name in local_vars for name in names):
             # Not a host local after all (run evaluates it): no plan.
             host.close()
+            missing = [name for name in names if name not in local_vars]
+            call_trace.set_no_plan(run, f"not host locals: {', '.join(missing)}")
             return run(*args)
         values = [local_vars[name] for name in names]
         call_entry(entry, values)
@@ -221,16 +264,21 @@ def _plan(
         result = done.value
     else:
         raise AssertionError("the host function yields once")
-    plan = _plan_sources(args, values, result, defaults)
-    if plan is not None:
+    plan = _plan_sources(args, values, result, defaults, names, why)
+    if plan is None:
+        call_trace.set_no_plan(run, why[0] if why else "the plan's sources")
+    else:
         from ..targets.base import MLIRTarget
 
         hooks = (type(entry.target), MLIRTarget.prepare_call, MLIRTarget.finish_call)
         native_run.install(native_call, hooks, params, *plan)  # type: ignore[attr-defined]
+        call_trace.set_plan_params(run, params)
     return result
 
 
-def _plan_params(args: tuple[object, ...]) -> list[tuple[object, ...]] | None:
+def _plan_params(
+    args: tuple[object, ...], why: list[str] | None = None
+) -> list[tuple[object, ...]] | None:
     """Per argument ``(kind, dtype or value, sizes, strides)``: 0 a plain CPU
     tensor, 1 an object compared by identity (a builtin function), 2 a scalar
     (type and ``==``, floats by their bits), 3 an ``hl.constexpr`` of a scalar
@@ -238,35 +286,44 @@ def _plan_params(args: tuple[object, ...]) -> list[tuple[object, ...]] | None:
     function ``(4, function, cell kinds, cell contents)``: its code and its
     closure's contents when planned, each as 1-3 (as Helion keys functions:
     another instance of a model has its own epilogue closures); ``None``: no
-    plan."""
+    plan, with the reason appended to ``why``."""
     import types
 
     from helion.language.constexpr import ConstExpr
 
+    def refuse(index: int, reason: str) -> None:
+        if why is not None:
+            why.append(f"argument {index}: {reason}")
+
     params: list[tuple[object, ...]] = []
-    for arg in args:
+    for index, arg in enumerate(args):
         if type(arg) in (torch.Tensor, torch.nn.Parameter):
             tensor: torch.Tensor = arg  # type: ignore[assignment]
             if tensor.device.type != "cpu" or tensor.layout != torch.strided:
+                refuse(index, f"a {tensor.device.type} or {tensor.layout} tensor")
                 return None
             params.append((0, tensor.dtype, tuple(tensor.shape), tensor.stride()))
         elif type(arg) in _ScalarTypes:
             if arg != arg:  # NaN never matches: no plan
+                refuse(index, "NaN")
                 return None
             params.append((2, arg, (), ()))
         elif type(arg) is ConstExpr and type(arg.value) in _ScalarTypes:  # type: ignore[attr-defined]
             if arg.value != arg.value:  # type: ignore[attr-defined]
+                refuse(index, "hl.constexpr(NaN)")
                 return None
             params.append((3, arg, (), ()))
         elif isinstance(arg, types.FunctionType):
             try:
                 contents = tuple(cell.cell_contents for cell in arg.__closure__ or ())
             except ValueError:  # an empty cell
+                refuse(index, "a function with an empty closure cell")
                 return None
             params.append((4, arg, tuple(map(_value_kind, contents)), contents))
         elif isinstance(arg, types.BuiltinFunctionType):
             params.append((1, arg, (), ()))
         else:
+            refuse(index, f"a {type(arg).__name__}")
             return None
     return params
 
@@ -287,6 +344,8 @@ def _plan_sources(
     values: list[object],
     result: object,
     defaults: tuple[object, ...],
+    names: list[str] | None = None,
+    why: list[str] | None = None,
 ) -> (
     tuple[
         list[tuple[int, int]],
@@ -297,7 +356,8 @@ def _plan_sources(
 ):
     """``(sources, fresh, result)`` for ``KernelRun.install``: per entry
     argument and for the result, ``(0, argument index)`` or ``(1, fresh
-    index)`` (``(0, -1)``: returns None); ``None``: no plan."""
+    index)`` (``(0, -1)``: returns None); ``None``: no plan, with the reason
+    appended to ``why``."""
     from ..execution import _contiguous_strides
 
     fresh: list[torch.Tensor] = []
@@ -331,9 +391,25 @@ def _plan_sources(
             return (1, len(fresh) - 1)
         return None
 
+    def refused(what: str, value: object) -> str:
+        if sum(value is arg for arg in args) > 1:
+            return f"{what}: the same object is passed for two arguments"
+        return (
+            f"{what}: neither exactly one argument nor a fresh contiguous CPU "
+            f"tensor at offset 0 (e.g. a view, or a default argument)"
+        )
+
     sources = [source(value) for value in values]
     result_source = (0, -1) if result is None else source(result)
     if result_source is None or any(s is None for s in sources):
+        if why is not None:
+            why.extend(
+                refused(f"entry argument {names[i] if names else i}", value)
+                for i, (value, s) in enumerate(zip(values, sources, strict=True))
+                if s is None
+            )
+            if result_source is None:
+                why.append(refused("the result", result))
         return None
     return (
         sources,  # type: ignore[return-value]

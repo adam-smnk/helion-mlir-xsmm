@@ -355,6 +355,18 @@ struct Plan {
 
 enum State { kUnplanned = 0, kPlanning = 1, kPlanned = 2, kNoPlan = 3 };
 
+// Which check sent a planned call to the general path (call_trace.py names them).
+// Written on that path only: a native call pays nothing for them.
+enum Refusal {
+  kRefusedArgCount = 0,
+  kRefusedDispatch = 1,
+  kRefusedHooks = 2,
+  kRefusedArgument = 3,  // index: the argument
+  kRefusedEntryArg = 4,  // index: the entry argument (alignment, or its own metadata)
+  kRefusedAliasing = 5,
+  kRefusalKinds = 6,
+};
+
 struct KernelRun {
   PyObject_HEAD
   PyObject* general;  // the Python run(*args)
@@ -364,6 +376,8 @@ struct KernelRun {
   Plan* plan;
   int state;
   unsigned long long native_calls;  // calls that ran natively (tests, profiling)
+  unsigned long long refusals[kRefusalKinds];  // refused calls, per check
+  int last_refusal, last_refusal_index;        // the latest; kind -1: none yet
 };
 
 PyTypeObject KernelRunType = {PyVarObject_HEAD_INIT(nullptr, 0)};
@@ -388,6 +402,7 @@ int KernelRun_init(KernelRun* self, PyObject* args, PyObject*) {
   Py_INCREF(planner);
   self->general = general;
   self->planner = planner;
+  self->last_refusal = -1;
   return 0;
 }
 
@@ -437,17 +452,17 @@ struct View {
   Ints sizes, strides;
 };
 
-// Runs the plan natively for ``args``. Returns a new reference, or nullptr
-// with ``fallback`` set if the call must take the general path (nullptr
-// without it: a Python error).
-PyObject* run_plan(KernelRun* self, PyObject* const* args, Py_ssize_t nargs,
-                   const std::vector<View>* views, const Ints* result_sizes,
-                   bool& fallback) {
-  fallback = true;
+// Why ``args`` can't run the plan, as far as is known before allocating: the
+// checks of run_plan, without running anything or changing the plan's records.
+// Returns the Refusal with ``index`` set, -1 if the checks pass, -2 on a Python
+// error.
+int check_arguments(KernelRun* self, PyObject* const* args, Py_ssize_t nargs,
+                    const std::vector<View>* views, int& index) {
   const Plan* plan = self->plan;
-  if (nargs != static_cast<Py_ssize_t>(plan->params.size()) || !plain_dispatch() ||
-      !default_hooks(self))
-    return nullptr;
+  index = -1;
+  if (nargs != static_cast<Py_ssize_t>(plan->params.size())) return kRefusedArgCount;
+  if (!plain_dispatch()) return kRefusedDispatch;
+  if (!default_hooks(self)) return kRefusedHooks;
   for (Py_ssize_t i = 0; i < nargs; ++i) {
     PyObject* arg = args[i];
     const Param& p = plan->params[i];
@@ -457,16 +472,45 @@ PyObject* run_plan(KernelRun* self, PyObject* const* args, Py_ssize_t nargs,
       if (!THPVariable_CheckExact(arg) ||
           !tensor_matches(THPVariable_Unpack(arg), p.dtype,
                           viewed ? (*views)[i].sizes : p.sizes,
-                          viewed ? (*views)[i].strides : p.strides, 1, ptr))
-        return nullptr;
+                          viewed ? (*views)[i].strides : p.strides, 1, ptr)) {
+        index = static_cast<int>(i);
+        return kRefusedArgument;
+      }
     } else {
       const int same =
           p.kind == kFunction ? same_function(p, arg) : same_value(p.kind, arg, p.value);
-      if (same <= 0) {
-        fallback = same == 0;
-        return nullptr;
+      if (same < 0) return -2;
+      if (same == 0) {
+        index = static_cast<int>(i);
+        return kRefusedArgument;
       }
     }
+  }
+  return -1;
+}
+
+void note_refusal(KernelRun* self, int refusal, int index) {
+  ++self->refusals[refusal];
+  self->last_refusal = refusal;
+  self->last_refusal_index = index;
+}
+
+// Runs the plan natively for ``args``. Returns a new reference, or nullptr
+// with ``fallback`` set if the call must take the general path (nullptr
+// without it: a Python error).
+PyObject* run_plan(KernelRun* self, PyObject* const* args, Py_ssize_t nargs,
+                   const std::vector<View>* views, const Ints* result_sizes,
+                   bool& fallback) {
+  fallback = true;
+  const Plan* plan = self->plan;
+  int refused_index;
+  const int refused = check_arguments(self, args, nargs, views, refused_index);
+  if (refused != -1) {
+    if (refused == -2)
+      fallback = false;
+    else
+      note_refusal(self, refused, refused_index);
+    return nullptr;
   }
   const auto& r = plan->result;
   const bool reshaped = result_sizes && r.first == kFresh;
@@ -492,11 +536,16 @@ PyObject* run_plan(KernelRun* self, PyObject* const* args, Py_ssize_t nargs,
     const Ints own_strides = viewed ? contiguous_strides(own_sizes) : Ints();
     if (!tensor_matches(t, specs[i].dtype, viewed ? own_sizes : specs[i].sizes,
                         viewed ? own_strides : specs[i].strides, entry->alignment,
-                        pointers[i]))
+                        pointers[i])) {
+      note_refusal(self, kRefusedEntryArg, static_cast<int>(i));
       return nullptr;
+    }
   }
   // ``args`` (owned by our caller) and ``fresh`` keep the tensors alive.
-  if (!call_entry(entry, pointers)) return nullptr;
+  if (!call_entry(entry, pointers)) {
+    note_refusal(self, kRefusedAliasing, -1);
+    return nullptr;
+  }
   fallback = false;
   ++self->native_calls;
   if (r.second < 0) Py_RETURN_NONE;
@@ -613,6 +662,38 @@ PyObject* KernelRun_general(KernelRun* self, void*) {
 
 PyObject* KernelRun_native_calls(KernelRun* self, void*) {
   return PyLong_FromUnsignedLongLong(self->native_calls);
+}
+
+// refusals -> (count per Refusal, ...)
+PyObject* KernelRun_refusals(KernelRun* self, void*) {
+  PyObject* out = PyTuple_New(kRefusalKinds);
+  for (int i = 0; out && i < kRefusalKinds; ++i)
+    PyTuple_SET_ITEM(out, i, PyLong_FromUnsignedLongLong(self->refusals[i]));
+  return out;
+}
+
+// last_refusal -> (Refusal, index) or None
+PyObject* KernelRun_last_refusal(KernelRun* self, void*) {
+  if (self->last_refusal < 0) Py_RETURN_NONE;
+  return Py_BuildValue("(ii)", self->last_refusal, self->last_refusal_index);
+}
+
+// check(*args) -> None if the plan's checks on the arguments pass (a call may still
+// be refused on allocation-dependent checks), else (Refusal, index). Runs
+// nothing, records nothing. For explain(): no plan installed raises.
+PyObject* KernelRun_check(KernelRun* self, PyObject* args) {
+  HANDLE_TH_ERRORS
+  if (self->state != kPlanned) {
+    PyErr_SetString(PyExc_RuntimeError, "KernelRun.check: no plan installed");
+    return nullptr;
+  }
+  int index;
+  const int refused = check_arguments(self, &PyTuple_GET_ITEM(args, 0),
+                                      PyTuple_GET_SIZE(args), nullptr, index);
+  if (refused == -2) return nullptr;
+  if (refused == -1) Py_RETURN_NONE;
+  return Py_BuildValue("(ii)", refused, index);
+  END_HANDLE_TH_ERRORS
 }
 
 // --------------------------------------------------------------------------
@@ -753,6 +834,8 @@ PyMethodDef KernelRun_methods[] = {
      "install the plan (from the planner)"},
     {"prepare", reinterpret_cast<PyCFunction>(KernelRun_prepare), METH_VARARGS,
      "prepare(bound, args, varying, views, result_sizes, fallback) -> PreparedRun"},
+    {"check", reinterpret_cast<PyCFunction>(KernelRun_check), METH_VARARGS,
+     "check(*args) -> None or (refusal, index): the plan's checks, running nothing"},
     {nullptr, nullptr, 0, nullptr}};
 
 PyGetSetDef KernelRun_getset[] = {
@@ -760,6 +843,10 @@ PyGetSetDef KernelRun_getset[] = {
     {"general", reinterpret_cast<getter>(KernelRun_general), nullptr, "the Python run", nullptr},
     {"native_calls", reinterpret_cast<getter>(KernelRun_native_calls), nullptr,
      "the number of calls that ran natively", nullptr},
+    {"refusals", reinterpret_cast<getter>(KernelRun_refusals), nullptr,
+     "planned calls sent to the general path, per check", nullptr},
+    {"last_refusal", reinterpret_cast<getter>(KernelRun_last_refusal), nullptr,
+     "(check, index) of the latest refusal, or None", nullptr},
     {nullptr, nullptr, nullptr, nullptr, nullptr}};
 
 PyGetSetDef PreparedRun_getset[] = {

@@ -5,11 +5,13 @@ from __future__ import annotations
 import dataclasses
 import logging
 import numbers
+import struct
 import sys
 import types
 from typing import Callable
 
 from helion.language.constexpr import ConstExpr
+import torch
 
 log = logging.getLogger(__name__)
 
@@ -23,6 +25,7 @@ def install() -> bool:
         from helion._compiler.backend_registry import register_compiler_backend
         from helion.runtime.kernel import BoundKernel
 
+        from helion_mlir_backend._compiler import call_trace
         from helion_mlir_backend._compiler.mlir.aten_bridge.original_args import (
             install_original_args_capture,
         )
@@ -41,8 +44,9 @@ def install() -> bool:
     _keep_runtime_slice_sizes(MLIRBackend)
     _key_function_args_by_globals_and_defaults(MLIRBackend)
     _key_constexpr_by_type_and_bits(MLIRBackend)
-    _bind_kernels_with_constexpr_params(MLIRBackend)
+    _fast_key_functions_and_constexpr(MLIRBackend)
     _check_module_lookups(MLIRBackend)
+    call_trace.install(MLIRBackend)
     install_trace_mode()
     install_original_args_capture()
     return True
@@ -88,7 +92,8 @@ def _keep_runtime_slice_sizes(MLIRBackend: type) -> None:
     from helion._compiler.compile_environment import CompileEnvironment
     from helion._compiler.compile_environment import _has_unbacked
     import sympy
-    
+    import torch
+
     if getattr(CompileEnvironment, "_helion_mlir_runtime_slice_sizes", False):
         return
     original = CompileEnvironment.try_concretize_symint
@@ -249,23 +254,157 @@ def _key_constexpr_by_type_and_bits(MLIRBackend: type) -> None:
     Kernel._base_specialization_key = base_specialization_key
 
 
-def _bind_kernels_with_constexpr_params(MLIRBackend: type) -> None:
-    """Helion's fast key of a plain float has ``0.0 == -0.0``, coarser than the full
-    key of a constexpr-annotated parameter (:func:`_key_constexpr_by_type_and_bits`):
-    such kernels take ``bind()`` on every call."""
+_MAX_FAST_KEYS = 4096
+"""Entries of a kernel's dispatch cache before the function path clears it: a
+float argument that changes per call would otherwise add one entry
+per call, for as long as the kernel lives. A cleared cache costs a ``bind()`` per
+key, nothing else."""
+
+_float_bits = struct.Struct("d").pack
+
+
+class _NoFastKey(Exception):
+    """An argument the fast key doesn't handle: the call takes ``bind()``."""
+
+
+def _scalar_fast_key(value: object) -> object:
+    """A scalar's type and value, floats by their bits (0.0 == -0.0, and NaN
+    differs from itself); ``_NoFastKey`` for anything else."""
+    kind = type(value)
+    if kind is float:
+        return float, _float_bits(value)  # type: ignore[arg-type]
+    if value is None or kind is int or kind is bool or kind is str:
+        return kind, value
+    raise _NoFastKey
+
+
+def _tensor_fast_key(tensor: torch.Tensor) -> object:
+    """The same metadata as ``Kernel._fast_dispatch_key`` for a tensor."""
+    indices = getattr(tensor, "_dynamo_static_indices", None)
+    return (
+        tensor.dtype,
+        tensor.shape,
+        tensor.stride(),
+        tensor.device,
+        None if indices is None else frozenset(indices),
+    )
+
+
+def _cell_fast_key(kernel: object, value: object) -> object:
+    """A closure cell: a number by its type, as in the full key, so a value that
+    changes per call, read at run time, keeps one entry and takes no ``bind()``. What
+    this doesn't know takes Helion's own key of the value."""
+    kind = type(value)
+    if kind is torch.Tensor or kind is torch.nn.Parameter:
+        return _tensor_fast_key(value)  # type: ignore[arg-type]
+    if kind is ConstExpr:
+        return ConstExpr, _scalar_fast_key(value.value)  # type: ignore[attr-defined]
+    if kind is types.FunctionType:
+        return _function_fast_key(kernel, value)  # type: ignore[arg-type]
+    if kind is torch.dtype or kind is torch.device:
+        return value
+    if kind is int or kind is float or kind is bool:
+        return kind
+    if value is None or kind is str:
+        return kind, value
+    key = kernel._specialization_key(value)  # type: ignore[attr-defined]
+    hash(key)  # what bind() raises on takes bind(), which reports it
+    return kind, key
+
+
+def _function_fast_key(kernel: object, fn: types.FunctionType) -> object:
+    """At least what ``function_key`` holds: code, cells, globals and defaults."""
+    closure = fn.__closure__
+    return (
+        fn.__code__,
+        ()
+        if closure is None
+        else tuple([_cell_fast_key(kernel, cell.cell_contents) for cell in closure]),
+        _SameObject(fn.__globals__),
+        tuple(map(_default_key, fn.__defaults__ or ())),
+    )
+
+
+def _extended_fast_key(kernel: object, args: tuple[object, ...]) -> object | None:
+    """``Kernel._fast_dispatch_key`` that also handles functions and
+    ``hl.constexpr`` arguments, part by part at least as fine as the full key:
+    two calls with one key bind to one ``BoundKernel``. ``None``: the call takes
+    ``bind()``, which is always right."""
+    annotations = kernel._annotations  # type: ignore[attr-defined]
+    if len(args) > len(annotations):
+        return None
+    key: list[object] = []
+    has_tensor = False
+    try:
+        for value, annotation in zip(args, annotations, strict=False):
+            kind = type(value)
+            if kind is torch.Tensor or kind is torch.nn.Parameter:
+                if annotation is ConstExpr:  # the full key holds this very tensor
+                    return None
+                has_tensor = True
+                key.append(_tensor_fast_key(value))  # type: ignore[arg-type]
+            elif kind is types.FunctionType:
+                if annotation is ConstExpr:  # the full key holds this very function
+                    return None
+                key.append(_function_fast_key(kernel, value))  # type: ignore[arg-type]
+            elif kind is types.BuiltinFunctionType:
+                if annotation is ConstExpr:
+                    return None
+                key.append(value)
+            elif kind is ConstExpr:
+                key.append((ConstExpr, _scalar_fast_key(value.value)))  # type: ignore[attr-defined]
+            elif kind is torch.dtype or kind is torch.device:
+                key.append(value)
+            else:
+                key.append(_scalar_fast_key(value))
+    except Exception:
+        return None
+    if not has_tensor:
+        return None
+    key.append(kernel._compute_is_distributed(args))  # type: ignore[attr-defined]
+    if kernel._key_fn is not None:  # type: ignore[attr-defined]
+        key.append(kernel._key_fn(*args))  # type: ignore[attr-defined]
+    return tuple(key)
+
+
+def _fast_key_functions_and_constexpr(MLIRBackend: type) -> None:
+    """Give mlir kernels called with a function or ``hl.constexpr`` Helion's fast
+    dispatch: its ``_fast_dispatch_key`` returns ``None`` for them, so every call
+    pays for ``bind()``. Other kernels and other arguments keep Helion's key, except
+    a kernel with a constexpr-annotated parameter: Helion's key of a plain float
+    has ``0.0 == -0.0``, coarser than this backend's full key
+    (:func:`_key_constexpr_by_type_and_bits`)."""
     from helion.runtime.kernel import Kernel
 
     original = Kernel._fast_dispatch_key
-    if getattr(original, "_helion_mlir_constexpr_params", False):
+    if getattr(original, "_helion_mlir_extended", False):
         return
     backend_name = MLIRBackend().name
 
-    def fast_dispatch_key(self: Kernel, args: tuple[object, ...]) -> object:
-        if self.settings.backend == backend_name and ConstExpr in self._annotations:
-            return None
-        return original(self, args)
+    def pure_key(self: Kernel, args: tuple[object, ...]) -> object:
+        """The key of a call, changing nothing (``explain``)."""
+        if self.settings.backend != backend_name:
+            return original(self, args)
+        if ConstExpr in self._annotations:
+            return _extended_fast_key(self, args)
+        key = original(self, args)
+        return _extended_fast_key(self, args) if key is None else key
 
-    fast_dispatch_key._helion_mlir_constexpr_params = True  # type: ignore[attr-defined]
+    def fast_dispatch_key(self: Kernel, args: tuple[object, ...]) -> object:
+        if self.settings.backend != backend_name:
+            return original(self, args)
+        if ConstExpr not in self._annotations:
+            key = original(self, args)
+            if key is not None:
+                return key
+        key = _extended_fast_key(self, args)
+        if key is not None and len(self._dispatch_cache) >= _MAX_FAST_KEYS:
+            self._dispatch_cache.clear()
+        return key
+
+    fast_dispatch_key._helion_mlir_pure = pure_key  # type: ignore[attr-defined]
+    fast_dispatch_key._helion_mlir_extended = True  # type: ignore[attr-defined]
+    fast_dispatch_key._helion_mlir_original = original  # type: ignore[attr-defined]
     Kernel._fast_dispatch_key = fast_dispatch_key
 
 
