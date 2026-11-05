@@ -19,6 +19,10 @@ shorter list -- leaves the parameter to lighthouse's inference:
   transposed B prefetches ``[n, k]`` tiles).
 - ``xegpu_prefetch_depths``: ``[a_nb, b_nb]``, how many K-loop iterations ahead a
   GEMM kernel prefetches A and B.
+- ``xegpu_sfc_walk``: ``True`` for workgroups along a space-filling curve:
+  :data:`SFC_WALK`.
+- ``xegpu_store_write_back``: ``True`` for L1 write-back stores:
+  :data:`STORE_WRITE_BACK`.
 - ``xegpu_nan_ignoring_maxima``: ``True`` for an attention kernel whose row
   maxima may ignore NaN. :data:`NAN_IGNORING_MAXIMA` has the reasoning.
 - ``igc_vectorizer``, not an XeGPU parameter: IGC's vectorizer for the kernel, ``"cmp"``,
@@ -91,6 +95,19 @@ form IGC's vectorizer miscompiles without ``VectorizerAllowCMP=0`` or
 loses them, as a default ``unitrace`` does, gets wrong rows; nothing refuses it at
 compile time. ``tests/test_xpu_igc_workarounds.py`` scans these binaries.
 ``tests/test_xpu_runtime.py`` compares with torch: ``test_attention_nonfinite``."""
+SFC_WALK = "xegpu_sfc_walk"
+"""Per GPU kernel, ``True``: its workgroups take their tiles along a space-filling curve,
+not in the grid's linear order (:mod:`~..mlir_transforms.xegpu_sfc_walk`). The same
+results, by a bijection of a parallel grid. A grid of one line has only the one order;
+a 3D grid or one over ``MAX_WORKGROUPS`` is refused. Whether it helps is measured per
+kernel, not predicted: numbers in AI-bench's ``helion_mlir_xpu_utils.matmul``. Not chosen
+automatically and not searched."""
+STORE_WRITE_BACK = "xegpu_store_write_back"
+"""Per GPU kernel, ``True``: its stores carry L1 and L3 write-back hints, where without
+hints they behave as L1 uncached (measured by time, the same as explicit ``uncached``).
+The same results: the SPIR-V extension's hints can't break the memory model, and each
+launch's event flushes at device scope. Numbers and checks: AI-bench's
+``helion_mlir_xpu_utils.matmul``. Not chosen automatically and not searched."""
 VECTORIZER = "igc_vectorizer"
 """Per GPU kernel: IGC's vectorizer ``"cmp"`` (on but for vector compares, the default,
 ``xpu_transforms.IGC_OPTIONS``) or ``"off"`` (the escape hatch, ``IGC_OPTIONS_OFF``). Not
@@ -131,7 +148,9 @@ _ARITY = {SG_TILES: 2, LOAD_TILES: 4, PREFETCH_TILES: 4, PREFETCH_DEPTHS: 2}
 _ELEMENTWISE_ARITY = {LOAD_TILES: (2, 1)}
 """Other entry lengths: ``[m, n]`` load tiles of 2D elementwise and reduction
 kernels, ``[n]`` of 1D elementwise kernels."""
-XPU_CONFIG_KEYS = frozenset({*_ARITY, NAN_IGNORING_MAXIMA, VECTORIZER, LAYOUTS})
+XPU_CONFIG_KEYS = frozenset(
+    {*_ARITY, NAN_IGNORING_MAXIMA, SFC_WALK, STORE_WRITE_BACK, VECTORIZER, LAYOUTS}
+)
 """The per-kernel config keys of the XPU target: its ``xegpu_*`` parameters, and
 ``igc_vectorizer``, which is IGC's, not XeGPU's."""
 _FIELDS = {
@@ -140,6 +159,8 @@ _FIELDS = {
     PREFETCH_TILES: "prefetch_tiles",
     PREFETCH_DEPTHS: "prefetch_depths",
     NAN_IGNORING_MAXIMA: "nan_ignoring_maxima",
+    SFC_WALK: "sfc_walk",
+    STORE_WRITE_BACK: "store_write_back",
     VECTORIZER: "vectorizer_off",
     LAYOUTS: "layouts",
 }
@@ -158,6 +179,10 @@ class KernelParams:
     prefetch_depths: tuple[int, ...] | None = None
     nan_ignoring_maxima: tuple[int, ...] | None = None
     """``(1,)`` if set, as module attributes hold arrays."""
+    sfc_walk: tuple[int, ...] | None = None
+    """``(1,)`` if set."""
+    store_write_back: tuple[int, ...] | None = None
+    """``(1,)`` if set."""
     vectorizer_off: tuple[int, ...] | None = None
     """``(1,)`` for ``igc_vectorizer="off"``."""
     layouts: tuple[int, ...] | None = None
@@ -182,7 +207,8 @@ class KernelParams:
         return {
             key: value
             for key, value in self.forced().items()
-            if key not in (NAN_IGNORING_MAXIMA, VECTORIZER, LAYOUTS)
+            if key
+            not in (NAN_IGNORING_MAXIMA, SFC_WALK, STORE_WRITE_BACK, VECTORIZER, LAYOUTS)
         }
 
     def annotate_options(self) -> dict[str, object]:
@@ -218,6 +244,8 @@ def xegpu_params(config: Mapping[str, object]) -> tuple[KernelParams, ...]:
         if not isinstance(value, (list, tuple)):
             entry = {
                 NAN_IGNORING_MAXIMA: "True",
+                SFC_WALK: "True",
+                STORE_WRITE_BACK: "True",
                 VECTORIZER: '"cmp" or "off"',
                 LAYOUTS: '"ir" or "lighthouse"',
             }.get(key, f"a list of {_ARITY.get(key)} ints")
@@ -255,7 +283,7 @@ def _entry(key: str, index: int, item: object) -> tuple[int, ...] | None:
                 "per GPU kernel)"
             )
         return (1,) if item == "off" else None
-    if key == NAN_IGNORING_MAXIMA:
+    if key in (NAN_IGNORING_MAXIMA, SFC_WALK, STORE_WRITE_BACK):
         if item is not True:
             raise XeGPUConfigError(
                 f"{key}[{index}]={item!r}: expected True or None (one entry per "
@@ -858,8 +886,7 @@ def columns_first(shape: KernelShape | None) -> bool:
     each of its rows in another DRAM page; columns first, they write
     neighbouring tiles of the same rows, as for the elementwise kernels. Where
     the operands dominate (4096^3, 2048x4096x8192, K = 524288) rows first keeps
-    the operand reuse the configs were tuned for (e.g. ``GEMM_SQUARE``'s waves
-    of half of M). Arc B50, 2026-10-31, e2e, rows -> columns first:
+    the operand reuse the configs were tuned for. Arc B50, 2026-10-31, e2e, rows -> columns first:
     32768x32768x64 256x256 tiles 43.5 -> 25.1 ms (64x256 tiles of 8x64
     subgroups 40.2 -> 16.5 ms); 8192x8192x512 2.65 -> 2.22 ms; 8192x8192x1024 4.29 -> 3.92 ms;
     4096x4096x2048 (the boundary, equal traffic) 1.80 -> 1.70 ms."""

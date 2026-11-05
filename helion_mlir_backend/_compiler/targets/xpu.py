@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import ctypes
 import functools
+import logging
 import operator
 import os
 import re
@@ -53,6 +54,7 @@ from ..mlir.support.debug import XPU_STOP_POINTS
 from ..mlir.support.debug import DebugOptions
 from ..mlir.support.debug import xpu_stop_at
 from ..mlir.support.errors import UnsupportedOperationError
+from ..mlir.support.errors import XeGPUConfigError
 from ..mlir.support.errors import UnsupportedTargetError
 from ..mlir_transforms import partial_tiles
 from ..mlir_transforms import xegpu_layouts
@@ -66,6 +68,7 @@ from ..mlir_transforms.prints import warn_print_is_experimental
 from ..mlir_transforms.row_maxima import restore_nan_propagating_maxima
 from ..mlir_transforms.xegpu_attention_loops import copy_attention_layouts
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
+from ..mlir_transforms.xegpu_sfc_walk import walk_on_curve
 from ..mlir_transforms.xevm_alloca_arrays import alloca_arrays
 from ..mlir_transforms.xevm_bf16_extensions import bf16_extensions_as_shifts
 from ..mlir_transforms.xevm_fabs import fabs_as_integer_min
@@ -86,6 +89,7 @@ from .base import MLIRTarget
 from .base import exit_before_teardown
 from .xpu_checks import check_partial_gemms
 from .xpu_checks import check_xegpu_capabilities
+from .xpu_params import SFC_WALK
 from .xpu_params import XPU_CONFIG_KEYS
 from .xpu_params import KernelParams
 from .xpu_params import attach_params
@@ -110,6 +114,7 @@ _CPU = "target='cpu' (CPU tensors)"
 _NO_PATTERN = "Could not apply any of the defined patterns"
 """Lighthouse's failure when no kernel class (GEMM, attention, reduction, or the
 backend's elementwise class) matches."""
+_LOG = logging.getLogger(__name__)
 _IR_ONLY = "HELION_MLIR_XPU_STOP_AT=xegpu-wg, xevm or xevm-final (IR only)"
 _LLVM_BUILD = (
     "an LLVM built with -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD=SPIRV "
@@ -226,6 +231,8 @@ def _stages(
     if stop_at != "xegpu-wg":
         schedules.extend(
             [
+                ("sfc-walk", _SfcWalk(entry, kernels)),
+                ("store-hints", _StoreWriteBack(entry, kernels)),
                 ("xevm-math", xpu_transforms.extend_math()),
                 ("xevm-math-approx", _ApproximateMath()),
                 ("xevm", xpu_transforms.lower_to_xevm()),
@@ -278,6 +285,53 @@ def _kernels_by_module(
         xpu_transforms.kernel_module_name(entry, index): kernel
         for index, kernel in enumerate(kernels)
     }
+
+
+class _SfcWalk(Stage):
+    """Workgroups along a space-filling curve, for the kernels that ask
+    (:mod:`xegpu_sfc_walk`)."""
+
+    def __init__(self, entry: str, kernels: Sequence[KernelParams]) -> None:
+        self.walked = {
+            xpu_transforms.kernel_module_name(entry, index): index
+            for index, kernel in enumerate(kernels)
+            if kernel.sfc_walk is not None
+        }
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        for name, index in self.walked.items():
+            func = _kernel_func(module, name)
+            try:
+                if not walk_on_curve(func.parent, func):
+                    _LOG.info("%s[%d]: a grid of one line, nothing to walk", SFC_WALK, index)
+            except ValueError as exc:
+                raise XeGPUConfigError(f"{SFC_WALK}[{index}]: {exc}") from exc
+        return module
+
+
+class _StoreWriteBack(Stage):
+    """L1 and L3 write-back hints on the stores of the kernels that ask
+    (``xegpu_store_write_back``)."""
+
+    def __init__(self, entry: str, kernels: Sequence[KernelParams]) -> None:
+        self.names = [
+            xpu_transforms.kernel_module_name(entry, index)
+            for index, kernel in enumerate(kernels)
+            if kernel.store_write_back is not None
+        ]
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        write_back = ir.Attribute.parse("#xegpu.cache_hint<write_back>")
+
+        def visit(op: ir.Operation) -> ir.WalkResult:
+            if op.name in ("xegpu.store_nd", "xegpu.store"):
+                op.attributes["l1_hint"] = write_back
+                op.attributes["l3_hint"] = write_back
+            return ir.WalkResult.ADVANCE
+
+        for name in self.names:
+            _kernel_func(module, name).walk(visit)
+        return module
 
 
 class _BoolCasts(Stage):

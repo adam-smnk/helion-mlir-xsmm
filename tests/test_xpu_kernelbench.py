@@ -259,17 +259,17 @@ def test_kernelbench_problem_lowers_for_xpu(name: str) -> None:
 
 _LAYOUT_32X64 = "sg_data = [32, 64], inst_data = [8, 16]"
 _GEMM_PINS = {
-    # GEMM_SQUARE: 128x512 workgroups of 4x8 subgroups of 32x64, A loaded 32x32
+    # GEMM_SQUARE: 256x256 workgroups of 8x4 subgroups of 32x64, A loaded 32x32
     # and B 16x32 per read (B's 32x32 tile is a [16, 32] block read), inferred
     # prefetches, one K step ahead.
     "1_Square_matrix_multiplication_": {
-        "grid": (32, 8),
-        "sg_layout": "[4, 8]",
+        "grid": (16, 16),
+        "sg_layout": "[8, 4]",
         "a_load": "sg_data = [32, 32], inst_data = [32, 32]",
         "b_load": "sg_data = [32, 64], inst_data = [16, 32]",
         "prefetches": [
-            "sg_layout = [16, 2], sg_data = [8, 16], inst_data = [8, 16]",
-            "sg_layout = [2, 16], sg_data = [16, 32], inst_data = [8, 16]",
+            "sg_layout = [16, 2], sg_data = [16, 16], inst_data = [8, 16]",
+            "sg_layout = [4, 8], sg_data = [8, 32], inst_data = [8, 16]",
         ],
         "prefetch_count": 4,
         "block_reads": {"read_16b_32r16x2c", "read_transform_16b_16r16x2c"},
