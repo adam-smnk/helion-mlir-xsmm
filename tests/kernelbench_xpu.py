@@ -1392,18 +1392,19 @@ derived layouts: ``xegpu_layouts="lighthouse"`` refuses it. Keep in sync with
 LINEAR_TALL_BLOCKS = [128, 512, 32]
 """40's 16384 x 4096 x 4096 (rows at least 4x columns), both cards, inferred layouts.
 Keep in sync with ``LINEAR_TALL_BLOCKS`` in AI-bench's ``linear.py``."""
-_A_LOAD = {"xegpu_load_tiles": [[32, 32, 16, 16]]}
-_NO_PREFETCH = {"xegpu_prefetch_depths": [[0, 0]]}
+_WRITE_BACK = {"xegpu_store_write_back": [True]}
+_A_LOAD = {"xegpu_load_tiles": [[32, 32, 16, 16]], **_WRITE_BACK}
+_NO_PREFETCH = {"xegpu_prefetch_depths": [[0, 0]], **_WRITE_BACK}
 
 
 def _linear_config(m: int, n: int) -> tuple[list[int], dict[str, object]]:
     """Block sizes and keys of ``[M, K] @ [N, K].T``, as AI-bench's ``linear._config``."""
     if m < LINEAR_BLOCKS[0]:
         if xe_cores() >= MANY_XE_CORES:
-            return LINEAR_SKINNY_MANY_CORES_BLOCKS, {}
+            return LINEAR_SKINNY_MANY_CORES_BLOCKS, _WRITE_BACK
         return LINEAR_SKINNY_BLOCKS, _NO_PREFETCH
     if m >= 4 * n:
-        return LINEAR_TALL_BLOCKS, {}
+        return LINEAR_TALL_BLOCKS, _WRITE_BACK
     return LINEAR_BLOCKS, _A_LOAD
 
 
