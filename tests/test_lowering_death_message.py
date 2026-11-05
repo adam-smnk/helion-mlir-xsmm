@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import os
 import signal
 
@@ -39,6 +40,9 @@ class _Target:
 
 def _abort_after_assertion() -> None:
     os.write(2, f"noise\n{ASSERTION}\nmore noise\n".encode())
+    # pytest's handler writes to the session's stderr, not to the child's fd 2: an
+    # abort this test expects would print a "Fatal Python error" in a passing run.
+    faulthandler.disable()
     os.abort()
 
 
