@@ -81,8 +81,8 @@ force-sort-within-sections = true
 
 [tool.codespell]
 # "inout": a tensor argument the kernel reads and writes (entry-function role);
-# "olt": MLIR's ordered less-than predicate.
-ignore-words-list = "inout,inouts,olt"
+# "olt": MLIR's ordered less-than predicate; "statics": a slice's static offsets or sizes.
+ignore-words-list = "inout,inouts,olt,statics"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
