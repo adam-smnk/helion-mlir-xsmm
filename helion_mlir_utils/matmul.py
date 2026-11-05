@@ -1894,6 +1894,84 @@ _BMM_TILES = (1, 128, 256, 128)
 _BMM_KERNELS: dict[tuple[int, ...], helion.Kernel] = {}
 
 
+def _bmm_batched(a: Tensor, b: Tensor, out: Tensor) -> Tensor:
+    """Batched bf16 ``a @ b`` with the batch a grid dim, into ``out``: each tile packs its
+    K chunks into AMX's VNNI layouts, as :func:`_matmul_fused_pack`."""
+    batch, m, k = a.shape
+    n = b.size(2)
+    k = hl.specialize(k)
+    hl.specialize(b.size(1))
+    for tile_b, tile_m, tile_n in hl.tile([batch, m, n]):
+        acc = hl.zeros([tile_b, tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            a_tile = a[tile_b, tile_m, tile_k]
+            b_tile = b[tile_b, tile_k, tile_n]
+            a4 = a_tile.reshape(
+                a_tile.size(0), a_tile.size(1), a_tile.size(2) // 2, 2
+            )
+            b4 = b_tile.reshape(
+                b_tile.size(0), b_tile.size(1) // 2, 2, b_tile.size(2)
+            ).permute(0, 1, 3, 2)
+            acc = acc + torch.einsum("bmcv,bcnv->bmn", a4, b4)
+        out[tile_b, tile_m, tile_n] = acc.to(a.dtype)
+    return out
+
+
+_BMM_MAX_K_CHUNK = 512
+"""K elements per chunk of :func:`_bmm_batched`. EMR, 64 threads, warm caches, GFLOPS at
+chunks of 256, 512 and 1024: 128x512x1024x2048 29000, 33200, 22300; 128x1024x1024x1024 at
+256 and 512 28700, 32900; 256x256x256x1024 at 256 and 512 35300, 39500."""
+
+
+_BMM_MAX_ACC_BYTES = 1 << 20
+"""Bytes of a tile's f32 accumulator: half of an EMR core's L2. Under AI-bench's cache flush
+between reps, 128x512x1024x2048, GFLOPS at glibc and TCMalloc: 512x512 tiles 28854, 29295;
+512x1024 26283, 26993; 256x512 26887, 27385; ``torch.bmm`` 21138, 27686."""
+_BMM_MIN_BATCH = 4
+"""Slices below which the per-slice kernels stay. EMR, 64 threads, us, batched against per
+slice: 4x512x1024x2048 241, 467; 4x2048x2048x2048 1622, 1600; 3x2048x2048x2048 1568, 1199;
+1x256x256x1024 597, 55."""
+
+
+def _bmm_batched_tiles(batch: int, m: int, n: int, k: int) -> tuple[int, ...] | None:
+    """Block sizes of :func:`_bmm_batched`: a whole slice per tile, the larger of rows and
+    columns halved until each thread has a tile and the accumulator fits
+    :data:`_BMM_MAX_ACC_BYTES`, or the tile is one AMX block; K in chunks up to
+    :data:`_BMM_MAX_K_CHUNK`. ``None`` for few slices (:data:`_BMM_MIN_BATCH`) or where the
+    tiles wouldn't be whole AMX blocks.
+
+    EMR, 64 threads, warm caches, us, batched, per slice, ``torch.bmm``: 16x512x1024x2048
+    821, 1701, 1253; 8x2048x2048x2048 3197, 4647, 5330."""
+    threads = int(os.environ.get("OMP_NUM_THREADS", os.cpu_count() or 1))
+    if (
+        threads < 1
+        or batch < _BMM_MIN_BATCH
+        or m % BLOCK_M
+        or n % BLOCK_N
+        or k % (2 * BLOCK_K)
+    ):
+        return None
+    tile_m, tile_n = m, n
+    while (
+        batch * (m // tile_m) * (n // tile_n) < threads
+        or tile_m * tile_n * 4 > _BMM_MAX_ACC_BYTES
+    ):
+        if tile_n >= tile_m and tile_n % (2 * BLOCK_N) == 0:
+            tile_n //= 2
+        elif tile_m % (2 * BLOCK_M) == 0:
+            tile_m //= 2
+        elif tile_n % (2 * BLOCK_N) == 0:
+            tile_n //= 2
+        else:
+            break  # Idle threads cost less than a parallel kernel per small slice.
+    if tile_m == BLOCK_M and tile_n == BLOCK_N:
+        # K in chunks on a tile of one AMX block doesn't reach AMX: 8x32x32x1024 585 us,
+        # K whole 26, a kernel per slice 177. Tiles of two blocks: 27-30.
+        return (1, tile_m, tile_n, k)
+    chunk = next(c for c in range(_BMM_MAX_K_CHUNK, 0, -2 * BLOCK_K) if k % c == 0)
+    return (1, tile_m, tile_n, chunk)
+
+
 def _divisor_tile(extent: int, largest: int) -> int | None:
     """The largest of ``largest``, its halves down to 32, that divides ``extent``."""
     tile = largest
@@ -1932,14 +2010,13 @@ def _bmm_f32(a: Tensor, b: Tensor) -> Tensor | None:
 def bmm(a: Tensor, b: Tensor) -> Tensor:
     """Batched ``A @ B``.
 
-    bf16: each batch slice is contracted by its own fully parallel kernel call,
-    written in place into the batched result (a single kernel with the batch
-    threaded through the pack + contract kernels was ~30% slower at
-    3x2048^3). f32: one kernel with the batch as a grid dim, operands read in
-    place (:func:`_bmm_direct`). 3x2048^3 on 64 threads, one OpenMP runtime
-    (``env.sh cpu-bench``): 8.00 ms; per-slice blocked kernels, packing both
-    operands per slice, stacked by ``torch.stack``: 11.49 ms; eager 7.36 ms.
-    Tiles that do not divide the problem fall back to the per-slice path.
+    bf16: one kernel with the batch as a grid dim, each tile packing its K chunks
+    (:func:`_bmm_batched_tiles`); shapes it can't tile take a fully parallel kernel per
+    slice, written in place into the batched result. f32: one kernel with the batch as a
+    grid dim, operands read in place (:func:`_bmm_direct`). 3x2048^3 on 64 threads, one
+    OpenMP runtime (``env.sh cpu-bench``): 8.00 ms; per-slice blocked kernels, packing
+    both operands per slice, stacked by ``torch.stack``: 11.49 ms; eager 7.36 ms. Tiles
+    that do not divide the problem fall back to the per-slice path.
     """
     batch, m, k = a.shape
     if b.dim() != 3 or b.shape[0] != batch or b.shape[1] != k:
@@ -1951,6 +2028,16 @@ def bmm(a: Tensor, b: Tensor) -> Tensor:
     if a.dtype == torch.bfloat16 and min(m, n) >= BLOCK_M and k >= 2 * BLOCK_K:
         a, b = a.contiguous(), b.contiguous()
         out = output_pool.empty((batch, m, n), dtype=a.dtype, device=a.device)
+        tiles = _bmm_batched_tiles(batch, m, n, k)
+        if tiles is not None:
+            if tiles not in _BMM_KERNELS:
+                _BMM_KERNELS[tiles] = helion.kernel(
+                    _bmm_batched,
+                    backend="mlir",
+                    static_shapes=True,
+                    config=helion.Config(block_sizes=list(tiles)),
+                )
+            return _BMM_KERNELS[tiles](a, b, out)
         for i in range(batch):
             bound, consts = _matmul_fused_pack_bound(
                 a[i], b[i], None, identity_epilogue, False, False, out[i]

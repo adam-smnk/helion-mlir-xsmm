@@ -102,3 +102,79 @@ def test_bmm_rejects_mismatched_operands(
     b = torch.randn(*b_shape, dtype=dtype)
     with pytest.raises(RuntimeError, match="batch2"):
         mm.bmm(a, b)
+
+
+@pytest.mark.parametrize(
+    ("shape", "tiles"),
+    [
+        ((8, 64, 128, 256), (1, 64, 128, 256)),  # whole slices, K in one chunk
+        ((4, 64, 64, 128), (1, 64, 64, 128)),  # the fewest slices it takes
+        ((3, 64, 64, 128), None),  # fewer: a kernel per slice
+        ((8, 65, 128, 256), None),  # rows of no whole AMX block
+        ((8, 64, 129, 256), None),  # columns of none
+        ((8, 64, 128, 250), None),  # K of none
+    ],
+    ids=["batched", "min_batch", "few_slices", "ragged_m", "ragged_n", "ragged_k"],
+)
+def test_bmm_bf16_gate(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, ...],
+    tiles: tuple[int, ...] | None,
+) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", "4")
+    assert mm._bmm_batched_tiles(*shape) == tiles
+
+
+@pytest.mark.parametrize(
+    ("threads", "shape", "tiles"),
+    [
+        ("64", (8, 512, 1024, 2048), (1, 256, 256, 512)),
+        ("64", (128, 512, 1024, 2048), (1, 512, 512, 512)),  # the accumulator's limit
+        ("64", (128, 1024, 1024, 1024), (1, 512, 512, 512)),
+        ("64", (4, 32, 32, 64), (1, 32, 32, 64)),  # no tile left to halve: threads idle
+        # One AMX block per tile keeps K whole: in chunks it doesn't reach AMX.
+        ("16", (4, 64, 32, 1024), (1, 32, 32, 1024)),
+        ("64", (8, 32, 32, 1024), (1, 32, 32, 1024)),
+        ("64", (8, 64, 64, 1024), (1, 32, 32, 1024)),
+        ("64", (8, 128, 128, 1024), (1, 64, 32, 512)),  # two blocks: chunks reach AMX
+    ],
+)
+def test_bmm_bf16_tiles_give_each_thread_one(
+    monkeypatch: pytest.MonkeyPatch,
+    threads: str,
+    shape: tuple[int, ...],
+    tiles: tuple[int, ...] | None,
+) -> None:
+    monkeypatch.setenv("OMP_NUM_THREADS", threads)
+    assert mm._bmm_batched_tiles(*shape) == tiles
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [(8, 64, 128, 256), (4, 64, 64, 128), (6, 96, 160, 192), (8, 32, 32, 1024)],
+    ids=["whole", "min_batch", "not_powers_of_two", "one_block"],
+)
+def test_bmm_bf16_batched_is_the_per_slice_result(
+    monkeypatch: pytest.MonkeyPatch, shape: tuple[int, ...]
+) -> None:
+    """Every slice, against the per-slice kernels and float64."""
+    batch, m, n, k = shape
+    generator = torch.Generator().manual_seed(batch * m)
+    a = torch.randn(batch, m, k, generator=generator, dtype=torch.float64)
+    b = torch.randn(batch, k, n, generator=generator, dtype=torch.float64)
+    a16, b16 = a.to(torch.bfloat16), b.to(torch.bfloat16)
+    tiles = mm._bmm_batched_tiles(batch, m, n, k)
+    assert tiles is not None
+    mm._BMM_KERNELS.pop(tiles, None)
+    # Different slices must reach different outputs: a wrong batch index shows.
+    out = mm.bmm(a16, b16).clone()
+    assert tiles in mm._BMM_KERNELS, "the batched kernel didn't run"
+    reference = torch.bmm(a16.double(), b16.double())
+    assert _error(out, reference) < 2e-2
+    for i in range(batch):
+        assert _error(out[i : i + 1], reference[i : i + 1]) < 2e-2
+    with monkeypatch.context() as patch:
+        patch.setattr(mm, "_bmm_batched_tiles", lambda *_: None)
+        per_slice = mm.bmm(a16, b16).clone()
+    assert _error(out, per_slice.double()) < 2e-2
+
