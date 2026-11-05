@@ -60,7 +60,7 @@ class MLIRBackend(Backend):
     def supports_config_key(self, key: str) -> bool:
         """Only block sizes shape the generated IR; ``mlir_pipeline`` picks the
         target's lighthouse pipeline (default on the CPU: ``HELION_MLIR_PIPELINE``,
-        else ``opt``). Each target's lowering keys are
+        else ``opt``). Each target's lowering keys (``xegpu_*`` on the XPU) are
         accepted on every device: the other targets ignore them."""
         return key in _CONFIG_KEYS or key in target_config_keys()
 

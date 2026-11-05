@@ -19,7 +19,9 @@ from torch._subclasses import FakeTensorMode
 from tests.inputs import same_values
 
 from helion_mlir_backend import generate_mlir
+from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler.mlir.backend import MLIRBackend
+from helion_mlir_backend._compiler.targets import xpu as xpu_target
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -84,6 +86,46 @@ def visits(owner: object, *names: str, limit: int) -> Iterator[dict[str, int]]:
     finally:
         for started in patches:
             started.stop()
+
+
+def xpu_tensor(*shape: int, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """A fake XPU tensor: generating and lowering XPU IR needs no XPU."""
+    with _FAKE_MODE:
+        return torch.empty(*shape, dtype=dtype, device="xpu")
+
+
+def lower_xpu(
+    kernel: helion.Kernel, args: list[object], stop_at: str = "xegpu-wg"
+) -> str:
+    """The IR of ``kernel`` for ``args`` lowered for the XPU to ``stop_at``."""
+    return str(lower_mlir(kernel, list(args), target="xpu", stop_at=stop_at))
+
+
+def lower_xpu_stages(
+    kernel: helion.Kernel, args: list[object], *, config: helion.Config | None = None
+) -> tuple[str, str]:
+    """The IR of ``kernel`` for ``args`` lowered for the XPU to ``xegpu-wg`` and to
+    ``xevm``, from one trace and one lowering: the ``xegpu-wg`` IR is the module
+    after that stage on the way to ``xevm`` (the stages of a lowering to
+    ``xegpu-wg`` and the IR are the same). The lowering runs in this process (no
+    compile timeout), so tests using this are ``isolated``."""
+    stages: dict[str, str] = {}
+    apply_stage = xpu_target._apply_stage
+
+    def record(name: str, stage: object, module: ir.Module, dump: bool) -> ir.Module:
+        module = apply_stage(name, stage, module, dump)
+        if name == "xegpu-wg":
+            stages[name] = str(module)
+        return module
+
+    with (
+        patch.dict(os.environ, {"HELION_MLIR_COMPILE_TIMEOUT": "0"}),
+        patch.object(xpu_target, "_apply_stage", record),
+    ):
+        lowered = lower_mlir(
+            kernel, list(args), config=config, target="xpu", stop_at="xevm"
+        )
+    return stages["xegpu-wg"], str(lowered)
 
 
 def execute_module(module: object, *tensors: torch.Tensor, kernel_name: str) -> object:

@@ -58,7 +58,7 @@ class MLIRTarget(abc.ABC):
     """
 
     name: ClassVar[str]
-    """The target's name (``cpu``); also part of JIT and autotune cache keys."""
+    """``cpu`` or ``xpu``; also part of JIT and autotune cache keys."""
     pipelines: ClassVar[tuple[str, ...]]
     """The names of the target's lighthouse pipelines."""
     config_keys: ClassVar[frozenset[str]] = frozenset()
@@ -74,7 +74,7 @@ class MLIRTarget(abc.ABC):
 
     def resolve_pipeline(self, pipeline: str | None) -> str:
         """``pipeline``, or the default one for ``None``; ``ValueError`` if the
-        target has no such pipeline."""
+        target has no such pipeline (e.g. a config's CPU pipeline on the XPU)."""
         if pipeline is None:
             return self.default_pipeline()
         if pipeline not in self.pipelines:

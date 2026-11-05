@@ -23,8 +23,8 @@ def generate_mlir(
     """Lower a Helion kernel to an MLIR Linalg-on-Tensors module.
 
     The module holds one private tensor function per phase and a public
-    memref-ABI entry function named after the kernel. ``target`` (``"cpu"``;
-    default: ``HELION_MLIR_TARGET``, else the device of ``args``)
+    memref-ABI entry function named after the kernel. ``target`` (``"cpu"`` or
+    ``"xpu"``; default: ``HELION_MLIR_TARGET``, else the device of ``args``)
     names the device target the module is generated for.
     """
     from helion._compiler.backend_registry import get_backend_class
@@ -50,7 +50,7 @@ def compile_mlir(
 
     The callable has the kernel's signature and Helion semantics: it runs the
     kernel's host code on each call and returns the kernel's return value.
-    ``target`` (``"cpu"``; default: ``HELION_MLIR_TARGET``, else the
+    ``target`` (``"cpu"`` or ``"xpu"``; default: ``HELION_MLIR_TARGET``, else the
     device of ``args``) names the device target. ``pipeline`` is one of the
     target's pipelines; on the CPU ``"opt"`` or ``"scalar"`` (default:
     ``HELION_MLIR_PIPELINE``, else ``"opt"``).
@@ -74,9 +74,13 @@ def lower_mlir(
     without JIT-compiling it: the IR a call would run, or an earlier stage of it.
 
     ``target`` and ``pipeline`` as for :func:`compile_mlir` (``pipeline``
-    defaults to the config's ``mlir_pipeline``, then the target's). ``stop_at`` is
-    a stage of the target's lowering; default: the full lowering (the LLVM dialect
-    on the CPU). Unsupported kernels raise ``UnsupportedOperationError``.
+    defaults to the config's ``mlir_pipeline``, then the target's; the config's
+    ``xegpu_*`` keys apply on the XPU). ``stop_at`` is
+    a stage of the target's lowering: on the XPU ``"xegpu-wg"`` (annotated
+    XeGPU), ``"xevm"`` (LLVM/XeVM, no device binary), ``"xevm-final"`` (the same after
+    the workaround stages: what becomes the binary) or ``"binary"``; default:
+    ``HELION_MLIR_XPU_STOP_AT`` on the XPU, else the full lowering (the LLVM
+    dialect on the CPU). Unsupported kernels raise ``UnsupportedOperationError``.
     """
     from helion._compiler.backend_registry import get_backend_class
 

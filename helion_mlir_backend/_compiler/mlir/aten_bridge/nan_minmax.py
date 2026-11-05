@@ -5,7 +5,7 @@ compare-and-select pairs that pick the bound for a NaN input:
 ``select(cmpf ult x, lo, lo, x)`` and ``select(cmpf ugt x, hi, hi, x)``
 (``torch.clamp(nan, -1, 1)`` gives -1), and ``aten.maximum`` / ``aten.minimum``
 to ``select(cmpf ogt a, b, a, b)``, which gives ``b`` for a NaN ``a``. Torch's
-minima and maxima propagate NaN from any operand.
+minima and maxima propagate NaN from any operand. On the CPU and the XPU alike.
 
 Only the helpers of :data:`NAN_PROPAGATING_OPS` are rewritten: in them, every
 ``select(cmpf P a, b, X, Y)`` with ``{X, Y} = {a, b}`` and an ordering predicate
@@ -21,6 +21,9 @@ a NaN operand now gives NaN:
   ordered and unordered forms are swapped, so a NaN input is picked;
 - otherwise (two runtime values) a NaN of the other operand is selected
   after the pair: ``select(cmpf uno v, v, v, r)``.
+
+On the XPU, IGC would still saturate a clamp to ``[0, 1]`` written this way,
+which loses NaN: see ``xevm_unit_clamps``.
 """
 
 from __future__ import annotations

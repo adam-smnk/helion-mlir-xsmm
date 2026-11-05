@@ -14,6 +14,7 @@ from helion_mlir_backend import generate_mlir
 from helion_mlir_backend._compiler import execution
 from helion_mlir_backend._compiler.mlir.support import UnsupportedTargetError
 from helion_mlir_backend._compiler.targets import CpuTarget
+from helion_mlir_backend._compiler.targets import XpuTarget
 from helion_mlir_backend._compiler.targets import get_target
 from helion_mlir_backend._compiler.targets import resolve_target
 from helion_mlir_backend._compiler.targets.cpu import cpu_name
@@ -62,15 +63,21 @@ def test_cpu_target_describes_todays_cpu_flow(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_pipelines_and_stop_points_belong_to_their_target() -> None:
-    cpu = get_target("cpu")
+    cpu, xpu = get_target("cpu"), get_target("xpu")
     assert cpu.resolve_pipeline(None) == "opt"
     assert cpu.resolve_pipeline("scalar") == "scalar"
+    assert xpu.resolve_pipeline(None) == "xegpu"
     with pytest.raises(ValueError, match="pipeline 'xegpu' for the MLIR target 'cpu'"):
         cpu.resolve_pipeline("xegpu")
+    with pytest.raises(ValueError, match="pipeline 'opt' for the MLIR target 'xpu'"):
+        xpu.resolve_pipeline("opt")
     cpu.check_stop_at(None)
     with pytest.raises(ValueError, match="stop point 'xevm' for the MLIR target 'cpu'"):
         cpu.check_stop_at("xevm")
+    xpu.check_stop_at("xevm")
     assert cpu.is_full(None)
+    assert xpu.is_full("binary")
+    assert not xpu.is_full("xegpu-wg")
 
 
 @pytest.mark.parametrize("value", ["cpu", "auto", ""])
@@ -93,7 +100,7 @@ def test_unknown_target_in_environment_is_rejected(
 def test_explicit_target_overrides_environment_and_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("HELION_MLIR_TARGET", "gpu")
+    monkeypatch.setenv("HELION_MLIR_TARGET", "xpu")
     assert resolve_target(META, "cpu").name == "cpu"
     assert resolve_target(CPU, "auto").name == "cpu"
 
@@ -101,6 +108,22 @@ def test_explicit_target_overrides_environment_and_device(
 def test_unknown_target_name_is_rejected() -> None:
     with pytest.raises(ValueError, match="unknown MLIR target 'gpu'"):
         resolve_target(CPU, "gpu")
+
+
+@pytest.mark.parametrize("how", ["override", "environment", "device"])
+def test_xpu_resolves_to_the_xpu_target(
+    monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    if how == "environment":
+        monkeypatch.setenv("HELION_MLIR_TARGET", "xpu")
+    if how == "override":
+        target = resolve_target(CPU, "xpu")
+    else:
+        target = resolve_target(torch.device("xpu") if how == "device" else CPU)
+    assert isinstance(target, XpuTarget)
+    assert target is get_target("xpu")
+    assert target.name == "xpu"
+    assert resolve_target(META, "xpu") is target
 
 
 def test_unknown_device_is_rejected() -> None:
@@ -161,7 +184,7 @@ def test_compile_mlir_for_the_cpu_target(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(CpuTarget, "prepare_call", hook("prepare"))
     monkeypatch.setattr(CpuTarget, "finish_call", hook("finish"))
     # The explicit target wins over the environment's.
-    monkeypatch.setenv("HELION_MLIR_TARGET", "gpu")
+    monkeypatch.setenv("HELION_MLIR_TARGET", "xpu")
     x, y = torch.randn(64, 64), torch.randn(64, 64)
     run = compile_mlir(_kernel(), [x, y], target="cpu", pipeline="scalar")
     torch.testing.assert_close(run(x, y), x * 2.0 + y)

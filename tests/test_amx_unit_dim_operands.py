@@ -1,6 +1,7 @@
 """AMX contraction operands read through views with unit dims.
 
-A split-K GEMM (``_matmul_split_k``, below) contracts a
+AI-bench's XPU split-K GEMM (``_matmul_split_k`` in
+``backends/utils/helion_mlir_xpu_utils/matmul.py``, copied below) contracts a
 chunk ``a[tm, ts.begin, tk].unsqueeze(0)`` of a ``[M, S, Kc]`` view of A with
 a 3-D ``hl.dot``: a ``linalg.batch_matmul`` of an ``expand_shape`` of the
 ``M x 1 x Kc`` slice. Register-tiled for AMX on the CPU, the LHS tiles are
@@ -59,7 +60,8 @@ amx_host_only = pytest.mark.skipif(not _HAS_AMX, reason="executes AMX code")
 
 
 # --- The kernel ---------------------------------------------------------------
-# The form of a GEMM split along K (backend tests do not import AI-bench).
+# Copied from AI-bench's backends/utils/helion_mlir_xpu_utils/matmul.py
+# (backend tests do not import AI-bench).
 
 
 def _matmul_split_k(a: Tensor, b: Tensor) -> Tensor:

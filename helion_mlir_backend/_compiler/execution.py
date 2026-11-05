@@ -483,7 +483,8 @@ def compile_entry(
     """Inline, lower and JIT-compile ``entry`` (consumes ``module``) for ``target``
     (default: :func:`resolve_target` for the CPU), or reuse the entry compiled from
     an identical module for the same target and pipeline. ``pipeline`` defaults to
-    the target's. A target whose lowerings stop early by default lowers and raises :class:`LoweringStoppedError`."""
+    the target's. A target whose lowerings stop early by default (e.g.
+    ``HELION_MLIR_XPU_STOP_AT``) lowers and raises :class:`LoweringStoppedError`."""
     if target is None:
         target = resolve_target()
     pipeline = target.resolve_pipeline(pipeline)

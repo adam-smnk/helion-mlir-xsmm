@@ -1,5 +1,5 @@
 """Inner loops bounded by an enclosing tile's position (non-rectangular iteration):
-results on the CPU, including partial tiles."""
+results on the CPU, including partial tiles, and which of them XPU takes as full."""
 
 from __future__ import annotations
 
@@ -11,6 +11,8 @@ import pytest
 import torch
 
 from tests.harness import check_kernel
+from tests.harness import lower_xpu
+from tests.harness import xpu_tensor
 
 from helion_mlir_backend._compiler.mlir.analysis.index_facts import IndexFacts
 from helion_mlir_backend._compiler.mlir.analysis.index_facts import index_facts
@@ -125,6 +127,23 @@ def test_loop_to_a_minimum_runs_no_key_past_it() -> None:
         lambda a, *_: _expected(a, 16, lambda _, end: (0, min(end, 24))),
         [x, hl.constexpr(24)],
     )
+
+
+def behind_any_row(x: torch.Tensor, window: hl.constexpr) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm in hl.tile(x.size(0)):
+        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
+        for tn in hl.tile(tm.begin - window, tm.end):
+            acc = acc + x[tn, :].sum(0)[None, :]
+        out[tm, :] = acc
+    return out
+
+
+def test_a_lower_bound_that_may_be_negative_is_refused() -> None:
+    """Regression: the first row tiles read before the tensor, with no error and
+    wrong rows (the XPU refused it, as a partial tile)."""
+    with pytest.raises(UnsupportedOperationError, match="before the tensor"):
+        _kernel(behind_any_row, 16, 8)(torch.randn(64, 16), hl.constexpr(16))
 
 
 def test_a_lower_bound_proven_in_the_tensor_is_not_refused() -> None:
@@ -436,6 +455,78 @@ def test_bounds_the_facts_cannot_prove_stay_refused(fn: object) -> None:
         _kernel(fn, 16, 8)(torch.randn(64, 8))
 
 
+def attention_like(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """A matmul per key tile up to the row tile's end."""
+    out = torch.empty_like(q)
+    for tm in hl.tile(q.size(0)):
+        acc = hl.zeros([tm, q.size(1)], dtype=torch.float32)
+        for tn in hl.tile(tm.end):
+            scores = hl.zeros([tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("md,nd->mn", q[tm, :], k[tn, :])
+            acc = acc + torch.einsum("mn,nd->md", scores.to(k.dtype), k[tn, :])
+        out[tm, :] = acc.to(out.dtype)
+    return out
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("rows", "keys", "blocks"),
+    [
+        (512, 512, (128, 96)),  # the row tile's end is no multiple of the key tile
+        (512, 256, (128, 64)),  # the row tiles pass the keys' extent
+    ],
+    ids=["no-multiple", "past-the-tensor"],
+)
+def test_xpu_refuses_tiles_it_cannot_prove_full(
+    rows: int, keys: int, blocks: tuple[int, ...]
+) -> None:
+    """Negative: full tiles are proven, not assumed; no masked loads on XPU."""
+    args = [
+        xpu_tensor(rows, 64, dtype=torch.bfloat16),
+        xpu_tensor(keys, 64, dtype=torch.bfloat16),
+    ]
+    with pytest.raises(UnsupportedOperationError, match="partial tiles"):
+        lower_xpu(_kernel(attention_like, *blocks), args)
+
+
+def behind_without_a_clamp(q: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
+    """Starts before K for the first row tiles."""
+    out = torch.empty_like(q)
+    for tm in hl.tile(q.size(0)):
+        acc = hl.zeros([tm, q.size(1)], dtype=torch.float32)
+        for tn in hl.tile(tm.begin - 128, tm.end):
+            scores = hl.zeros([tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("md,nd->mn", q[tm, :], k[tn, :])
+            acc = acc + torch.einsum("mn,nd->md", scores.to(k.dtype), k[tn, :])
+        out[tm, :] = acc.to(out.dtype)
+    return out
+
+
+@pytest.mark.isolated
+def test_xpu_refuses_a_lower_bound_that_may_be_negative() -> None:
+    """Negative: multiples of the tile, but no proof that it stays in the tensor."""
+    args = [xpu_tensor(512, 64, dtype=torch.bfloat16)] * 2
+    with pytest.raises(UnsupportedOperationError, match="before the tensor"):
+        lower_xpu(_kernel(behind_without_a_clamp, 128, 64), args)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("fn", "blocks"),
+    [(from_grid, (64, 32)), (from_runtime_grid, (64, 32)), (top_level_grid, (32,))],
+    ids=["grid", "runtime-grid", "top-level-grid"],
+)
+def test_xpu_refuses_a_grid_that_may_start_below_zero(
+    fn: object, blocks: tuple[int, ...]
+) -> None:
+    """Regression of the CPU's silent reads before the tensor, on the XPU path."""
+    args: list[object] = [xpu_tensor(256, 64, dtype=torch.float32)]
+    if fn is from_runtime_grid:
+        args.append(-1)
+    with pytest.raises(UnsupportedOperationError, match="before the tensor"):
+        lower_xpu(_kernel(fn, *blocks), args)
+
+
 # --- index_facts ---------------------------------------------------------------------
 
 
@@ -491,20 +582,3 @@ _LEAF = IndexFacts(64, 0, 448)
 )
 def test_index_facts(build: object, expected: IndexFacts) -> None:
     assert _facts_of(build, _LEAF) == expected
-
-
-def behind_any_row(x: torch.Tensor, window: hl.constexpr) -> torch.Tensor:
-    out = torch.empty_like(x)
-    for tm in hl.tile(x.size(0)):
-        acc = hl.zeros([tm, x.size(1)], dtype=x.dtype)
-        for tn in hl.tile(tm.begin - window, tm.end):
-            acc = acc + x[tn, :].sum(0)[None, :]
-        out[tm, :] = acc
-    return out
-
-
-def test_a_lower_bound_that_may_be_negative_is_refused() -> None:
-    """Regression: the first row tiles read before the tensor, with no error and
-    wrong rows."""
-    with pytest.raises(UnsupportedOperationError, match="before the tensor"):
-        _kernel(behind_any_row, 16, 8)(torch.randn(64, 16), hl.constexpr(16))

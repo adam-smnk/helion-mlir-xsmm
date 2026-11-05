@@ -13,6 +13,7 @@ from ..mlir.support.debug import target_override
 from ..mlir.support.errors import UnsupportedTargetError
 from .base import MLIRTarget
 from .cpu import CpuTarget
+from .xpu import XpuTarget
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CpuTarget",
     "MLIRTarget",
+    "XpuTarget",
     "get_target",
     "resolve_target",
     "target_config_keys",
@@ -29,9 +31,10 @@ __all__ = [
 
 _FACTORIES: dict[str, Callable[[], MLIRTarget] | None] = {
     "cpu": CpuTarget,
+    "xpu": XpuTarget,
 }
-_TARGET_CLASSES: tuple[type[MLIRTarget], ...] = (CpuTarget,)
-_DEVICE_TARGETS = {"cpu": "cpu"}
+_TARGET_CLASSES: tuple[type[MLIRTarget], ...] = (CpuTarget, XpuTarget)
+_DEVICE_TARGETS = {"cpu": "cpu", "xpu": "xpu"}
 """The target of each ``torch.device`` type under ``auto``."""
 _INSTANCES: dict[str, MLIRTarget] = {}
 
@@ -42,7 +45,7 @@ def target_config_keys() -> frozenset[str]:
 
 
 def get_target(name: str) -> MLIRTarget:
-    """The target named ``name`` (``cpu``)."""
+    """The target named ``name`` (``cpu`` or ``xpu``)."""
     if name not in _FACTORIES:
         raise ValueError(
             f"unknown MLIR target {name!r}; expected one of {tuple(_FACTORIES)}"
@@ -72,7 +75,7 @@ def resolve_target(
         raise UnsupportedTargetError(
             "MLIR compilation for meta tensors",
             reason="meta tensors have no device to pick the target from",
-            alternatives=["target='cpu'", "HELION_MLIR_TARGET"],
+            alternatives=["target='cpu' or target='xpu'", "HELION_MLIR_TARGET"],
         )
     if device_type not in _DEVICE_TARGETS:
         raise UnsupportedTargetError(

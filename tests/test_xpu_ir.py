@@ -1,0 +1,2023 @@
+"""The XPU target at the IR level: no XPU, no SPIR-V target needed.
+
+Kernels on fake XPU tensors are lowered to annotated XeGPU (``xegpu-wg``) and on
+to LLVM/XeVM without device binaries (``xevm``). Kernels outside what the XeGPU
+pipeline compiles fail with ``UnsupportedOperationError`` before lowering.
+"""
+
+from __future__ import annotations
+
+import collections
+import contextlib
+import importlib.util
+import io
+import os
+import re
+from typing import TYPE_CHECKING
+from unittest import mock
+
+import helion
+import helion.language as hl
+from lighthouse.pipeline.stage import TransformStage
+from mlir import ir
+import pytest
+import torch
+
+from tests.harness import lower_xpu
+from tests.harness import lower_xpu_stages
+from tests.harness import xpu_tensor
+from tests.ir_query import layout_of
+from tests.ir_query import ops_named
+from tests.ir_query import parse
+from tests.kernelbench_xpu import attention
+from tests.test_nan_minmax import clamp_scaled
+
+from helion_mlir_backend import compile_mlir
+from helion_mlir_backend import generate_mlir
+from helion_mlir_backend import lower_mlir
+from helion_mlir_backend._compiler import xpu_transforms
+from helion_mlir_backend._compiler.mlir.support import LoweringStoppedError
+from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
+from helion_mlir_backend._compiler.mlir.support import UnsupportedTargetError
+from helion_mlir_backend._compiler.mlir.support import XeGPUConfigError
+from helion_mlir_backend._compiler.targets import XpuTarget
+from helion_mlir_backend._compiler.targets import get_target
+from helion_mlir_backend._compiler.targets import xpu
+from helion_mlir_backend._compiler.targets.xpu import XpuLowering
+from helion_mlir_backend._compiler.targets.xpu import _translated
+from helion_mlir_backend._compiler.targets.xpu import bindings_emit_spirv
+from helion_mlir_backend._compiler.targets.xpu_params import AttentionShape
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
+
+N = 1024
+GEMM = helion.Config(block_sizes=[256, 256, 32])
+
+
+def _kernel(config: helion.Config) -> object:
+    return helion.kernel(backend="mlir", static_shapes=True, config=config)
+
+
+@_kernel(GEMM)
+def matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@_kernel(GEMM)
+def matmul_relu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        out[tm, tn] = torch.relu(acc)
+    return out
+
+
+@_kernel(GEMM)
+def matmul_scaled(a: torch.Tensor, b: torch.Tensor, scale: float) -> torch.Tensor:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        out[tm, tn] = acc * scale
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 128]))
+def scale_shift(x: torch.Tensor, alpha: float, beta: int) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = x[tile] * alpha + beta
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 128]))
+def scale_in_f64(x: torch.Tensor, alpha: float) -> torch.Tensor:
+    """f64 math on f32 tiles: the kernel needs ``alpha`` as an f64."""
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = (x[tile].to(torch.float64) * alpha).to(torch.float32)
+    return out
+
+
+@_kernel(GEMM)
+def matmul_transposed_b(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``a @ b.T`` with ``b`` of shape (N, K): Helion emits a ``linalg.contract``
+    reading ``b`` transposed."""
+    m, k = a.size()
+    n, _ = b.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tn, tk].T)
+        out[tm, tn] = acc
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[256, 256, 32, 256, 256, 32]))
+def two_phase_matmul(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """``(a @ b) @ c``: the second product reads all of the first (``hl.barrier``)."""
+    m, k = a.size()
+    _, n = b.size()
+    tmp = torch.empty([m, n], dtype=torch.float16, device=a.device)
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        tmp[tm, tn] = acc.to(torch.float16)
+    hl.barrier()
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(n):
+            acc = torch.addmm(acc, tmp[tm, tk], c[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 64]))
+def softmax(x: torch.Tensor) -> torch.Tensor:
+    """Row softmax in three passes over column tiles (max, sum of exps, output)."""
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty_like(x)
+    for tile_m in hl.tile(m):
+        top = hl.full([tile_m, block_n], float("-inf"), dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            top = torch.maximum(top, x[tile_m, tile_n])
+        row_top = torch.amax(top, dim=-1, keepdim=True)
+        total = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            total = total + torch.exp(x[tile_m, tile_n] - row_top)
+        inv = 1.0 / total.sum(-1, keepdim=True)
+        for tile_n in hl.tile(n, block_size=block_n):
+            out[tile_m, tile_n] = torch.exp(x[tile_m, tile_n] - row_top) * inv
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[32, 256]))
+def relu(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.relu(x[tile])
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 128]))
+def gelu_tanh_cast(x: torch.Tensor) -> torch.Tensor:
+    """bf16 math (tanh, exp) on bf16 tiles, stored as f32."""
+    out = torch.empty(x.shape, dtype=torch.float32, device=x.device)
+    for tile in hl.tile(x.shape):
+        v = x[tile]
+        out[tile] = (torch.tanh(v) * torch.exp(v)).to(torch.float32)
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 128]))
+def two_in_two_out(
+    x: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused bf16 math over two inputs, into two outputs."""
+    a = torch.empty_like(x)
+    b = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        s = torch.sigmoid(x[tile] + y[tile])
+        a[tile] = s
+        b[tile] = torch.exp(s) * x[tile]
+    return a, b
+
+
+@_kernel(helion.Config(block_sizes=[64, 128]))
+def bias_relu(x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """A row of ``bias`` broadcast over every row of the tile."""
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.shape):
+        out[tm, tn] = torch.relu(x[tm, tn] + bias[tn][None, :])
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[2048]))
+def sigmoid_1d(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.size(0)):
+        out[tile] = torch.sigmoid(x[tile])
+    return out
+
+
+def tile_mul1(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``a * 1.0`` folds away: a tile copy (regression, see
+    :func:`test_tile_copies_lower`)."""
+    for tile in hl.tile(a.shape):
+        out[tile] = a[tile] * 1.0
+    return out
+
+
+def tile_copy(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(a.shape):
+        out[tile] = a[tile]
+    return out
+
+
+def tile_same_dtype(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    for tile in hl.tile(a.shape):
+        out[tile] = a[tile].to(a.dtype)
+    return out
+
+
+def tile_add0(a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """``a + 0.0`` does not fold (``-0.0 + 0.0`` is ``+0.0``): an elementwise op."""
+    for tile in hl.tile(a.shape):
+        out[tile] = a[tile] + 0.0
+    return out
+
+
+TILE_COPIES = {
+    "mul1": tile_mul1,
+    "copy": tile_copy,
+    "same_dtype": tile_same_dtype,
+    "add0": tile_add0,
+}
+TILE_COPY_SHAPES = {"2d": ((64, 256), [32, 256]), "1d": ((8192,), [256])}
+"""Shape and block sizes: the regression's 64x256 in [32, 256] tiles; 1D tiles."""
+
+
+def tile_copy_kernel(name: str, shape: str) -> helion.Kernel:
+    return helion.kernel(
+        TILE_COPIES[name],
+        backend="mlir",
+        static_shapes=True,
+        config=helion.Config(block_sizes=TILE_COPY_SHAPES[shape][1]),
+    )
+
+
+@_kernel(helion.Config(block_sizes=[64]))
+def row_amax(x: torch.Tensor) -> torch.Tensor:
+    """Row maxima of whole rows (regression: NaN rows gave the largest number)."""
+    m, _ = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        out[tile_m] = x[tile_m, :].amax(-1)
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 64]))
+def row_sums(x: torch.Tensor) -> torch.Tensor:
+    """Row sums, stored as a vector."""
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, block_n], dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            acc = acc + x[tile_m, tile_n]
+        out[tile_m] = acc.sum(-1)
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 64]))
+def row_maxima(x: torch.Tensor) -> torch.Tensor:
+    """Row maxima, stored as a ``keepdim`` column."""
+    m, n = x.shape
+    block_n = hl.register_block_size(n)
+    out = torch.empty([m, 1], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        top = hl.full([tile_m, block_n], float("-inf"), dtype=torch.float32)
+        for tile_n in hl.tile(n, block_size=block_n):
+            top = torch.maximum(top, x[tile_m, tile_n])
+        out[tile_m, :] = torch.amax(top, dim=-1, keepdim=True)
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[64, 64]))
+def running_row_maxima(x: torch.Tensor) -> torch.Tensor:
+    """A row value carried over column tiles, stored as a vector."""
+    m, n = x.shape
+    out = torch.empty([m], dtype=x.dtype, device=x.device)
+    for tile_m in hl.tile(m):
+        top = hl.full([tile_m], float("-inf"), dtype=x.dtype)
+        for tile_n in hl.tile(n):
+            top = torch.maximum(top, x[tile_m, tile_n].amax(-1))
+        out[tile_m] = top
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[1, 64, 64]))
+def batched_row_maxima(x: torch.Tensor) -> torch.Tensor:
+    """Rank 3: the row vector's buffer is a collapsed unit tile."""
+    batch, m, _ = x.shape
+    out = torch.empty([batch, m], dtype=x.dtype, device=x.device)
+    for tile_b, tile_m in hl.tile([batch, m]):
+        out[tile_b, tile_m] = x[tile_b, tile_m, :].amax(-1)
+    return out
+
+
+@_kernel(helion.Config(block_sizes=[256, 256, 32, 32]))
+def two_matmuls(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], c[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
+# Rank 3+ kernels (block sizes per test): unit leading tile dims fold away.
+
+
+def relu_nd(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tile in hl.tile(x.shape):
+        out[tile] = torch.relu(x[tile])
+    return out
+
+
+def batched_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    batch, m, k = a.size()
+    _, _, n = b.size()
+    out = torch.empty([batch, m, n], dtype=torch.float32, device=a.device)
+    for tb, tm, tn in hl.tile([batch, m, n]):
+        acc = hl.zeros([tb, tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = hl.dot(a[tb, tm, tk], b[tb, tk, tn], acc=acc)
+        out[tb, tm, tn] = acc
+    return out
+
+
+def tensor_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    batch, m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([batch, m, n], dtype=torch.float32, device=a.device)
+    for tb, tm, tn in hl.tile([batch, m, n]):
+        acc = hl.zeros([tb, tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = acc + torch.einsum("bmk,kn->bmn", a[tb, tm, tk], b[tk, tn])
+        out[tb, tm, tn] = acc
+    return out
+
+
+def head_row_sums(x: torch.Tensor) -> torch.Tensor:
+    """Row sums over the last dim of ``[B, H, S, D]`` in chunks, keepdim."""
+    batch, heads, rows, cols = x.shape
+    block_n = hl.register_block_size(cols)
+    out = torch.empty([batch, heads, rows, 1], dtype=x.dtype, device=x.device)
+    for tb, th, tm in hl.tile([batch, heads, rows]):
+        acc = hl.zeros([tb, th, tm, block_n], dtype=torch.float32)
+        for tn in hl.tile(cols, block_size=block_n):
+            acc = acc + x[tb, th, tm, tn]
+        out[tb, th, tm, :] = acc.sum(-1, keepdim=True)
+    return out
+
+
+def middle_sums(x: torch.Tensor) -> torch.Tensor:
+    """Sums over the middle dim of ``[B, D1, D2]`` (KernelBench 47), keepdim."""
+    batch, _, cols = x.size()
+    out = torch.empty([batch, 1, cols], dtype=x.dtype, device=x.device)
+    for tb, tn in hl.tile([batch, cols]):
+        out[tb, :, tn] = torch.sum(x[tb, :, tn], dim=1, keepdim=True)
+    return out
+
+
+def _gemm_args(dtype: torch.dtype = torch.float16, size: int = N) -> list[object]:
+    return [xpu_tensor(size, size, dtype=dtype), xpu_tensor(size, size, dtype=dtype)]
+
+
+@pytest.fixture(autouse=True)
+def xpu_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    for name in ("HELION_MLIR_TARGET", "HELION_MLIR_XPU_STOP_AT"):
+        monkeypatch.delenv(name, raising=False)
+    # Lighthouse's path, as long as the toggle has it: its refusals and classes.
+    # Not through monkeypatch: isolated tests pickle the fixtures they take.
+    os.environ["HELION_MLIR_XPU_LAYOUTS"] = "lighthouse"
+    yield
+    del os.environ["HELION_MLIR_XPU_LAYOUTS"]
+
+
+# --- IR checks ---------------------------------------------------------------
+
+
+def _check_gemm_kernel(text: str, grid: tuple[int, int], threads: int) -> None:
+    """One annotated GEMM kernel per launch of ``grid`` workgroups of ``threads``."""
+    module = parse(text)
+    for name in ("xegpu.load_nd", "xegpu.store_nd", "xegpu.prefetch_nd"):
+        assert ops_named(module, name), name
+    dpas = ops_named(module, "xegpu.dpas")
+    assert dpas
+    for op in dpas:
+        for attribute in ("layout_a", "layout_b", "layout_cd"):
+            layout = layout_of(op, attribute)
+            assert layout is not None and layout.sg_layout is not None
+    assert f"known_block_size = array<i32: {threads}, 1, 1>" in text
+    assert f"known_grid_size = array<i32: {grid[0]}, {grid[1]}, 1>" in text
+    assert re.search(r"gpu\.launch_func\s+@\w+::@\w+ blocks in", text)
+
+
+def _host_function(text: str, name: str) -> str:
+    """The body of the host function ``name`` (up to its first return)."""
+    start = re.search(rf"(func\.func|llvm\.func) (public )?@{name}\(", text)
+    assert start, f"no host function @{name}"
+    end = text.index("return", start.end())
+    return text[start.start() : end]
+
+
+def _check_xevm(text: str, entry: str, launches: int) -> None:
+    """Device code fully lowered; the host launches ``launches`` kernels in order on
+    one stream, then waits for them. Each GPU module has one XeVM target, with
+    lighthouse's opt level (a second target would compile every kernel twice)."""
+    assert "xegpu." not in text
+    targets = re.findall(r"gpu\.module @\w+ \[(.*)\] \{", text)
+    assert len(targets) == launches, targets
+    for target in targets:
+        assert target.count("#xevm.target<") == 1, target
+        assert "O = 3" in target and "cmd-options" not in target
+    assert "llvm.func spir_funccc" in text
+    host = _host_function(text, entry)
+    streams = re.findall(r"(%\w+) = llvm\.call @mgpuStreamCreate\(\)", host)
+    assert len(streams) == 1, host
+    stream = streams[0]
+    launched = [m.start() for m in re.finditer(r"gpu\.launch_func <", host)]
+    on_stream = list(re.finditer(rf"gpu\.launch_func <{stream} : !llvm\.ptr>", host))
+    assert len(launched) == len(on_stream) == launches, host
+    sync = host.index(f"llvm.call @mgpuStreamSynchronize({stream})")
+    assert sync > launched[-1]
+
+
+def _launch_args(text: str, entry: str) -> list[list[str]]:
+    """The ``helion.name`` of each entry argument a launch passes, per launch."""
+    host = _host_function(text, entry)
+    names = dict(re.findall(r"(%arg\d+): memref<[^{]*\{helion\.name = \"(\w+)\"", host))
+    return [
+        [names[arg] for arg in re.findall(r"%arg\d+", args) if arg in names]
+        for args in re.findall(r"gpu\.launch_func [^\n]* args\(([^\n]*)\)", host)
+    ]
+
+
+# --- Supported kernels -------------------------------------------------------
+
+
+# Tests lowering to both stages check the ``xegpu-wg`` IR and the ``xevm`` IR of
+# one lowering (``lower_xpu_stages``).
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_matmul_lowers_to_xegpu_and_xevm(dtype: torch.dtype) -> None:
+    text, lowered = lower_xpu_stages(matmul, _gemm_args(dtype))
+    _check_gemm_kernel(text, grid=(4, 4), threads=512)
+    assert text.count("gpu.launch_func") == 1
+    _check_xevm(lowered, "matmul", launches=1)
+
+
+@pytest.mark.isolated
+def test_matmul_relu_epilogue() -> None:
+    text, lowered = lower_xpu_stages(matmul_relu, _gemm_args())
+    _check_gemm_kernel(text, grid=(4, 4), threads=512)
+    # The epilogue runs in the kernel, on the accumulator before the store.
+    kernel = text[text.index("gpu.module") :]
+    assert re.search(r"arith\.maximumf|arith\.cmpf", kernel)
+    _check_xevm(lowered, "matmul_relu", launches=1)
+
+
+@pytest.mark.isolated
+def test_matmul_transposed_b() -> None:
+    text, lowered = lower_xpu_stages(matmul_transposed_b, _gemm_args())
+    _check_gemm_kernel(text, grid=(4, 4), threads=512)
+    # B tiles load as (N, K) tiles, transposed in registers for DPAS.
+    module = parse(text)
+    transposes = ops_named(module, "vector.transpose")
+    assert transposes
+    for transpose in transposes:
+        load = transpose.operands[0].owner
+        assert load.name == "xegpu.load_nd"
+        assert layout_of(load).order == (0, 1)
+    _check_xevm(lowered, "matmul_transposed_b", launches=1)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_runtime_scalar_is_passed_by_value(dtype: torch.dtype) -> None:
+    text, lowered = lower_xpu_stages(matmul_scaled, [*_gemm_args(dtype), 0.5])
+    _check_gemm_kernel(text, grid=(4, 4), threads=512)
+    host = _host_function(text, "matmul_scaled")
+    scalar = re.search(
+        r"(%arg\d+): f64 \{helion\.name = \"scale\", helion\.role = \"scalar\"", host
+    )
+    assert scalar, host
+    # The conversion to the accumulator's type runs on the host: the kernel takes
+    # the f32 value.
+    cast = re.search(rf"(%\w+) = arith\.truncf {scalar.group(1)} : f64 to f32", host)
+    assert cast, host
+    assert host.index(cast.group(0)) < host.index("gpu.launch_func")
+    assert re.search(rf"args\([^\n]*{cast.group(1)} : f32", host)
+    kernel = text[text.index("gpu.module") :]
+    assert re.search(r"gpu\.func @matmul_scaled_kernel\([^)]*: f32", kernel)
+    assert "f64" not in kernel
+    # Lowered, the kernel still takes the f32 value.
+    _check_xevm(lowered, "matmul_scaled", launches=1)
+    kernel = re.search(
+        r"llvm\.func spir_kernelcc @matmul_scaled_kernel\(([^)]*)\)", lowered
+    )
+    assert kernel, lowered
+    assert ": f32" in kernel.group(1)
+    assert "f64" not in lowered[lowered.index("gpu.module") :]
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("dtype", "element"), [(torch.float32, "f32"), (torch.bfloat16, "bf16")]
+)
+def test_float_and_int_scalars_reach_the_kernel_in_its_type(
+    dtype: torch.dtype, element: str
+) -> None:
+    text = lower_xpu(scale_shift, [xpu_tensor(1024, 1024, dtype=dtype), 0.5, 3], "xevm")
+    _check_xevm(text, "scale_shift", launches=1)
+    host = _host_function(text, "scale_shift")
+    assert re.search(r"%arg\d+: f64 \{helion\.name = \"alpha\"", host)
+    assert re.search(r"%arg\d+: i64 \{helion\.name = \"beta\"", host)
+    kernel = re.search(r"llvm\.func spir_kernelcc @scale_shift_kernel\(([^)]*)\)", text)
+    assert kernel, text
+    # Both scalars converted on the host (alpha truncated, beta converted to float).
+    assert kernel.group(1).count(f": {element},") == 2, kernel.group(1)
+    assert "f64" not in text[text.index("gpu.module") :]
+
+
+@pytest.mark.isolated
+def test_f64_kernel_argument_is_unsupported() -> None:
+    with pytest.raises(UnsupportedOperationError, match="kernel argument") as info:
+        lower_xpu(scale_in_f64, [xpu_tensor(1024, 1024), 0.5])
+    assert "'alpha' (f64) is used by" in str(info.value)
+    assert "no floats wider than 32 bits" in str(info.value)
+
+
+@pytest.mark.isolated
+def test_barrier_phases_launch_in_order_on_one_stream() -> None:
+    args = [xpu_tensor(N, N, dtype=torch.float16) for _ in range(3)]
+    text, lowered = lower_xpu_stages(two_phase_matmul, args)
+    _check_gemm_kernel(text, grid=(4, 4), threads=512)
+    assert text.count("gpu.launch_func") == 2
+    first, second = _launch_args(text, "two_phase_matmul")
+    assert {"a", "b", "tmp"} <= set(first) and "c" not in first
+    assert {"tmp", "c", "out"} <= set(second) and "a" not in second
+    _check_xevm(lowered, "two_phase_matmul", 2)
+
+
+@pytest.mark.isolated
+def test_softmax_row_reduction() -> None:
+    text, lowered = lower_xpu_stages(softmax, [xpu_tensor(4096, 4096)])
+    assert "known_grid_size = array<i32: 64, 1, 1>" in text
+    assert "vector.multi_reduction" in text
+    assert "xegpu.load_nd" in text and "xegpu.store_nd" in text
+    assert "sg_layout" in text
+    _check_xevm(lowered, "softmax", launches=1)
+
+
+def _layouts(text: str, op: str) -> list[str]:
+    """The anchor layouts of the ``op`` ops in ``text``."""
+    return re.findall(rf"{re.escape(op)} [^\n]*<\{{layout = (#xegpu\.[^}}]*)\}}>", text)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_elementwise_kernel_lowers_to_xegpu(dtype: torch.dtype) -> None:
+    text, lowered = lower_xpu_stages(relu, [xpu_tensor(4096, 4096, dtype=dtype)])
+    # 32x256 workgroup tiles: 8 subgroups of 32x32 (inferred), 16x16 block
+    # loads (16 columns, at most 16 elements per work item), 8x16 block stores.
+    tile = "sg_layout = [1, 8], sg_data = [32, 32]"
+    assert _layouts(text, "xegpu.load_nd") == [
+        f"#xegpu.layout<{tile}, inst_data = [16, 16]>"
+    ]
+    assert _layouts(text, "xegpu.store_nd") == [
+        f"#xegpu.layout<{tile}, inst_data = [8, 16]>"
+    ]
+    assert "known_block_size = array<i32: 128, 1, 1>" in text
+    # Columns first (map_elementwise_grid): 16 column tiles in x, 128 rows.
+    assert "known_grid_size = array<i32: 16, 128, 1>" in text
+    _check_xevm(lowered, "relu", 1)
+
+
+def _bf16_natives(text: str) -> list[str]:
+    """Device functions declared with bf16 operands (no such OpenCL builtins)."""
+    return re.findall(r"llvm\.func @(_Z\w+)\([^)]*bf16", text)
+
+
+@pytest.mark.isolated
+def test_elementwise_bf16_math_and_casts() -> None:
+    args = [xpu_tensor(1024, 1024, dtype=torch.bfloat16)]
+    text, lowered = lower_xpu_stages(gelu_tanh_cast, args)
+    # bf16 loads, f32 stores: each with its own block tile.
+    assert re.search(r"xegpu\.load_nd [^\n]*inst_data = \[16, 16\][^\n]*xbf16>", text)
+    assert re.search(r"xegpu\.store_nd [^\n]*inst_data = \[8, 16\][^\n]*xf32>", text)
+    _check_xevm(lowered, "gelu_tanh_cast", 1)
+    # bf16 math runs in f32 (the fast exp too: upstream's math-to-xevm would
+    # call a bf16 native exp otherwise).
+    assert _bf16_natives(lowered) == []
+    assert "__spirv_ocl_tanh" not in lowered  # xpu_math_approx
+    # The f32 native exp, per element or of a 16-element vector.
+    assert re.search(r"@_Z22__spirv_ocl_native_exp(f|Dv16_f)\b", lowered)
+
+
+@pytest.mark.isolated
+def test_elementwise_several_inputs_and_outputs() -> None:
+    args = [xpu_tensor(1024, 1024, dtype=torch.bfloat16) for _ in range(2)]
+    text, lowered = lower_xpu_stages(two_in_two_out, args)
+    assert len(_layouts(text, "xegpu.load_nd")) == 2
+    assert len(_layouts(text, "xegpu.store_nd")) == 2
+    assert "known_grid_size = array<i32: 8, 16, 1>" in text
+    _check_xevm(lowered, "two_in_two_out", 1)
+    assert _bf16_natives(lowered) == []
+
+
+@pytest.mark.isolated
+def test_elementwise_broadcast_row() -> None:
+    args = [
+        xpu_tensor(1024, 1024, dtype=torch.bfloat16),
+        xpu_tensor(1024, dtype=torch.bfloat16),
+    ]
+    text, lowered = lower_xpu_stages(bias_relu, args)
+    # The 64x128 tiles are anchored; the bias row's layout is propagated.
+    assert len(_layouts(text, "xegpu.load_nd")) == 1
+    assert len(_layouts(text, "xegpu.store_nd")) == 1
+    _check_xevm(lowered, "bias_relu", 1)
+
+
+@pytest.mark.isolated
+def test_elementwise_1d_tiles_gather_and_scatter() -> None:
+    args = [xpu_tensor(1 << 20)]
+    text, lowered = lower_xpu_stages(sigmoid_1d, args)
+    # Contiguous f32 elements: 4 (16 bytes) per work item and instruction.
+    layout = "#xegpu.layout<sg_layout = [2], sg_data = [1024], inst_data = [64]>"
+    assert _layouts(text, "xegpu.load") == [layout]
+    assert _layouts(text, "xegpu.store") == [layout]
+    assert "known_block_size = array<i32: 32, 1, 1>" in text
+    _check_xevm(lowered, "sigmoid_1d", 1)
+
+
+@_kernel(helion.Config(block_sizes=[1, 64]))
+def add_column_index(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.shape):
+        out[tm, tn] = x[tm, tn] + tn.index.to(torch.float32)[None, :]
+    return out
+
+
+@pytest.mark.isolated
+@pytest.mark.skipif(not bindings_emit_spirv(), reason="needs the SPIR-V target")
+def test_one_row_tile_with_an_index_vector_compiles() -> None:
+    """Regression (review of the chunked 1D tiles), the exact reproducer:
+    ``tn.index`` folds to an arange constant; with 4 elements per work item it
+    became per-work-item ``vector<64xi64>`` constants read with dynamic
+    ``extractelement``, and LLVM's SPIR-V backend crashed (``Index <
+    this->size()``) at ``binary``."""
+    binary = lower_xpu(add_column_index, [xpu_tensor(16, 16384)], "binary")
+    assert "gpu.binary" in binary
+
+
+@pytest.mark.isolated
+def test_one_row_tile_with_an_index_vector_keeps_one_element() -> None:
+    """Only kernels whose vectors are the tiles, their offsets and elementwise
+    math take several elements per work item; ``tn.index``'s arange keeps one."""
+    text = lower_xpu(add_column_index, [xpu_tensor(16, 16384)], "xegpu-wg")
+    layout = "#xegpu.layout<sg_layout = [1], sg_data = [64], inst_data = [16]>"
+    assert set(_layouts(text, "xegpu.load") + _layouts(text, "xegpu.store")) == {layout}
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("name", "layout"),
+    [
+        # Stored as a [rows, 1] column too (keep_row_dims).
+        ("row_sums", "#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 1]>"),
+        ("row_maxima", "#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 1]>"),
+    ],
+    ids=["vector", "keepdim-column"],
+)
+def test_row_reduction_results(name: str, layout: str) -> None:
+    """Row results are stored with scatter stores of ``[rows, 1]`` columns
+    (``[rows]`` vectors are stored as columns: their sliced layout gave wrong
+    results on hardware), anchored with the reduction's layout (no
+    ``inst_data``: a ``keepdim`` column's fails in XeVM); a column needs no
+    temporary buffer. The reduced tiles' loads are anchored too."""
+    kernel = {"row_sums": row_sums, "row_maxima": row_maxima}[name]
+    args = [xpu_tensor(4096, 8192)]
+    text, lowered = lower_xpu_stages(kernel, args)
+    assert _layouts(text, "xegpu.store") == [layout]
+    assert _layouts(text, "xegpu.load_nd") == [
+        "#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 64], inst_data = [8, 16]>"
+    ]
+    assert "xegpu.store_nd" not in text and "gpu.alloc" not in text
+    assert "known_block_size = array<i32: 128, 1, 1>" in text
+    _check_xevm(lowered, name, 1)
+
+
+def _shuffle_masks(lowered: str) -> dict[int, int]:
+    """How many ``sub_group_shuffle_xor`` calls of each constant mask."""
+    constants = dict(
+        re.findall(r"(%\d+) = llvm\.mlir\.constant\((\d+) : i32\) : i32", lowered)
+    )
+    masks = re.findall(r"@_Z21sub_group_shuffle_xor\w+\(%\d+, (%\d+)\)", lowered)
+    return collections.Counter(int(constants[mask]) for mask in masks)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("name", "shape"),
+    [("running_row_maxima", (256, 512)), ("batched_row_maxima", (2, 256, 128))],
+    ids=["loop-carried", "rank-3"],
+)
+def test_row_vectors_reduce_over_all_lanes(name: str, shape: tuple[int, ...]) -> None:
+    """Row vectors other than a reduction's direct result into a plain buffer
+    are stored as columns as well (keep_row_dims): the reduction's source keeps
+    the 2D block load's lanes, and joins all 16 of them for every row."""
+    kernel = {
+        "running_row_maxima": running_row_maxima,
+        "batched_row_maxima": batched_row_maxima,
+    }[name]
+    text, lowered = lower_xpu_stages(kernel, [xpu_tensor(*shape)])
+    assert _layouts(text, "xegpu.store") == [
+        "#xegpu.layout<sg_layout = [8, 1], sg_data = [8, 1]>"
+    ]
+    masks = _shuffle_masks(str(lowered))
+    assert masks and {masks[1]} == {masks[2], masks[4], masks[8]}, masks
+
+
+@pytest.mark.isolated
+def test_row_vector_store_unrewritten_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without keep_row_dims, the layout XeGPU derives from the ``[rows]`` store
+    reduces columns over pairs of lanes: wrong rows. Upstream only warns on the
+    load and that warning does not reach this path, so nothing fails until the
+    check on the lowered kernel refuses it."""
+    monkeypatch.setattr(xpu, "keep_row_dims", lambda module: 0)
+    with pytest.raises(
+        UnsupportedOperationError, match="row reduction over part of a subgroup"
+    ):
+        lower_xpu(running_row_maxima, [xpu_tensor(256, 512)], stop_at="xevm")
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("shape", list(TILE_COPY_SHAPES))
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize("name", list(TILE_COPIES))
+def test_tile_copies_lower(name: str, dtype: torch.dtype, shape: str) -> None:
+    """Regression (bf16 ``mul1`` 2d: the exact kernel and config): a kernel that
+    stores the tiles it loads, unchanged, had no linalg op left, so lighthouse's
+    cleanup found no payload function ("extract_handle: invalid index 0 for
+    target of length 0"). The copy is a ``linalg.copy`` (materialize_tile_copies)
+    and lowers like an elementwise kernel: one load and one store per tile."""
+    size = TILE_COPY_SHAPES[shape][0]
+    args = [xpu_tensor(*size, dtype=dtype), xpu_tensor(*size, dtype=dtype)]
+    text, lowered = lower_xpu_stages(tile_copy_kernel(name, shape), args)
+    loads = len(_layouts(text, "xegpu.load_nd")) + len(_layouts(text, "xegpu.load"))
+    stores = len(_layouts(text, "xegpu.store_nd")) + len(_layouts(text, "xegpu.store"))
+    assert (loads, stores) == (1, 1), text
+    assert "memref.copy" not in text
+    _check_xevm(lowered, TILE_COPIES[name].__name__, 1)
+
+
+@pytest.mark.isolated
+def test_maximum_reductions_propagate_nan() -> None:
+    """Regression: lighthouse's vectorization turns ``maximumf`` reductions into
+    ``maxnumf`` ones (NaN-ignoring: a row with NaN gave its largest number);
+    they are ``maximumf`` again (``nan-maxima``), lowered to
+    ``llvm.intr.maximum``. Minima were never changed."""
+    text, lowered = lower_xpu_stages(
+        row_amax, [xpu_tensor(256, 512, dtype=torch.bfloat16)]
+    )
+    assert "vector.multi_reduction <maximumf>" in text
+    assert "maxnumf" not in text
+    assert "llvm.intr.maximum" in lowered
+    assert "llvm.intr.maxnum" not in lowered
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("xegpu", "ignored"),
+    [({"xegpu_nan_ignoring_maxima": [True]}, True), ({}, False)],
+)
+def test_attention_row_maxima_forms(xegpu: dict[str, object], ignored: bool) -> None:
+    """``xegpu_nan_ignoring_maxima``: the reductions stay as lighthouse vectorizes
+    them; without it they propagate NaN, as ``amax`` elsewhere."""
+    text, lowered = lower_xpu_stages(
+        *_attention_case((2, 2, 512, 64), [1, 1, 128, 64], **xegpu)
+    )
+    assert ("vector.multi_reduction <maxnumf>" in text) == ignored
+    assert ("vector.multi_reduction <maximumf>" in text) != ignored
+    assert ("llvm.intr.maxnum" in lowered) == ignored
+    assert ("llvm.intr.maximum" in lowered) != ignored
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        ([1], r"xegpu_nan_ignoring_maxima\[0\]=1: expected True or None"),
+        ([False], r"xegpu_nan_ignoring_maxima\[0\]=False: expected True or None"),
+        (True, r"xegpu_nan_ignoring_maxima=True: expected a list"),
+    ],
+)
+def test_nan_ignoring_maxima_malformed(value: object, match: str) -> None:
+    config = helion.Config(block_sizes=[1, 1, 128, 64], xegpu_nan_ignoring_maxima=value)
+    args = [xpu_tensor(2, 2, 512, 64, dtype=torch.bfloat16) for _ in range(3)]
+    with pytest.raises(XeGPUConfigError, match=match):
+        lower_xpu(_kernel(config)(attention), args)
+
+
+def attention_and_row_maximum(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attention, and its running maximum as a second output: a NaN there counts."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    maximum = torch.empty(batch, heads, m, 1, dtype=torch.float32, device=q.device)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+        maximum[tb, th, tm, :] = row_max[:, :, :, None]
+    return out, maximum
+
+
+def attention_and_output_maximum(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Attention, and the maximum of each output row as a second output."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    maximum = torch.empty(batch, heads, m, 1, dtype=torch.float32, device=q.device)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        result = acc / row_sum[:, :, :, None]
+        out[tb, th, tm, :] = result.to(out.dtype)
+        maximum[tb, th, tm, :] = result.amax(-1)[:, :, :, None]
+    return out, maximum
+
+
+def attention_hard(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """Hard attention: P is 1 where the score equals the running maximum."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = (scores >= new_max[:, :, :, None]).to(torch.float32)
+            alpha = (row_max >= new_max).to(torch.float32)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+
+
+def attention_row_gate(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """The maximum gates each output row."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        gate = (row_max > 0.0).to(torch.float32)[:, :, :, None]
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None] * gate).to(out.dtype)
+    return out
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("fn", "ignoring", "propagating"),
+    [
+        (attention, 1, 0),
+        # Their stored row maximum's xegpu.store is left to upstream's propagation, which
+        # production allows (check_anchors). Right on the device, against fp64:
+        # test_xpu_runtime.py's test_maximum_stored_without_a_layout_matches_fp64.
+        pytest.param(
+            attention_and_row_maximum,
+            0,
+            1,
+            marks=pytest.mark.expect_violation("layouts"),
+        ),
+        pytest.param(
+            attention_and_output_maximum,
+            1,
+            1,
+            marks=pytest.mark.expect_violation("layouts"),
+        ),
+        (attention_hard, 0, 1),
+        (attention_row_gate, 0, 1),
+    ],
+    ids=["softmax", "stored", "output-row", "hard", "row-gate"],
+)
+def test_key_applies_to_reductions_that_only_shift(
+    fn: object, ignoring: int, propagating: int
+) -> None:
+    """``row_maxima``: of a kernel with the key, only reductions that reach nothing
+    but the running maximum and ``exp(s - m)`` ignore NaN. To ``xegpu-wg``: the last
+    two hang further down (not from this)."""
+    config = helion.Config(
+        block_sizes=[1, 1, 128, 64], xegpu_nan_ignoring_maxima=[True]
+    )
+    args = [xpu_tensor(2, 2, 512, 64, dtype=torch.bfloat16) for _ in range(3)]
+    text = lower_xpu(_kernel(config)(fn), args)
+    assert text.count("<maxnumf>") == ignoring
+    assert text.count("<maximumf>") == propagating
+
+
+_TILE_EXPRESSION_KERNEL = """
+import helion.language as hl
+import torch
+
+
+def tile_expression(q, k, v):
+    batch, heads, m, d = q.shape
+    group = heads // k.size(1)
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m], block_size=[1, 1, None]):
+        k_head = EXPRESSION
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum(
+                "bhmd,bnd->bhmn", q_tile, k[tb, k_head, tn, :]
+            )
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bnd->bhmd", p.to(v.dtype), v[tb, k_head, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+"""
+TILE_EXPRESSIONS = {
+    "fdiv": ("th.begin // group", lambda h: h // 4),
+    "plus-minus": ("(th.begin + group) // group - 1", lambda h: (h + 4) // 4 - 1),
+    "end": ("(th.end - 1) // group", lambda h: h // 4),
+    "id": ("th.id // group", lambda h: h // 4),
+    "flip": ("1 - th.begin // group", lambda h: 1 - h // 4),
+    "times": ("(th.begin * 3) // (group * 3)", lambda h: (h * 3) // 12),
+    "nested": ("(th.begin // 2) // 2", lambda h: (h // 2) // 2),
+}
+"""Tile position arithmetic above an inner loop: source, and what it gives for a query
+head of the (2, 8, 256, 64) test shape."""
+
+
+def tile_expression_kernel(directory: Path, expression: str) -> object:
+    """The kernel with K/V head ``expression``, from a file: Helion reads the source."""
+    path = directory / "tile_expression.py"
+    path.write_text(_TILE_EXPRESSION_KERNEL.replace("EXPRESSION", expression))
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.tile_expression
+
+
+def _tile_expression_args() -> list[object]:
+    return [
+        xpu_tensor(2, 8, 256, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+    ]
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("expression", list(TILE_EXPRESSIONS))
+def test_tile_expressions_above_an_inner_loop_lower(
+    expression: str, tmp_path: Path
+) -> None:
+    fn = tile_expression_kernel(tmp_path, TILE_EXPRESSIONS[expression][0])
+    config = helion.Config(block_sizes=[256, 64])
+    assert "xegpu.dpas" in lower_xpu(_kernel(config)(fn), _tile_expression_args())
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    "expression",
+    ["th.begin % 2", "(th.begin // group) * (th.begin // group)"],
+    ids=["mod", "square"],
+)
+def test_other_tile_expressions_are_a_clear_error(
+    expression: str, tmp_path: Path
+) -> None:
+    """Negative: not "Value not found for node: symnode"."""
+    fn = tile_expression_kernel(tmp_path, expression)
+    config = helion.Config(block_sizes=[256, 64])
+    with pytest.raises(UnsupportedOperationError, match="tile expression"):
+        lower_xpu(_kernel(config)(fn), _tile_expression_args())
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("value", "match"),
+    [
+        (["on"], r"igc_vectorizer\[0\]='on': expected \"cmp\", \"off\" or None"),
+        ([True], r"igc_vectorizer\[0\]=True: expected"),
+        ("cmp", r"igc_vectorizer='cmp': expected a list"),
+    ],
+)
+def test_vectorizer_malformed(value: object, match: str) -> None:
+    config = helion.Config(block_sizes=[64, 64], igc_vectorizer=value)
+    args = [xpu_tensor(256, 512, dtype=torch.bfloat16)]
+    with pytest.raises(XeGPUConfigError, match=match):
+        lower_xpu_stages(row_amax, args, config=config)
+
+
+@pytest.mark.isolated
+def test_vectorizer_choice_differs_in_the_module() -> None:
+    """Part of the module, so of the JIT cache key: the two compile separately."""
+    config = helion.Config(block_sizes=[256, 256, 32])
+    texts = []
+    for xegpu in ({}, {"igc_vectorizer": ["off"]}):
+        module = generate_mlir(matmul, _gemm_args(), config=config)
+        get_target("xpu").configure(module, xegpu)
+        texts.append(str(module))
+    assert texts[0] != texts[1]
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("q_shape", "blocks"),
+    [((1, 1, 128, 64), [1, 1, 128, 64]), ((1, 1, 512, 64), [1, 1, 512, 64])],
+)
+def test_one_workgroup_with_per_kernel_keys(
+    q_shape: tuple[int, ...], blocks: list[int]
+) -> None:
+    """Regression: "lists of 1 entries, but the kernel has 0 GPU kernel(s)", as the
+    tile of the whole shape left no grid loop. It is one GPU kernel, with the key."""
+    config = helion.Config(block_sizes=blocks, igc_vectorizer=["cmp"])
+    args = [xpu_tensor(*q_shape, dtype=torch.bfloat16) for _ in range(3)]
+    _, lowered = lower_xpu_stages(_kernel(config)(attention), args)
+    assert lowered.count("gpu.launch_func") == 1
+
+
+@pytest.mark.isolated
+def test_nan_ignoring_maxima_is_for_attention() -> None:
+    """Elsewhere a row maximum is a result: its NaN would be lost."""
+    config = helion.Config(block_sizes=[64, 64], xegpu_nan_ignoring_maxima=[True])
+    args = [xpu_tensor(256, 512, dtype=torch.bfloat16)]
+    with pytest.raises(XeGPUConfigError, match=r"applies to attention kernels"):
+        lower_xpu_stages(row_amax, args, config=config)
+
+
+@pytest.mark.isolated
+def test_lane_reductions_check_accepts_both_forms() -> None:
+    """Both forms of the row maxima reduce over all 16 lanes
+    (``check_lane_reductions``, at the end of the ``xevm`` stage)."""
+    for xegpu in ({"xegpu_nan_ignoring_maxima": [True]}, {}):
+        _, lowered = lower_xpu_stages(
+            *_attention_case((2, 2, 512, 64), [1, 1, 128, 64], **xegpu)
+        )
+        assert "_Z21sub_group_shuffle_xorfj" in lowered
+
+
+def two_attention_kernels(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Two attention kernels (grid loops), one after the other."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    first = torch.empty_like(q)
+    second = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        first[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(first.dtype)
+    hl.barrier()
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        second[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(second.dtype)
+    return first, second
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("entries", "first", "second"),
+    [([True, None], True, False), ([None, True], False, True)],
+)
+def test_nan_ignoring_maxima_is_per_kernel(
+    entries: list[object], first: bool, second: bool
+) -> None:
+    """One entry per kernel: the other kernel keeps NaN-propagating maxima."""
+    args = [xpu_tensor(2, 2, 512, 64, dtype=torch.bfloat16) for _ in range(3)]
+    config = helion.Config(
+        block_sizes=[1, 1, 128, 64] * 2, xegpu_nan_ignoring_maxima=entries
+    )
+    text, _ = lower_xpu_stages(_kernel(config)(two_attention_kernels), args)
+    modules = re.split(r"gpu\.module @", text)[1:]
+    assert len(modules) == 2
+    for module, ignored in zip(modules, (first, second), strict=True):
+        assert ("<maxnumf>" in module) == ignored, module[:200]
+        assert ("<maximumf>" in module) != ignored, module[:200]
+
+
+def attention_runtime_scale(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scale: float
+) -> torch.Tensor:
+    """Attention with its scale a runtime float (the tile times its fill, a named
+    elementwise op)."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            scores = scores * scale
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+
+
+def attention_head_index(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """Grouped-query attention with the K/V head computed above the K/V loop:
+    ``k_head = th.begin // group``, which reaches the inner loop as a symbolic
+    expression. Block sizes: query rows, K/V rows."""
+    batch, heads, m, d = q.shape
+    group = heads // k.size(1)
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m], block_size=[1, 1, None]):
+        k_head = th.begin // group
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum(
+                "bhmd,bnd->bhmn", q_tile, k[tb, k_head, tn, :]
+            )
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bnd->bhmd", p.to(v.dtype), v[tb, k_head, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+
+
+def attention_head_index_then_phase(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor
+) -> torch.Tensor:
+    """:func:`attention_head_index`, then a later phase: as a Llama step's entry, with
+    host code following the loop of the head index. Block sizes: query rows, K/V rows,
+    then the tiles of the copy."""
+    batch, heads, m, d = q.shape
+    group = heads // k.size(1)
+    n = k.size(2)
+    att = torch.empty_like(q)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m], block_size=[1, 1, None]):
+        k_head = th.begin // group
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], -3.4028234663852886e38, dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum(
+                "bhmd,bnd->bhmn", q_tile, k[tb, k_head, tn, :]
+            )
+            scores = scores * 0.125
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bnd->bhmd", p.to(v.dtype), v[tb, k_head, tn, :]
+            )
+            row_max = new_max
+        att[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(att.dtype)
+    hl.barrier()
+    for t0, t1, t2, td in hl.tile([batch, heads, m, d]):
+        out[t0, t1, t2, td] = att[t0, t1, t2, td].to(torch.float32).to(out.dtype)
+    return out
+
+
+def matmul_and_row_maximum(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """A GEMM and the maximum of its rows in one grid loop."""
+    m, k = a.shape
+    n = b.size(1)
+    out = torch.empty(m, 1, dtype=torch.float32, device=a.device)
+    for tile_m in hl.tile(m):
+        acc = hl.zeros([tile_m, n], dtype=torch.float32)
+        for tile_k in hl.tile(k):
+            acc = acc + hl.dot(a[tile_m, tile_k], b[tile_k, :])
+        out[tile_m, :] = acc.amax(-1, keepdim=True)
+    return out
+
+
+@pytest.mark.isolated
+def test_attention_runtime_scale_lowers() -> None:
+    """Regression: "'xevm.blockload2d' op tile_width * v_blocks ...": the tile
+    times a runtime scalar's fill kept its unit dims, so the scores went through a
+    scratch buffer in the kernel."""
+    args = [
+        xpu_tensor(2, 2, 1024, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+        0.125,
+    ]
+    kernel = _kernel(helion.Config(block_sizes=[1, 1, 256, 64]))(
+        attention_runtime_scale
+    )
+    text, lowered = lower_xpu_stages(kernel, args)
+    assert "gpu.alloc" not in text
+    assert "intel_sub_group_bf16_bf16_matrix_mad_k16" in lowered
+
+
+@pytest.mark.isolated
+def test_attention_head_index_from_outer_loop_lowers() -> None:
+    """Regression: "invalid block key: '(u3//4)'" for a tile position's arithmetic
+    above the loop that uses it."""
+    args = [
+        xpu_tensor(2, 8, 256, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+        xpu_tensor(2, 2, 256, 64, dtype=torch.bfloat16),
+    ]
+    kernel = _kernel(helion.Config(block_sizes=[256, 64]))(attention_head_index)
+    text, _ = lower_xpu_stages(kernel, args)
+    assert text.count("xegpu.dpas") == 2
+    assert "arith.floordivsi" in text or "arith.divsi" in text or "arith.divui" in text
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("k", "blocks"),
+    [(256, [64, 32]), (128, [64, 32]), (256, [64, 64]), (128, [128, 64])],
+)
+def test_matmul_and_row_reduction_is_a_clear_error(k: int, blocks: list[int]) -> None:
+    """Regression: a raw ``AssertionError: annotate_attention expects d_head to be
+    64`` from lighthouse's attention layout at K tiles other than 64; at 64 it
+    lowered, with 180 of 256 rows wrong on the device."""
+    args = [
+        xpu_tensor(256, k, dtype=torch.bfloat16),
+        xpu_tensor(k, 256, dtype=torch.bfloat16),
+    ]
+    with pytest.raises(UnsupportedOperationError, match=r"row reduction in one grid"):
+        lower_xpu(
+            _kernel(helion.Config(block_sizes=blocks))(matmul_and_row_maximum), args
+        )
+
+
+@pytest.mark.isolated
+def test_clamp_uses_ordered_comparisons() -> None:
+    """torch-mlir's clamp selects the bound for a NaN input (``cmpf ult``); the
+    helper compares ordered (``nan_minmax``), down to XeGPU."""
+    args = [xpu_tensor(64, 256, dtype=torch.bfloat16)] * 2
+    text, _ = lower_xpu_stages(clamp_scaled, args)
+    assert re.search(r"arith\.cmpf olt, [^\n]*vector<32x256xf32>", text)
+    assert re.search(r"arith\.cmpf ogt, [^\n]*vector<32x256xf32>", text)
+    assert "cmpf ult" not in text and "cmpf ugt" not in text
+
+
+@pytest.mark.isolated
+def test_cpu_tensors_lower_for_a_named_xpu_target() -> None:
+    """Codegen is target-neutral: the IR of CPU (or meta) tensors lowers for the
+    XPU when the target is named; running it needs XPU tensors."""
+    cpu = [torch.randn(N, N, dtype=torch.float16) for _ in range(2)]
+    _check_gemm_kernel(lower_xpu(matmul, cpu), grid=(4, 4), threads=512)
+    meta = [torch.empty(N, N, dtype=torch.float16, device="meta") for _ in range(2)]
+    _check_gemm_kernel(lower_xpu(matmul, meta), grid=(4, 4), threads=512)
+
+
+@pytest.mark.isolated
+def test_stop_point_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HELION_MLIR_XPU_STOP_AT", "xegpu-wg")
+    text = str(lower_mlir(matmul, _gemm_args()))
+    assert "xegpu.dpas" in text
+    # An explicit stop point wins.
+    assert "xegpu." not in str(lower_mlir(matmul, _gemm_args(), stop_at="xevm"))
+    monkeypatch.setenv("HELION_MLIR_XPU_STOP_AT", "llvm")
+    with pytest.raises(ValueError, match="HELION_MLIR_XPU_STOP_AT='llvm'"):
+        lower_mlir(matmul, _gemm_args())
+
+
+@pytest.mark.isolated
+def test_stage_dumps(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HELION_MLIR_DUMP_STAGES", "1")
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")  # lower in-process
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        lower_xpu(matmul, _gemm_args())
+    stages = re.findall(r"=== MLIR after XPU stage '([\w-]+)' ===", output.getvalue())
+    assert stages == [
+        "prepare",
+        "cleanup",
+        "vectorized",
+        "nan-maxima",
+        "bufferized",
+        "partial-tiles",
+        "host-legalized",
+        "grid-mappings",
+        "gpu-outlining",
+        "print-reads",
+        "row-results",
+        "bool-casts",
+        "xegpu-initial",
+        "xegpu-wg",
+    ]
+
+
+@pytest.mark.isolated
+def test_cpu_target_lowers_to_llvm() -> None:
+    cpu = [torch.randn(64, 64), torch.randn(64, 64)]
+    text = str(lower_mlir(matmul, cpu, config=helion.Config(block_sizes=[32, 32, 32])))
+    assert "llvm.func @matmul" in text
+    with pytest.raises(ValueError, match="stop point 'xevm'"):
+        lower_mlir(matmul, cpu, stop_at="xevm")
+
+
+# --- Rank 3+ (unit leading tile dims) -----------------------------------------
+
+_TENSOR_DESC = re.compile(r"!xegpu\.tensor_desc<((?:\d+x)+)\w+")
+_RANK3 = {
+    # name: (kernel, block sizes, input shapes, dtype, class op, grid)
+    "relu_3d": (
+        relu_nd,
+        [1, 128, 256],
+        [(4, 256, 512)],
+        torch.bfloat16,
+        "xegpu.load_nd",
+        (2, 2, 4),
+    ),
+    "relu_4d": (
+        relu_nd,
+        [1, 1, 128, 256],
+        [(2, 3, 256, 256)],
+        torch.float32,
+        "xegpu.load_nd",
+        (2, 3, 2),
+    ),
+    "batched_matmul": (
+        batched_matmul,
+        [1, 256, 256, 32],
+        [(4, N, N), (4, N, N)],
+        torch.float16,
+        "xegpu.dpas",
+        (4, 4, 4),
+    ),
+    "tensor_matmul": (
+        tensor_matmul,
+        [1, 256, 256, 32],
+        [(4, N, N), (N, N)],
+        torch.bfloat16,
+        "xegpu.dpas",
+        (4, 4, 4),
+    ),
+    "head_row_sums": (
+        head_row_sums,
+        [64, 1, 1, 64],
+        [(2, 4, 128, 256)],
+        torch.float32,
+        "vector.multi_reduction",
+        (2, 4, 2),
+    ),
+}
+
+
+def _rank3_case(name: str, **config: object) -> tuple[object, list[object]]:
+    fn, block_sizes, shapes, dtype, _, _ = _RANK3[name]
+    kernel = _kernel(helion.Config(block_sizes=block_sizes, **config))(fn)
+    return kernel, [xpu_tensor(*shape, dtype=dtype) for shape in shapes]
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize("name", list(_RANK3))
+def test_unit_leading_tile_dims_fold(name: str) -> None:
+    """Block size 1 on the leading dims: the kernel lowers as its 2D class, all
+    XeGPU tiles 2D, the leading dims as workgroup grid dims."""
+    *_, class_op, grid = _RANK3[name]
+    text, lowered = lower_xpu_stages(*_rank3_case(name))
+    assert class_op in text
+    ranks = {dims.count("x") for dims in _TENSOR_DESC.findall(text)}
+    assert ranks == {2}, ranks
+    assert f"known_grid_size = array<i32: {', '.join(map(str, grid))}>" in text
+    assert "xegpu." not in lowered
+    if class_op == "xegpu.dpas":
+        assert "matrix_mad" in lowered
+
+
+@pytest.mark.isolated
+def test_batched_matmul_params_see_the_batch_matrix() -> None:
+    """Parameter validation sees one batch's 2D GEMM (M, N, K of a matrix)."""
+    with pytest.raises(
+        XeGPUConfigError, match=r"GEMM \(M=1024, N=1024, K=1024, WG tile 256x256"
+    ):
+        lower_xpu(*_rank3_case("batched_matmul", xegpu_sg_tiles=[[256, 256]]))
+
+
+# --- Attention ------------------------------------------------------------------
+
+
+def attention_kt(q: torch.Tensor, kt: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """:func:`attention` of K stored transposed (``[B, H, D, S]``)."""
+    batch, heads, m, d = q.shape
+    n = kt.size(3)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        row_max = hl.full([tb, th, tm], float("-inf"), dtype=torch.float32)
+        row_sum = hl.zeros([tb, th, tm], dtype=torch.float32)
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhdn->bhmn", q_tile, kt[tb, th, :, tn])
+            new_max = torch.maximum(row_max, scores.amax(-1))
+            p = torch.exp(scores - new_max[:, :, :, None])
+            alpha = torch.exp(row_max - new_max)
+            row_sum = row_sum * alpha + p.sum(-1)
+            acc = acc * alpha[:, :, :, None] + torch.einsum(
+                "bhmn,bhnd->bhmd", p.to(v.dtype), v[tb, th, tn, :]
+            )
+            row_max = new_max
+        out[tb, th, tm, :] = (acc / row_sum[:, :, :, None]).to(out.dtype)
+    return out
+
+
+def chained_matmuls(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+    """``(Q @ K^T) @ V`` in one K/V loop, without a softmax between."""
+    batch, heads, m, d = q.shape
+    n = k.size(2)
+    out = torch.empty_like(q)
+    for tb, th, tm in hl.tile([batch, heads, m]):
+        q_tile = q[tb, th, tm, :]
+        acc = hl.zeros([tb, th, tm, d], dtype=torch.float32)
+        for tn in hl.tile(n):
+            scores = hl.zeros([tb, th, tm, tn], dtype=torch.float32)
+            scores = scores + torch.einsum("bhmd,bhnd->bhmn", q_tile, k[tb, th, tn, :])
+            acc = acc + torch.einsum(
+                "bhmn,bhnd->bhmd", scores.to(v.dtype), v[tb, th, tn, :]
+            )
+        out[tb, th, tm, :] = acc.to(out.dtype)
+    return out
+
+
+def _attention_case(
+    shape: tuple[int, int, int, int],
+    block_sizes: list[int],
+    fn: object = attention,
+    **config: object,
+) -> tuple[object, list[object]]:
+    kernel = _kernel(helion.Config(block_sizes=block_sizes, **config))(fn)
+    shapes = [shape, shape, shape]
+    if fn is attention_kt:
+        batch, heads, seq, head_dim = shape
+        shapes[1] = (batch, heads, head_dim, seq)
+    return kernel, [xpu_tensor(*dims, dtype=torch.bfloat16) for dims in shapes]
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("shape", "block_sizes", "sg_rows", "expected"),
+    [
+        # Other sizes than 97's: more workgroup rows, a 32-row K/V tile.
+        ((2, 4, 1024, 64), [1, 1, 256, 32], None, AttentionShape(256, 32, 64, 64)),
+        # A forced subgroup tile: 4 subgroups of 32 rows.
+        ((32, 32, 512, 64), [1, 1, 128, 64], 32, AttentionShape(128, 64, 64, 64)),
+    ],
+)
+def test_attention_is_recognized_by_structure(
+    shape: tuple[int, int, int, int],
+    block_sizes: list[int],
+    sg_rows: int | None,
+    expected: AttentionShape,
+) -> None:
+    """Two contractions chained through row reductions in a K/V loop are the
+    attention class (any sizes lighthouse's layout takes): lighthouse's
+    attention threads and layout, both matmuls on DPAS."""
+    config = {} if sg_rows is None else {"xegpu_sg_tiles": [[sg_rows, 0]]}
+    shapes: list[object] = []
+    check_params = xpu.check_params
+
+    def record(params: object, kernel_shapes: list[object]) -> None:
+        shapes.extend(kernel_shapes)
+        check_params(params, kernel_shapes)
+
+    with mock.patch.object(xpu, "check_params", record):
+        text, lowered = lower_xpu_stages(*_attention_case(shape, block_sizes, **config))
+    assert shapes == [expected]
+    rows = sg_rows or 16
+    subgroups = expected.rows // rows
+    assert f"known_block_size = array<i32: {subgroups * 16}, 1, 1>" in text
+    module = parse(text)
+    assert len(ops_named(module, "xegpu.dpas")) == 2
+    loads = [layout_of(op) for op in ops_named(module, "xegpu.load_nd")]
+    assert any(
+        layout.sg_layout == (subgroups, 1) and layout.sg_data == (rows, 64)
+        for layout in loads
+    )
+    assert any(
+        layout.sg_layout == (1, 1)
+        and layout.sg_data == (expected.kv_tile, 64)
+        and layout.order == (0, 1)
+        for layout in loads
+    )
+    assert "xegpu." not in lowered
+    assert "intel_sub_group_bf16_bf16_matrix_mad_k16" in lowered
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("shape", "block_sizes", "fn", "error", "match"),
+    [
+        # Lighthouse's attention layout is written for a head dim of 64.
+        (
+            (32, 32, 512, 128),
+            [1, 1, 128, 64],
+            attention,
+            UnsupportedOperationError,
+            r"attention with head dim 128(.|\n)*annotate_attention",
+        ),
+        # K stored transposed: lighthouse's layout loads K [seq, head dim].
+        (
+            (32, 32, 512, 64),
+            [1, 1, 128, 64],
+            attention_kt,
+            UnsupportedOperationError,
+            r"outside the attention form(.|\n)*K stored \[seq, head dim\]",
+        ),
+        # No softmax (row reduction) between the matmuls.
+        (
+            (32, 32, 512, 64),
+            [1, 1, 128, 64],
+            chained_matmuls,
+            UnsupportedOperationError,
+            "no row reduction",
+        ),
+        # One K/V tile: no K/V loop.
+        (
+            (32, 32, 512, 64),
+            [1, 1, 128, 512],
+            attention,
+            UnsupportedOperationError,
+            "not in one loop over K/V tiles",
+        ),
+        # V is loaded in 32x32 blocks.
+        (
+            (32, 32, 512, 64),
+            [1, 1, 128, 16],
+            attention,
+            XeGPUConfigError,
+            r"K/V tile of 16 rows is not a multiple of 32",
+        ),
+        # 64 subgroups of 16 rows.
+        (
+            (32, 32, 2048, 64),
+            [1, 1, 1024, 64],
+            attention,
+            XeGPUConfigError,
+            "64 subgroups of 16 rows exceed the maximum of 32",
+        ),
+    ],
+)
+def test_unsupported_attention_variants(
+    shape: tuple[int, int, int, int],
+    block_sizes: list[int],
+    fn: object,
+    error: type[Exception],
+    match: str,
+) -> None:
+    with pytest.raises(error, match=match):
+        lower_xpu(*_attention_case(shape, block_sizes, fn=fn))
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("xegpu", "match"),
+    [
+        # Q is loaded in 16-row blocks.
+        ({"xegpu_sg_tiles": [[8, 0]]}, r"\[rows, 0\] with rows a multiple of 16"),
+        ({"xegpu_sg_tiles": [[48, 0]]}, "not a multiple of the 48-row subgroups"),
+        ({"xegpu_load_tiles": [[16, 16]]}, "do not apply to attention kernels"),
+    ],
+)
+def test_invalid_attention_parameters(xegpu: dict[str, object], match: str) -> None:
+    with pytest.raises(XeGPUConfigError, match=match):
+        lower_xpu(*_attention_case((32, 32, 512, 64), [1, 1, 128, 64], **xegpu))
+
+
+# --- Unsupported kernels -----------------------------------------------------
+
+
+@pytest.mark.isolated
+def test_elementwise_tile_columns_must_fit_block_loads() -> None:
+    config = helion.Config(block_sizes=[64, 8])
+    with pytest.raises(
+        UnsupportedOperationError,
+        match=r"elementwise kernel \(WG tile 64x8\) on XPU(.|\n)*not a multiple of 16",
+    ):
+        lower_mlir(
+            relu,
+            [xpu_tensor(4096, 4096, dtype=torch.bfloat16)],
+            config=config,
+            target="xpu",
+            stop_at="xegpu-wg",
+        )
+
+
+@pytest.mark.isolated
+def test_partial_tiles_on_unaligned_rows_are_unsupported() -> None:
+    """Other partial tiles: ``test_xpu_partial_tiles.py``."""
+    with pytest.raises(UnsupportedOperationError, match="partial tiles on rows of"):
+        lower_xpu(matmul, _gemm_args(size=1001))
+
+
+@pytest.mark.isolated
+def test_matmul_without_k_loop_is_unsupported() -> None:
+    config = helion.Config(block_sizes=[256, 256, N])
+    with pytest.raises(UnsupportedOperationError, match="without a K loop") as refused:
+        lower_mlir(matmul, _gemm_args(), config=config, target="xpu", stop_at="xevm")
+    assert "padded with zeros" in str(refused.value)
+
+
+@pytest.mark.isolated
+def test_f32_matmul_is_unsupported() -> None:
+    with pytest.raises(UnsupportedOperationError, match="f32 x f32 into f32"):
+        lower_xpu(matmul, _gemm_args(torch.float32))
+
+
+@pytest.mark.isolated
+def test_two_matmuls_in_one_grid_loop_are_unsupported() -> None:
+    args = [xpu_tensor(N, N, dtype=torch.float16) for _ in range(3)]
+    with pytest.raises(
+        UnsupportedOperationError,
+        match=r"two matmuls outside the attention form(.|\n)*one loop over K/V",
+    ):
+        lower_xpu(two_matmuls, args)
+
+
+@pytest.mark.isolated
+@pytest.mark.parametrize(
+    ("name", "block_sizes", "tile"),
+    [("relu_3d", [2, 64, 256], "2x64x256"), ("batched_matmul", [2, 128, 128, 32], "")],
+)
+def test_real_3d_tiles_are_unsupported(
+    name: str, block_sizes: list[int], tile: str
+) -> None:
+    fn, _, shapes, dtype, _, _ = _RANK3[name]
+    kernel = _kernel(helion.Config(block_sizes=block_sizes))(fn)
+    args = [xpu_tensor(*shape, dtype=dtype) for shape in shapes]
+    with pytest.raises(UnsupportedOperationError, match="3D tiles on XPU") as info:
+        lower_xpu(kernel, args)
+    assert tile in str(info.value)
+    assert "block size 1 on the leading" in str(info.value)
+
+
+@pytest.mark.isolated
+def test_reduction_over_a_middle_dim_is_unsupported() -> None:
+    kernel = _kernel(helion.Config(block_sizes=[1, 64]))(middle_sums)
+    with pytest.raises(
+        UnsupportedOperationError, match="reduction over a non-innermost dim"
+    ) as info:
+        lower_xpu(kernel, [xpu_tensor(16, 256, 256)])
+    assert "reduces dim 0 of a 256x64 tile" in str(info.value)
+
+
+@pytest.mark.isolated
+def test_dynamic_shapes_are_unsupported() -> None:
+    dynamic = helion.kernel(backend="mlir", static_shapes=False, config=GEMM)(matmul.fn)
+    # Real tensors: Helion keeps the sizes of fake ones static.
+    args = [torch.randn(N, 512).half(), torch.randn(512, 2 * N).half()]
+    with pytest.raises(UnsupportedOperationError, match="dynamic shapes on XPU"):
+        lower_xpu(dynamic, args)
+
+
+@pytest.mark.isolated
+def test_cpu_pipelines_are_rejected_on_xpu() -> None:
+    with pytest.raises(ValueError, match="unknown pipeline 'opt' for the MLIR target"):
+        lower_mlir(matmul, _gemm_args(), pipeline="opt", stop_at="xevm")
+    config = helion.Config(block_sizes=[256, 256, 32], mlir_pipeline="scalar")
+    with pytest.raises(ValueError, match="unknown pipeline 'scalar'"):
+        lower_mlir(matmul, _gemm_args(), config=config, stop_at="xevm")
+
+
+# --- Runtime without an XPU ---------------------------------------------------
+
+
+@pytest.mark.isolated
+def test_running_needs_an_xpu_capable_llvm(monkeypatch: pytest.MonkeyPatch) -> None:
+    if bindings_emit_spirv():
+        pytest.skip("the MLIR bindings have the SPIR-V target")
+    cpu = [torch.randn(N, N, dtype=torch.float16) for _ in range(2)]
+    with pytest.raises(UnsupportedTargetError, match="no SPIR-V target"):
+        compile_mlir(matmul, cpu, target="xpu")
+    with pytest.raises(UnsupportedTargetError, match="no SPIR-V target"):
+        lower_mlir(matmul, cpu, target="xpu")
+    # A default stop point lowers, then stops before the JIT.
+    monkeypatch.setenv("HELION_MLIR_XPU_STOP_AT", "xevm")
+    with pytest.raises(LoweringStoppedError, match="stops at 'xevm'"):
+        compile_mlir(matmul, cpu, target="xpu")
+
+
+def test_xpu_target_without_an_xpu() -> None:
+    target = get_target("xpu")
+    assert isinstance(target, XpuTarget)
+    assert target.pipelines == ("xegpu",)
+    assert target.default_pipeline() == "xegpu"
+    assert target.stop_points == ("xegpu-wg", "xevm", "xevm-final", "binary")
+    target.validate_environment("xegpu-wg")
+    target.validate_environment("xevm")
+    target.validate_environment("xevm-final")
+    with pytest.raises(NotImplementedError, match="compiled for XPU tensors"):
+        target.check_tensor("x", torch.empty(2))
+    # No XPU tensors: nothing to synchronize.
+    target.prepare_call([torch.tensor(1.0)])
+    if not (hasattr(torch, "xpu") and torch.xpu.is_available()):
+        assert target.hardware_name() == "xpu"
+
+
+def test_lighthouse_kernel_class_failures_are_unsupported_operations() -> None:
+    failure = RuntimeError(
+        "Failed to apply named transform sequence.\nDiagnostic message at "
+        "loc(unknown): outline_gpu_func: Could not apply any of the defined patterns."
+    )
+    error = _translated(failure, "gpu-outlining")
+    assert isinstance(error, UnsupportedOperationError)
+    assert "'outline_gpu_func' stage matched no GEMM" in str(error)
+    other = _translated(RuntimeError("boom"), "xevm")
+    assert other.__notes__ == ["Helion MLIR backend: failed in the XPU stage 'xevm'"]
+
+
+def test_generate_mlir_for_fake_xpu_tensors() -> None:
+    text = str(generate_mlir(matmul, _gemm_args()))
+    assert "linalg.matmul" in text and "scf.forall" in text
+
+
+# --- Host-code legalization ----------------------------------------------------
+
+
+HOST_CODE = """
+func.func @k(%out: memref<64x64xf32> {helion.name = "out", helion.role = "inout"},
+             %x: memref<64x64xf32> {helion.name = "x", helion.role = "in"},
+             %s: f64 {helion.name = "s", helion.role = "scalar"}) {
+  %zero = arith.constant 0.0 : f32
+  %tmp = gpu.alloc () : memref<64x64xf32>
+  memref.copy %x, %tmp : memref<64x64xf32> to memref<64x64xf32>
+  linalg.fill ins(%zero : f32) outs(%out : memref<64x64xf32>)
+  scf.forall (%i) in (64) {
+    %v = memref.load %tmp[%i, %i] : memref<64x64xf32>
+    %t = arith.truncf %s : f64 to f32
+    %r = arith.mulf %v, %t : f32
+    memref.store %r, %out[%i, %i] : memref<64x64xf32>
+  }
+  gpu.dealloc %tmp : memref<64x64xf32>
+  return
+}
+"""
+
+
+def _legalize(source: str) -> str:
+    with ir.Context() as context, ir.Location.unknown():
+        module = ir.Module.parse(source)
+        stage = TransformStage(xpu_transforms.legalize_host_ops(), context)
+        XpuLowering([("host-legalized", stage)], dump=False).apply(module)
+        module.operation.verify()
+        return str(module)
+
+
+def test_host_copies_and_fills_become_gpu_runtime_calls() -> None:
+    text = _legalize(HOST_CODE)
+    assert "memref.copy" not in text
+    assert "linalg.fill" not in text
+    assert re.search(r"gpu\.memcpy\s+%\w+, %arg1 :", text)
+    assert re.search(r"gpu\.memset\s+%arg0, %\w+ : memref<64x64xf32>, f32", text)
+    # The kernel stays; the runtime scalar's conversion moves out of it, so the
+    # kernel takes an f32.
+    assert "memref.store" in text
+    assert text.index("arith.truncf %arg2 : f64 to f32") < text.index("scf.forall")
+
+
+SCALAR_CODE = """
+func.func @k(%out: memref<64xf32>, %vout: memref<64x4xf32>, %s: f64, %n: i64) {
+  %c0 = arith.constant 0 : index
+  %c4 = arith.constant 4 : index
+  %c64 = arith.constant 64 : index
+  %c7 = arith.constant 7 : i64
+  %two = arith.constant 2.0 : f32
+  scf.forall (%i) in (64) {
+    %acc = scf.for %k = %c0 to %c64 step %c4 iter_args(%a = %two) -> (f32) {
+      %t = arith.truncf %s : f64 to f32
+      %f = arith.sitofp %n : i64 to f32
+      %u = arith.mulf %t, %f : f32
+      %ki = arith.index_cast %k : index to i64
+      %kf = arith.sitofp %ki : i64 to f32
+      %w = arith.mulf %u, %kf : f32
+      %d = arith.divsi %c7, %n : i64
+      %df = arith.sitofp %d : i64 to f32
+      %b = arith.addf %a, %w : f32
+      %c = arith.addf %b, %df : f32
+      scf.yield %c : f32
+    }
+    memref.store %acc, %out[%i] : memref<64xf32>
+    %t0 = arith.truncf %s : f64 to f32
+    %v = vector.broadcast %t0 : f32 to vector<4xf32>
+    vector.store %v, %vout[%i, %c0] : memref<64x4xf32>, vector<4xf32>
+  }
+  return
+}
+"""
+
+
+def test_invariant_scalar_code_moves_out_of_the_kernels() -> None:
+    text = _legalize(SCALAR_CODE)
+    kernel = text[text.index("scf.forall") :]
+    host = text[: text.index("scf.forall")]
+    # Scalar code of the runtime scalars, also from the nested loop.
+    for op in ("arith.truncf %arg2", "arith.sitofp %arg3", "arith.mulf %0, %1"):
+        assert op in host, op
+    # Code of the loops' induction variables, code that may trap (and what uses
+    # it) and vector code stay.
+    for op in ("arith.index_cast", "arith.divsi", "vector.broadcast", "arith.addf"):
+        assert op in kernel, op
+
+
+STRIDED_COPY = """
+  %sub = memref.subview %x[0, 0] [64, 32] [1, 1]
+      : memref<64x64xf32> to memref<64x32xf32, strided<[64, 1]>>
+  %sub2 = memref.subview %tmp[0, 0] [64, 32] [1, 1]
+      : memref<64x64xf32> to memref<64x32xf32, strided<[64, 1]>>
+  memref.copy %sub, %sub2
+      : memref<64x32xf32, strided<[64, 1]>> to memref<64x32xf32, strided<[64, 1]>>
+"""
+
+
+@pytest.mark.parametrize(
+    ("edits", "match"),
+    [
+        (
+            [
+                (
+                    "  gpu.dealloc",
+                    "  memref.store %zero, %out[%c0, %c0] : memref<64x64xf32>\n  gpu.dealloc",
+                )
+            ],
+            "'memref.store' outside the kernels accesses a device buffer",
+        ),
+        (
+            [("gpu.alloc ()", "memref.alloc ()"), ("gpu.dealloc", "memref.dealloc")],
+            "'memref.alloc' creates a host buffer",
+        ),
+        (
+            [
+                (
+                    "    %t = arith.truncf %s : f64 to f32",
+                    (
+                        "    %ii = arith.index_cast %i : index to i64\n"
+                        "    %if = arith.sitofp %ii : i64 to f64\n"
+                        "    %p = arith.mulf %if, %s : f64\n"
+                        "    %t = arith.truncf %p : f64 to f32"
+                    ),
+                )
+            ],
+            "'s' (f64) is used by 'arith.mulf' in a kernel",
+        ),
+        (
+            [("  memref.copy %x, %tmp", STRIDED_COPY + "  memref.copy %x, %tmp")],
+            "'memref.copy' outside the kernels accesses a device buffer",
+        ),
+    ],
+    ids=["host-store", "host-alloc", "f64-kernel-argument", "strided-copy"],
+)
+def test_host_access_to_device_memory_is_unsupported(
+    edits: list[tuple[str, str]], match: str
+) -> None:
+    source = HOST_CODE.replace(
+        "  %zero = arith.constant 0.0 : f32",
+        "  %zero = arith.constant 0.0 : f32\n  %c0 = arith.constant 0 : index",
+    )
+    for old, new in edits:
+        assert old in source
+        source = source.replace(old, new)
+    with pytest.raises(UnsupportedOperationError, match=re.escape(match)):
+        _legalize(source)

@@ -1,4 +1,4 @@
-"""``print`` in a kernel (``hl.device_print``): the printed values, the kernel's
+"""``print`` in a kernel (``hl.device_print``): the printed values on each target, the kernel's
 result unchanged, the refusals, and no change to a kernel without a print."""
 
 from __future__ import annotations
@@ -18,10 +18,17 @@ from mlir import ir
 import pytest
 import torch
 
+from tests.harness import xpu_tensor
+
 from helion_mlir_backend import api
 from helion_mlir_backend import lower_mlir
 from helion_mlir_backend._compiler.mlir.support import UnsupportedOperationError
+from helion_mlir_backend._compiler.mlir_transforms.prints import guard_prints
 from helion_mlir_backend._compiler.mlir_transforms.prints import lower_prints_to_libc
+from helion_mlir_backend._compiler.mlir_transforms.prints import (
+    settle_prints_of_stored_buffers,
+)
+from helion_mlir_backend._compiler.targets import xpu as xpu_target
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -29,6 +36,8 @@ if TYPE_CHECKING:
 
 BLOCKS_2D = [32, 32]
 BLOCKS_GEMM = [32, 32, 32]
+XPU_BLOCKS_2D = [64, 64]
+XPU_BLOCKS_GEMM = [64, 64, 32]
 
 
 def _kernel(fn: Callable, blocks: list[int]) -> helion.Kernel:
@@ -132,6 +141,24 @@ def scale_tile(x: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def chain(x: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.size()):
+        v = x[tm, tn] * 2.0
+        out[tm, tn] = torch.abs(v) + 1.0
+    return out
+
+
+def chain_tile(x: torch.Tensor) -> torch.Tensor:
+    """The print is of a tile only computed in the kernel."""
+    out = torch.empty_like(x)
+    for tm, tn in hl.tile(x.size()):
+        v = x[tm, tn] * 2.0
+        print("v", v)
+        out[tm, tn] = torch.abs(v) + 1.0
+    return out
+
+
 def two_tensors(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     for tm, tn in hl.tile(x.size()):
@@ -156,6 +183,18 @@ def int_tile(x: torch.Tensor) -> torch.Tensor:
         v = x[tm, tn]
         print("i", v)
         out[tm, tn] = v
+    return out
+
+
+def gemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        out[tm, tn] = acc.to(a.dtype)
     return out
 
 
@@ -199,6 +238,18 @@ def gemm_k_label_f32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return out
 
 
+def gemm_f32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        out[tm, tn] = acc
+    return out
+
+
 def in_host_code(x: torch.Tensor) -> torch.Tensor:
     out = torch.empty_like(x)
     hl.device_print("start", x)
@@ -213,6 +264,71 @@ def full_print(x: torch.Tensor) -> torch.Tensor:
     for tm, tn in hl.tile(x.size()):
         print("f", out[tm, tn])
         out[tm, tn] = x[tm, tn] * 2.0
+    return out
+
+
+def in_place_before(x: torch.Tensor) -> torch.Tensor:
+    for tm, tn in hl.tile(x.size()):
+        print("b", x[tm, tn])
+        x[tm, tn] = x[tm, tn] * 2.0
+    return x
+
+
+def in_place_after(x: torch.Tensor) -> torch.Tensor:
+    for tm, tn in hl.tile(x.size()):
+        x[tm, tn] = x[tm, tn] * 2.0
+        print("a", x[tm, tn])
+    return x
+
+
+def read_and_accumulate(x: torch.Tensor) -> torch.Tensor:
+    out = torch.zeros_like(x)
+    for tm, tn in hl.tile(x.size()):
+        print("z", out[tm, tn])
+        out[tm, tn] = out[tm, tn] + x[tm, tn]
+    return out
+
+
+def input_and_output(x: torch.Tensor) -> torch.Tensor:
+    out = torch.full_like(x, -1.0)
+    for tm, tn in hl.tile(x.size()):
+        print("x", x[tm, tn])
+        out[tm, tn] = x[tm, tn] * 2.0
+        print("o", out[tm, tn])
+    return out
+
+
+def maybe_aliased(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    for tm, tn in hl.tile(a.size()):
+        print("p", a[tm, tn])
+        b[tm, tn] = a[tm, tn] * 2.0
+    return b
+
+
+def gemm_stored(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], dtype=a.dtype, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+        out[tm, tn] = acc.to(a.dtype)
+        print("o", out[tm, tn])
+    return out
+
+
+def gemm_store_in_k(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Later K tiles overwrite the tile the print reads, in the other threads' shares."""
+    m, k = a.size()
+    _, n = b.size()
+    out = torch.empty([m, n], dtype=torch.float32, device=a.device)
+    for tm, tn in hl.tile([m, n]):
+        acc = hl.zeros([tm, tn], dtype=torch.float32)
+        for tk in hl.tile(k):
+            acc = torch.addmm(acc, a[tm, tk], b[tk, tn])
+            out[tm, tn] = acc
+            print("o", out[tm, tn])
     return out
 
 
@@ -257,6 +373,28 @@ def host_print(x: torch.Tensor) -> torch.Tensor:
     print("host", "only")
     for tm, tn in hl.tile(x.size()):
         out[tm, tn] = x[tm, tn] * 2.0
+    return out
+
+
+def print_in_an_if(x: torch.Tensor) -> torch.Tensor:
+    """A barrier here could be reached by some threads only, as far as the rule can tell."""
+    out = torch.full_like(x, 7.0)
+    for tm, tn in hl.tile(x.size()):
+        if tm.begin == 0:
+            print("i", out[tm, tn])
+        out[tm, tn] = x[tm, tn] * 2.0
+    return out
+
+
+def two_grid_loops(x: torch.Tensor) -> torch.Tensor:
+    out = torch.full_like(x, 7.0)
+    for tm, tn in hl.tile(x.size()):
+        print("a", out[tm, tn])
+        out[tm, tn] = x[tm, tn] * 2.0
+    hl.barrier()
+    for tm, tn in hl.tile(x.size()):
+        print("c", out[tm, tn])
+        out[tm, tn] = out[tm, tn] + 1.0
     return out
 
 
@@ -426,7 +564,145 @@ def test_refused_non_tensor_argument() -> None:
         lower_mlir(_kernel(position, BLOCKS_2D), [_x()], target="cpu")
 
 
+def test_refused_computed_tile_on_the_xpu() -> None:
+    kernel = _kernel(chain_tile, XPU_BLOCKS_2D)
+    with pytest.raises(UnsupportedOperationError) as error:
+        lower_mlir(kernel, [xpu_tensor(128, 128)], target="xpu", stop_at="xevm")
+    text = str(error.value)
+    assert "hl.device_print of a computed or partial tile on XPU" in text
+    assert "print a full loaded tile of an input, or the output tile after" in text
+
+
+def test_refused_partial_tile_on_the_xpu_names_it() -> None:
+    kernel = _kernel(int_tile, XPU_BLOCKS_2D)
+    with pytest.raises(UnsupportedOperationError, match="computed or partial tile"):
+        lower_mlir(kernel, [xpu_tensor(100, 128)], target="xpu", stop_at="xevm")
+
+
 STORED_BUFFER_WARNING = "may show wrong values"
+
+
+def _lowered_and_warnings(fn: Callable, bf16: bool) -> tuple[str, list[str]]:
+    """The kernel's IR at ``xegpu-wg``, and the messages of the warnings from lowering it.
+    ``simplefilter("always")``: the project's ``ignore::UserWarning`` would otherwise leave
+    the list empty whatever the backend does."""
+    args = (
+        [xpu_tensor(128, 128, dtype=torch.bfloat16) for _ in range(2)]
+        if bf16
+        else [xpu_tensor(128, 128)]
+    )
+    blocks = XPU_BLOCKS_GEMM if bf16 else XPU_BLOCKS_2D
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        text = str(
+            lower_mlir(_kernel(fn, blocks), args, target="xpu", stop_at="xegpu-wg")
+        )
+    return text[text.index("gpu.module") :], [str(w.message) for w in caught]
+
+
+def _stored_buffer_warnings(messages: list[str]) -> list[str]:
+    return [message for message in messages if STORED_BUFFER_WARNING in message]
+
+
+@pytest.mark.parametrize(
+    ("fn", "bf16"),
+    [
+        (full_print, False),
+        (in_place_before, False),
+        (read_and_accumulate, False),
+        (gemm_store_in_k, True),
+    ],
+    ids=["full", "in-place-before", "accumulate", "store-in-k"],
+)
+def test_print_that_can_see_other_threads_stores_gets_barriers(
+    fn: Callable, bf16: bool
+) -> None:
+    text, messages = _lowered_and_warnings(fn, bf16)
+    assert _stored_buffer_warnings(messages) == []
+    assert text.count("gpu.barrier") == 2
+    assert re.search(r"gpu\.barrier.*gpu\.printf.*gpu\.barrier", text, re.DOTALL)
+
+
+def test_each_grid_loop_gets_its_own_barriers() -> None:
+    kernel = _kernel(two_grid_loops, [64] * 4)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        text = str(
+            lower_mlir(kernel, [xpu_tensor(128, 128)], target="xpu", stop_at="xegpu-wg")
+        )
+    assert _stored_buffer_warnings([str(w.message) for w in caught]) == []
+    assert text.count("gpu.barrier") == 4
+
+
+def test_warns_with_no_barrier_in_a_users_if() -> None:
+    text, messages = _lowered_and_warnings(print_in_an_if, False)
+    found = _stored_buffer_warnings(messages)
+    assert len(found) == 1
+    assert found[0].startswith("'i'")
+    assert "control flow all threads may not run" in found[0]
+    assert "Print the tile after its store" in found[0]
+    assert "or print an input the kernel only reads" in found[0]
+    assert "gpu.barrier" not in text
+
+
+def test_warning_reaches_the_caller_with_pytest_warns() -> None:
+    with pytest.warns(UserWarning, match=STORED_BUFFER_WARNING):
+        lower_mlir(
+            _kernel(print_in_an_if, XPU_BLOCKS_2D),
+            [xpu_tensor(128, 128)],
+            target="xpu",
+            stop_at="xevm",
+        )
+
+
+@pytest.mark.parametrize(
+    ("fn", "bf16"),
+    [
+        (in_place_after, False),
+        (input_and_output, False),
+        (scale_tile, False),
+        (scale_label, False),
+        (gemm_stored, True),
+        (gemm_input, True),
+    ],
+    ids=[
+        "in-place-after",
+        "input-and-output",
+        "tile-stored",
+        "label",
+        "gemm-stored",
+        "k-input",
+    ],
+)
+def test_nothing_added_for_inputs_labels_and_after_the_store(
+    fn: Callable, bf16: bool
+) -> None:
+    text, messages = _lowered_and_warnings(fn, bf16)
+    assert _stored_buffer_warnings(messages) == []
+    assert "gpu.barrier" not in text
+
+
+def test_warning_doesnt_change_the_kernel(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A warned print stays as it is: the same module with or without the check."""
+
+    def lowered() -> str:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return str(
+                lower_mlir(
+                    _kernel(print_in_an_if, XPU_BLOCKS_2D),
+                    [xpu_tensor(128, 128)],
+                    target="xpu",
+                    stop_at="xevm-final",
+                )
+            )
+
+    with_check = lowered()
+    monkeypatch.setattr(
+        xpu_target, "settle_prints_of_stored_buffers", lambda module: []
+    )
+    assert lowered() == with_check
+    assert "lowering_warnings" not in with_check
 
 
 def test_cpu_has_no_such_warning() -> None:
@@ -441,7 +717,64 @@ def test_cpu_lowers_a_print_before_the_store() -> None:
     assert "@printf" in text
 
 
-# --- The experimental warning ------------------------------------------------------
+# --- The XPU target's IR -----------------------------------------------------------
+
+
+def _xegpu_lines(text: str) -> list[str]:
+    """The ``xegpu`` ops without SSA names, which a print shifts."""
+    return [
+        re.sub(r"%[\w#]+", "%v", line.strip())
+        for line in text.splitlines()
+        if "xegpu." in line
+    ]
+
+
+@pytest.mark.parametrize(
+    ("printing", "plain", "blocks", "bf16"),
+    [
+        (scale_label, scale, XPU_BLOCKS_2D, False),
+        (scale_tile, scale, XPU_BLOCKS_2D, False),
+        (gemm_k_label, gemm, XPU_BLOCKS_GEMM, True),
+        (gemm_input, gemm, XPU_BLOCKS_GEMM, True),
+    ],
+    ids=["tile-label", "tile-stored", "k-label", "k-input"],
+)
+def test_xpu_print_is_guarded_and_keeps_the_xegpu_ops(
+    printing: Callable, plain: Callable, blocks: list[int], bf16: bool
+) -> None:
+    def tensors() -> list[torch.Tensor]:
+        if bf16:
+            return [xpu_tensor(128, 128, dtype=torch.bfloat16) for _ in range(2)]
+        return [xpu_tensor(128, 128)]
+
+    text = str(
+        lower_mlir(
+            _kernel(printing, blocks), tensors(), target="xpu", stop_at="xegpu-wg"
+        )
+    )
+    kernel = text[text.index("gpu.module") :]
+    host = text[: text.index("gpu.module")]
+    assert re.search(r"scf\.if %\w+ \{\s+gpu\.printf", kernel)
+    assert "gpu.thread_id x" in kernel
+    assert "gpu.thread_id" not in host
+    plain_text = str(
+        lower_mlir(_kernel(plain, blocks), tensors(), target="xpu", stop_at="xegpu-wg")
+    )
+    assert _xegpu_lines(text) == _xegpu_lines(plain_text)
+
+
+def test_xpu_print_reaches_the_opencl_builtin() -> None:
+    text = str(
+        lower_mlir(
+            _kernel(scale_label, XPU_BLOCKS_2D),
+            [xpu_tensor(128, 128)],
+            target="xpu",
+            stop_at="xevm",
+        )
+    )
+    assert "_Z6printfPU3AS2Kcz" in text
+    assert "gpu.printf" not in text
+    assert "_Z12get_local_idj" in text
 
 
 EXPERIMENTAL = "(hl.device_print) is experimental"
@@ -452,10 +785,17 @@ def _experimental(recwarn: pytest.WarningsRecorder) -> list[str]:
 
 
 def _lower_for(target: str, fn: Callable) -> None:
-    lower_mlir(_kernel(fn, BLOCKS_2D), [_x()], target=target)
+    if target == "xpu":
+        args, blocks = [xpu_tensor(128, 128)], XPU_BLOCKS_2D
+    else:
+        args, blocks = [_x()], BLOCKS_2D
+    lower_mlir(_kernel(fn, blocks), args, target=target, stop_at=_STOPS[target])
 
 
-@pytest.mark.parametrize("target", ["cpu"])
+_STOPS = {"cpu": None, "xpu": "xegpu-wg"}
+
+
+@pytest.mark.parametrize("target", ["cpu", "xpu"])
 def test_experimental_warning_once_per_compile(
     target: str, recwarn: pytest.WarningsRecorder
 ) -> None:
@@ -468,7 +808,7 @@ def test_experimental_warning_once_per_compile(
     assert "'Printing in a kernel'" in messages[0]
 
 
-@pytest.mark.parametrize("target", ["cpu"])
+@pytest.mark.parametrize("target", ["cpu", "xpu"])
 def test_no_experimental_warning_without_a_print(
     target: str, recwarn: pytest.WarningsRecorder
 ) -> None:
@@ -483,7 +823,7 @@ def test_host_print_is_no_kernel_print(recwarn: pytest.WarningsRecorder) -> None
     assert _experimental(recwarn) == []
 
 
-@pytest.mark.parametrize("target", ["cpu"])
+@pytest.mark.parametrize("target", ["cpu", "xpu"])
 def test_every_compile_warns_under_the_default_filter(
     target: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -496,6 +836,17 @@ def test_every_compile_warns_under_the_default_filter(
         _lower_for(target, two_labels)
         _lower_for(target, two_labels)
     assert len([w for w in caught if EXPERIMENTAL in str(w.message)]) == 2
+
+
+def test_stored_buffer_warning_on_every_compile_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HELION_MLIR_COMPILE_TIMEOUT", "0")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("default")
+        _lower_for("xpu", print_in_an_if)
+        _lower_for("xpu", print_in_an_if)
+    assert len([w for w in caught if STORED_BUFFER_WARNING in str(w.message)]) == 2
 
 
 # --- A kernel without a print ------------------------------------------------------
@@ -534,6 +885,29 @@ def test_generated_module_differs_by_the_print_alone() -> None:
     assert without.replace("k_printing", "k_plain") == _generated(k_plain, BLOCKS_2D, x)
 
 
+def test_xevm_final_of_a_kernel_without_a_print_is_byte_identical(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def lowered() -> str:
+        return str(
+            lower_mlir(
+                _kernel(scale, XPU_BLOCKS_2D),
+                [xpu_tensor(128, 128)],
+                target="xpu",
+                stop_at="xevm-final",
+            )
+        )
+
+    with_steps = lowered()
+    monkeypatch.setattr(xpu_target, "guard_prints", lambda module: 0)
+    monkeypatch.setattr(
+        xpu_target, "refuse_prints_needing_allocation", lambda module: None
+    )
+    assert lowered() == with_steps
+    assert "printf" not in with_steps
+    assert "thread_id" not in with_steps
+
+
 NO_PRINT = """
 module {
   func.func @f(%x: index) -> index { return %x : index }
@@ -560,7 +934,7 @@ def _context():
 
 
 @pytest.mark.usefixtures("_context")
-@pytest.mark.parametrize("rewrite", [lower_prints_to_libc])
+@pytest.mark.parametrize("rewrite", [lower_prints_to_libc, guard_prints])
 def test_rewrites_leave_a_module_without_a_print_alone(rewrite: Callable) -> None:
     module = ir.Module.parse(NO_PRINT)
     before = str(module)
@@ -581,4 +955,352 @@ def test_libc_calls_share_strings_and_pass_doubles() -> None:
     assert text.count("arith.extf %arg0 : f32 to f64") == 2
 
 
+@pytest.mark.usefixtures("_context")
+def test_guard_wraps_each_print() -> None:
+    module = ir.Module.parse(TWO_PRINTS)
+    assert guard_prints(module) == 3
+    module.operation.verify()
+    text = str(module)
+    assert text.count("gpu.thread_id x") == 3
+    assert text.count("arith.cmpi eq") == 3
+    assert len(re.findall(r"scf\.if %\w+ \{\s+gpu\.printf", text)) == 3
+
+
+STORE_THEN_READ = """
+  %v = "test.tile"() : () -> vector<8x8xf32>
+  vector.transfer_write %v, %a[%i, %j] {in_bounds = [true, true]} : vector<8x8xf32>, memref<64x64xf32>
+"""
+SECOND_STORE = STORE_THEN_READ.replace("%v", "%v2")
+READ_TILE = """
+  scf.for %p = %c0 to %c8 step %c1 {
+    scf.for %q = %c0 to %c8 step %c1 {
+      %r = arith.addi %i, %p : index
+      %s = arith.addi %j, %q : index
+      %e = memref.load %SOURCE[%r, %s] : memref<64x64xf32>
+      gpu.printf "e %f\\n", %e : f32
+    }
+  }
+"""
+
+
+def _kernel_module(body: str, host_args: str = "%x, %x2") -> ir.Module:
+    first, second = host_args.split(", ")
+    return ir.Module.parse(f"""
+module attributes {{gpu.container_module}} {{
+  func.func @entry(%x: memref<64x64xf32>, %x2: memref<64x64xf32>, %n: index) {{
+    %y = memref.cast %x : memref<64x64xf32> to memref<64x64xf32>
+    gpu.launch_func @m::@k blocks in (%n, %n, %n) threads in (%n, %n, %n) args({first} : memref<64x64xf32>, {second} : memref<64x64xf32>)
+    return
+  }}
+  gpu.module @m {{
+    gpu.func @k(%a: memref<64x64xf32>, %b: memref<64x64xf32>) kernel {{
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c8 = arith.constant 8 : index
+      %c9 = arith.constant 9 : index
+      %i = "test.begin"() : () -> index
+      %j = "test.begin"() : () -> index
+      {body}
+      gpu.return
+    }}
+  }}
+}}
+""")
+
+
+@pytest.mark.usefixtures("_context")
+@pytest.mark.parametrize(
+    "body",
+    [
+        STORE_THEN_READ + READ_TILE.replace("%SOURCE", "%a"),
+        READ_TILE.replace("%SOURCE", "%b"),
+        READ_TILE.replace("%SOURCE", "%b") + STORE_THEN_READ,
+        STORE_THEN_READ,
+    ],
+    ids=["after-its-store", "input", "input-before-another-store", "no-print"],
+)
+def test_store_rule_is_silent(body: str) -> None:
+    module = _kernel_module(body)
+    before = str(module)
+    assert settle_prints_of_stored_buffers(module) == []
+    assert str(module) == before
+
+
+@pytest.mark.usefixtures("_context")
+@pytest.mark.parametrize(
+    ("body", "host_args"),
+    [
+        (READ_TILE.replace("%SOURCE", "%a") + STORE_THEN_READ, "%x, %x2"),
+        (
+            STORE_THEN_READ + SECOND_STORE + READ_TILE.replace("%SOURCE", "%a"),
+            "%x, %x2",
+        ),
+        (
+            STORE_THEN_READ + READ_TILE.replace("%SOURCE", "%a") + SECOND_STORE,
+            "%x, %x2",
+        ),
+        (
+            STORE_THEN_READ
+            + READ_TILE.replace("%SOURCE", "%a").replace("to %c8", "to %c9"),
+            "%x, %x2",
+        ),
+        (
+            STORE_THEN_READ
+            + READ_TILE.replace("%SOURCE", "%a").replace(
+                "arith.addi %i", "arith.addi %j"
+            ),
+            "%x, %x2",
+        ),
+        (
+            "scf.for %t = %c0 to %c8 step %c1 {"
+            + STORE_THEN_READ
+            + READ_TILE.replace("%SOURCE", "%a")
+            + "}",
+            "%x, %x2",
+        ),
+        (
+            STORE_THEN_READ.replace(
+                "{in_bounds = [true, true]}",
+                "{in_bounds = [true, true], permutation_map = "
+                "affine_map<(d0, d1) -> (d1, d0)>}",
+            )
+            + READ_TILE.replace("%SOURCE", "%a"),
+            "%x, %x2",
+        ),
+        (
+            '"test.writes"(%a) : (memref<64x64xf32>) -> ()'
+            + READ_TILE.replace("%SOURCE", "%a"),
+            "%x, %x2",
+        ),
+        (STORE_THEN_READ + READ_TILE.replace("%SOURCE", "%b"), "%x, %y"),
+    ],
+    ids=[
+        "before-the-store",
+        "two-stores-before",
+        "a-store-after",
+        "outside-the-tile",
+        "swapped-begins",
+        "store-in-a-loop",
+        "transposed-store",
+        "unknown-op",
+        "one-host-buffer",
+    ],
+)
+def test_store_rule_warns(body: str, host_args: str) -> None:
+    module = _kernel_module(body, host_args)
+    messages = settle_prints_of_stored_buffers(module)
+    assert len(messages) == 1
+    assert "also stores" in messages[0]
+    assert "gpu.barrier" not in str(module)
+
+
+GRID_STORE = """
+  %v = "test.tile"() : () -> vector<8x8xf32>
+  vector.transfer_write %v, %a[%i, %j] {in_bounds = [true, true]} : vector<8x8xf32>, memref<64x64xf32>
+"""
+
+
+def _grid_module(
+    body: str,
+    *,
+    begins: tuple[str, str] = ("x", "y"),
+    step: int = 8,
+    grid: str = "known_grid_size = array<i32: 2, 2, 1>",
+) -> ir.Module:
+    """A kernel whose tile is ``[block_id * step, ...]``, ``%i`` and ``%j``."""
+    return ir.Module.parse(f"""
+module attributes {{gpu.container_module}} {{
+  func.func @entry(%x: memref<64x64xf32>, %x2: memref<64x64xf32>, %c: i1, %n: index) {{
+    gpu.launch_func @m::@k blocks in (%n, %n, %n) threads in (%n, %n, %n) args(%x : memref<64x64xf32>, %x2 : memref<64x64xf32>, %c : i1, %n : index)
+    return
+  }}
+  gpu.module @m {{
+    gpu.func @k(%a: memref<64x64xf32>, %b: memref<64x64xf32>, %u: i1, %n: index) kernel attributes {{{grid}}} {{
+      %c0 = arith.constant 0 : index
+      %c1 = arith.constant 1 : index
+      %c8 = arith.constant 8 : index
+      %step = arith.constant {step} : index
+      %bx = gpu.block_id {begins[0]}
+      %by = gpu.block_id {begins[1]}
+      %i = arith.muli %bx, %step : index
+      %j = arith.muli %by, %step : index
+      {body}
+      gpu.return
+    }}
+  }}
+}}
+""")
+
+
+GUARDED_READ = """
+  %t = gpu.thread_id x
+  %first = arith.cmpi eq, %t, %c0 : index
+  scf.for %p = %c0 to %c8 step %c1 {
+    scf.for %q = %c0 to %c8 step %c1 {
+      %r = arith.addi %FIRST, %p : index
+      %s = arith.addi %j, %q : index
+      %e = memref.load %a[%r, %s] : memref<64x64xf32>
+      scf.if %first {
+        gpu.printf "e %f\\n", %e : f32
+      }
+    }
+  }
+"""
+OWN_READ = GUARDED_READ.replace("%FIRST", "%i")
+
+
+@pytest.mark.usefixtures("_context")
+def test_barriers_go_around_the_prints_own_loops() -> None:
+    module = _grid_module(OWN_READ + GRID_STORE)
+    assert settle_prints_of_stored_buffers(module) == []
+    module.operation.verify()
+    text = str(module)
+    assert text.count("gpu.barrier") == 2
+    # Just outside the print's two loops, on both sides, and before the store.
+    assert re.search(
+        r"gpu\.barrier\s+scf\.for.*scf\.for.*gpu\.printf.*\}\s+\}\s+\}\s+gpu\.barrier",
+        text,
+        re.DOTALL,
+    )
+    assert text.index("vector.transfer_write") > text.rindex("gpu.barrier")
+
+
+@pytest.mark.usefixtures("_context")
+def test_barriers_in_a_loop_of_constant_bounds() -> None:
+    module = _grid_module(
+        "scf.for %k = %c0 to %c8 step %c1 {" + OWN_READ + GRID_STORE + "}"
+    )
+    assert settle_prints_of_stored_buffers(module) == []
+    assert str(module).count("gpu.barrier") == 2
+
+
+@pytest.mark.usefixtures("_context")
+@pytest.mark.parametrize(
+    ("body", "options", "reason"),
+    [
+        ("scf.if %u {" + OWN_READ + "}" + GRID_STORE, {}, "control flow"),
+        (
+            "scf.for %k = %c0 to %n step %c1 {" + OWN_READ + GRID_STORE + "}",
+            {},
+            "control flow",
+        ),
+        (GUARDED_READ.replace("%FIRST", "%j") + GRID_STORE, {}, "another workgroup"),
+        (OWN_READ + GRID_STORE.replace("%a[%i, %j]", "%a[%c0, %j]"), {}, "another"),
+        (OWN_READ + GRID_STORE, {"begins": ("x", "x")}, "another workgroup"),
+        (OWN_READ + GRID_STORE, {"step": 4}, "another workgroup"),
+        (OWN_READ + GRID_STORE, {"grid": ""}, "another workgroup"),
+        (
+            OWN_READ
+            + GRID_STORE
+            + GRID_STORE.replace("%v", "%v2").replace("%a[%i, %j]", "%a[%j, %i]"),
+            {},
+            "another workgroup",
+        ),
+    ],
+    ids=[
+        "users-if",
+        "runtime-loop",
+        "read-swapped",
+        "store-without-block-id",
+        "grid-dim-unused",
+        "step-below-tile",
+        "no-known-grid",
+        "second-store-elsewhere",
+    ],
+)
+def test_no_barrier_unless_proven_right(
+    body: str, options: dict[str, object], reason: str
+) -> None:
+    module = _grid_module(body, **options)
+    messages = settle_prints_of_stored_buffers(module)
+    assert len(messages) == 1
+    assert reason in messages[0]
+    assert "gpu.barrier" not in str(module)
+
+
 # --- On the device -----------------------------------------------------------------
+
+
+@pytest.mark.xpu_runtime
+@pytest.mark.isolated
+def test_label_and_values_on_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    for variable in ("HELION_MLIR_TARGET", "HELION_MLIR_XPU_STOP_AT"):
+        monkeypatch.delenv(variable, raising=False)
+    x = _x(128).to("xpu")
+    with _stdout_lines() as label_lines:
+        out = _kernel(scale_label, XPU_BLOCKS_2D)(x)
+        torch.xpu.synchronize()
+    assert label_lines == ["50% tile é"] * 4
+    plain = _kernel(scale, XPU_BLOCKS_2D)(x)
+    torch.xpu.synchronize()
+    assert torch.equal(out.cpu(), plain.cpu())
+    with _stdout_lines() as lines:
+        out = _kernel(scale_tile, XPU_BLOCKS_2D)(x)
+        torch.xpu.synchronize()
+    elements = _elements(lines, "v")
+    assert len(elements) == x.numel()
+    _check_positions(elements, x.cpu() * 2, 64)
+    assert torch.equal(out.cpu(), plain.cpu())
+
+
+@pytest.mark.xpu_runtime
+@pytest.mark.isolated
+def test_gemm_k_loop_on_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    for variable in ("HELION_MLIR_TARGET", "HELION_MLIR_XPU_STOP_AT"):
+        monkeypatch.delenv(variable, raising=False)
+    a, b = (t.to("xpu") for t in _ab(128))
+    with _stdout_lines() as lines:
+        out = _kernel(gemm_k_label, XPU_BLOCKS_GEMM)(a, b)
+        torch.xpu.synchronize()
+    assert lines == ["k"] * (4 * 4)
+    plain = _kernel(gemm, XPU_BLOCKS_GEMM)(a, b)
+    torch.xpu.synchronize()
+    assert torch.equal(out.to(torch.float32).cpu(), plain.to(torch.float32).cpu())
+
+
+@pytest.mark.xpu_runtime
+@pytest.mark.isolated
+def test_before_the_store_forms_print_their_values_on_the_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The review's kernels, exact; without barriers most of these values were wrong."""
+    for variable in ("HELION_MLIR_TARGET", "HELION_MLIR_XPU_STOP_AT"):
+        monkeypatch.delenv(variable, raising=False)
+    x = _x(128)
+    for fn, label, expected, result in (
+        (full_print, "f", torch.full_like(x, 7.0), x * 2),
+        (read_and_accumulate, "z", torch.zeros_like(x), x),
+        (in_place_before, "b", x, x * 2),
+    ):
+        with _stdout_lines() as lines:
+            out = _kernel(fn, XPU_BLOCKS_2D)(x.to("xpu").clone())
+            torch.xpu.synchronize()
+        _check_positions(_elements(lines, label), expected, 64)
+        assert torch.equal(out.cpu(), result)
+
+
+@pytest.mark.xpu_runtime
+@pytest.mark.isolated
+def test_allowed_stores_and_inputs_print_their_values_on_the_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An input at the call, an output after its store (over a sentinel), and an input that
+    is the output at the call, which is passed as a copy."""
+    for variable in ("HELION_MLIR_TARGET", "HELION_MLIR_XPU_STOP_AT"):
+        monkeypatch.delenv(variable, raising=False)
+    x = _x(128)
+    with _stdout_lines() as lines:
+        out = _kernel(input_and_output, XPU_BLOCKS_2D)(x.to("xpu"))
+        torch.xpu.synchronize()
+    inputs = [line for line in lines if line.startswith("x[")]
+    stored = [line for line in lines if line.startswith("o[")]
+    assert len(inputs) == len(stored) == x.numel()
+    _check_positions(_elements(inputs, "x"), x, 64)
+    _check_positions(_elements(stored, "o"), x * 2, 64)
+    assert torch.equal(out.cpu(), x * 2)
+    aliased = x.to("xpu")
+    with _stdout_lines() as lines:
+        out = _kernel(maybe_aliased, XPU_BLOCKS_2D)(aliased, aliased)
+        torch.xpu.synchronize()
+    _check_positions(_elements(lines, "p"), x, 64)
+    assert torch.equal(out.cpu(), x * 2)

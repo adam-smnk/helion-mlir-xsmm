@@ -54,6 +54,14 @@ class UnsupportedTargetError(UnsupportedOperationError, NotImplementedError):
     """
 
 
+class XeGPUConfigError(MLIRBackendError, ValueError):
+    """Raised for ``xegpu_*`` config values the XPU target cannot apply: malformed
+    entries, more entries than the kernel has GPU kernels, or tiles outside
+    lighthouse's XeGPU constraints for the kernel's shapes.
+
+    Also a :class:`ValueError`; the autotuner skips such configs."""
+
+
 class ShapeError(MLIRBackendError):
     """Raised when shape inference fails."""
 
@@ -131,13 +139,13 @@ class CompileTimeoutError(MLIRBackendError):
 
 
 class LoweringStoppedError(MLIRBackendError):
-    """Raised when a kernel to run was only lowered to an earlier stage: there is
-    nothing to JIT-compile."""
+    """Raised when a kernel to run was only lowered to an earlier stage (e.g.
+    ``HELION_MLIR_XPU_STOP_AT``): there is nothing to JIT-compile."""
 
     def __init__(self, target: str, stop_at: str | None) -> None:
         super().__init__(
             f"Lowering for the MLIR target '{target}' stops at '{stop_at}' by "
-            "default, so the kernel cannot run; "
+            "default (e.g. HELION_MLIR_XPU_STOP_AT), so the kernel cannot run; "
             "helion_mlir_backend.lower_mlir() returns the IR"
         )
         self.target = target

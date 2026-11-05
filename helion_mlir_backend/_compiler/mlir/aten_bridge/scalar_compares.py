@@ -5,7 +5,8 @@ its type, ``x <= 0.1`` is true. torch-mlir (wheel 20261001) instead widens a flo
 f64 and compares with the f64 number, where 0.1 of f32 is above 0.1; for an integer tile it
 truncates a float number, where ``x > -0.5`` is ``x > 0``, and compares an integer number in
 i64, where torch wraps it to the tile's width (``i8 < 200`` is ``i8 < -56``). Those are wrong
-answers, on the elements at or next to the number.
+answers on the CPU and the XPU alike, on the elements at or next to the number; on the XPU
+they also compute in f64 for no reason.
 
 :func:`compare_in_tile_type` rewrites one of those ATen helpers, as ``nan_minmax`` does:
 

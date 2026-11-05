@@ -8,7 +8,7 @@ import os
 _FALSE_VALUES = ("", "0", "false", "no")
 PIPELINES = ("opt", "scalar")
 """The CPU target's lighthouse pipelines."""
-TARGETS = ("auto", "cpu")
+TARGETS = ("auto", "cpu", "xpu")
 """``HELION_MLIR_TARGET`` values; ``auto`` follows the device."""
 LOWERING_LOG_ATTR = "helion.lowering_log"
 LOWERING_WARNINGS_ATTR = "helion.lowering_warnings"
@@ -16,6 +16,10 @@ LOWERING_WARNINGS_ATTR = "helion.lowering_warnings"
 own warnings no one sees, so they travel on the module."""
 """Module attribute: lines a lowering logged that its caller must see too, since a forked
 lowering's log doesn't reach the caller's process."""
+XPU_STOP_POINTS = ("xegpu-wg", "xevm", "xevm-final", "binary")
+"""Where the XPU lowering can stop: annotated XeGPU, LLVM/XeVM without a device
+binary, the same after the workaround stages (what becomes the binary), and the full
+lowering with the binary."""
 PIPELINE_CONFIG_KEY = "mlir_pipeline"
 """Config key naming the lighthouse pipeline (``opt``/``scalar``) of one config."""
 
@@ -32,7 +36,7 @@ class DebugOptions:
     dump_pre_lowering: bool
     dump_lowered: bool
     dump_stages: bool
-    """The IR after each stage of a lowering built stage by stage."""
+    """The IR after each stage of a lowering built stage by stage (XPU)."""
 
     @classmethod
     def from_env(cls) -> DebugOptions:
@@ -56,12 +60,24 @@ def default_pipeline() -> str:
 
 
 def target_override() -> str | None:
-    """``HELION_MLIR_TARGET`` (``cpu``); ``None`` if unset or ``auto``
+    """``HELION_MLIR_TARGET`` (``cpu`` or ``xpu``); ``None`` if unset or ``auto``
     (the target follows the device of the kernel's tensors)."""
     target = os.environ.get("HELION_MLIR_TARGET", "").strip() or "auto"
     if target not in TARGETS:
         raise ValueError(f"HELION_MLIR_TARGET={target!r}; expected one of {TARGETS}")
     return None if target == "auto" else target
+
+
+def xpu_stop_at() -> str | None:
+    """``HELION_MLIR_XPU_STOP_AT`` (one of :data:`XPU_STOP_POINTS`): where
+    XPU lowerings that name no stop point stop; ``None`` (the full lowering) if
+    unset."""
+    stop_at = os.environ.get("HELION_MLIR_XPU_STOP_AT", "").strip() or None
+    if stop_at is not None and stop_at not in XPU_STOP_POINTS:
+        raise ValueError(
+            f"HELION_MLIR_XPU_STOP_AT={stop_at!r}; expected one of {XPU_STOP_POINTS}"
+        )
+    return stop_at
 
 
 def compile_timeout() -> float | None:

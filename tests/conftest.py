@@ -185,6 +185,11 @@ def pytest_configure(config: pytest.Config) -> None:
         "helion_internals: pins Helion internals the native kernel run relies on "
         "(host-code types, binding, call conventions); run first on a Helion upgrade",
     )
+    config.addinivalue_line(
+        "markers",
+        "xpu_runtime: runs XPU kernels on the device; skipped unless torch finds an "
+        "XPU and the MLIR bindings can emit and run XPU binaries",
+    )
 
 
 @pytest.hookimpl(optionalhook=True)
@@ -226,6 +231,31 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     if any(item.get_closest_marker("isolated") for item in session.items):
         _isolated_context()
         multiprocessing.forkserver.ensure_running()
+
+
+_xpu_runtime_missing: list[str | None] = []
+
+
+def _missing_xpu_runtime() -> str | None:
+    """Why XPU kernels cannot run here (``None``: they can), probed once: the
+    XPU target's own check of the bindings, the runtime library and the device."""
+    if not _xpu_runtime_missing:
+        from helion_mlir_backend._compiler.mlir.support import UnsupportedTargetError
+        from helion_mlir_backend._compiler.targets import XpuTarget
+
+        try:
+            XpuTarget().validate_environment(None)
+        except UnsupportedTargetError as missing:
+            _xpu_runtime_missing.append(str(missing).splitlines()[0])
+        else:
+            _xpu_runtime_missing.append(None)
+    return _xpu_runtime_missing[0]
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    if item.get_closest_marker("xpu_runtime") is not None:
+        if (missing := _missing_xpu_runtime()) is not None:
+            pytest.skip(f"no XPU runtime: {missing}")
 
 
 @pytest.hookimpl(tryfirst=True)

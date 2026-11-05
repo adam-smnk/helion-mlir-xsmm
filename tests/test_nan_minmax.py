@@ -1,6 +1,6 @@
 """NaN through minima and maxima: torch-mlir's compare-and-select clamps and
 ``aten.maximum``/``aten.minimum`` made NaN-propagating (``nan_minmax``), on the
-CPU.
+CPU here (the XPU runs the same kernels in ``test_xpu_runtime``).
 
 Regression: ``torch.clamp(x * 1.5, -1.0, 1.0)`` on bf16 (``[32, 256]`` tiles)
 gave -1.0 at NaN inputs on the CPU and the XPU; torch gives NaN.

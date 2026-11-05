@@ -1,5 +1,6 @@
 """Compares of a tile with a Python number, against torch, element by element, at the elements
-where it matters: the number itself in the tile's type, and its neighbours. On the CPU. ``HELION_TEST_FULL_SWEEP=1``: every number and type."""
+where it matters: the number itself in the tile's type, and its neighbours. On the CPU here, on
+the XPU in ``test_xpu_scalar_compares``. ``HELION_TEST_FULL_SWEEP=1``: every number and type."""
 
 from __future__ import annotations
 

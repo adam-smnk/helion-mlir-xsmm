@@ -47,8 +47,9 @@ if TYPE_CHECKING:
 
 _SPELLING_CUTOFF = 0.8
 """``difflib`` ratio from which an unknown config key counts as a misspelling. Every typo
-tried of a valid key is above it (``block_size``, ``mlir_pipline``), and none of the keys that AI-bench and this repo's tests, examples and
-tools pass or name; at 0.7 ``reduce_block_sizes`` would match."""
+tried of a valid key is above it (``xegpu_sg_tile``, ``xepgu_sg_tiles``, ``block_size``,
+``mlir_pipline``), and none of the keys that AI-bench and this repo's tests, examples and
+tools pass or name; at 0.7 ``xegpu_ops`` and ``reduce_block_sizes`` would match."""
 _warned_spellings: set[tuple[str, str]] = set()
 """``(kernel, key)`` pairs warned about, so a kernel warns once however often it compiles."""
 
@@ -105,7 +106,7 @@ def compile_kernel(
     ``target`` names the device target (default: ``HELION_MLIR_TARGET``, else
     the one for ``env.device``). ``pipeline`` defaults to the config's
     ``mlir_pipeline``, then the target's default (``HELION_MLIR_PIPELINE``, else
-    ``opt`` on the CPU). The target's config keys
+    ``opt`` on the CPU). The target's config keys (e.g. ``xegpu_*`` on the XPU)
     apply to its lowering; other targets ignore them.
     """
     mlir_target = resolve_target(env.device, target)

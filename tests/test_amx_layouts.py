@@ -17,7 +17,7 @@ assumes without checking, found on an AMX host (EMR, bf16):
 The transform and IR-level tests force AMX on through lighthouse's
 ``TargetInfo.override`` and run on any x86 host. The numeric tests execute AMX
 code and run on AMX hosts only (the KernelBench and attention numerics run in
-``test_contraction_regressions.py``).
+``test_xpu_kernelbench.py`` and ``test_contraction_regressions.py``).
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ import torch
 from tests.harness import amx_features
 from tests.harness import attention_kernel
 from tests.harness import lower_opt_with_amx
+from tests.kernelbench_xpu import LEVEL2_PROBLEMS
 
 import helion_mlir_backend  # noqa: F401
 from helion_mlir_backend import generate_mlir
@@ -992,15 +993,16 @@ def test_linear_bf16_reaches_amx_with_k_by_n_operand() -> None:
     ``test_level2_matches_eager_on_cpu``): the contractions reach AMX reading
     B as K x N (a transposed copy), not as the N x K tiles the rewrite packs
     as if K x N."""
+    (problem,) = [p for p in LEVEL2_PROBLEMS if p.name.startswith("40_")]
     kernel = helion.kernel(
         backend="mlir",
         static_shapes=True,
         config=helion.Config(block_sizes=[32, 64, 32]),
-    )(_linear_scaling_residual_add)
+    )(problem.fn)
     x = torch.randn(64, 256, dtype=torch.bfloat16)
     weight = torch.randn(128, 256, dtype=torch.bfloat16)
     bias = torch.randn(128, dtype=torch.bfloat16)
-    module = generate_mlir(kernel, [x, weight, bias, hl.constexpr(0.5)])
+    module = generate_mlir(kernel, list(problem.args(x, weight, bias)))
     before, after = _lower_to_x86_vectorization(module, kernel.fn.__name__)
     assert _contracts(before)
     # B tiles K x N (32 x 16); N x K tiles would be 16 x 32, as A tiles are.
@@ -1332,22 +1334,3 @@ def test_layouts_kept_off_amx(name: str, tolerance: float) -> None:
     out = kernel(*args)
     error = (out.float() - expected).abs().max() / expected.abs().max()
     assert error.item() < tolerance
-
-
-def _linear_scaling_residual_add(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    scaling_factor: hl.constexpr,
-) -> torch.Tensor:
-    """KernelBench level 2 40: ``y * scaling_factor + y`` of ``y = linear(x)``."""
-    m, k = x.size()
-    n, _ = weight.size()
-    out = torch.empty([m, n], dtype=x.dtype, device=x.device)
-    for tm, tn in hl.tile([m, n]):
-        acc = hl.zeros([tm, tn], dtype=torch.float32)
-        for tk in hl.tile(k):
-            acc = torch.addmm(acc, x[tm, tk], weight[tn, tk].T)
-        y = acc + bias[tn]
-        out[tm, tn] = (y * scaling_factor + y).to(x.dtype)
-    return out

@@ -27,6 +27,7 @@ from ..analysis.geometry import loop_block_ids
 from ..analysis.tensor_effects import accessed_tensor
 from ..support import NodeLoweringError
 from ..support import UnsupportedOperationError
+from ..support.debug import target_override
 from . import emit
 from .control_flow import carried_positions
 from .control_flow import lower_subgraph
@@ -156,6 +157,21 @@ def _trip_count(bound: LoopBounds) -> int | ir.Value:
     ).result
 
 
+def _on_xpu(ctx: BuildContext) -> bool:
+    return ctx.env.device.type == "xpu" or target_override() == "xpu"
+
+
+def _keep_one_tile_grid(forall: scf_d.ForallOp, trips: list[int | ir.Value]) -> None:
+    """A grid of one tile keeps its loop: canonicalization folds single-iteration
+    dims of a loop without a ``mapping``, and the XPU target's GPU kernels are the
+    grid loops, so the whole kernel would become host code touching device
+    memory. The mapping is a placeholder until the XPU target outlines the kernel
+    (``strip_grid_mappings``). A grid with several tiles folds its unit dims."""
+    if all(trip == 1 for trip in trips):
+        threads = ", ".join(f"#gpu.thread<linear_dim_{i}>" for i in range(len(trips)))
+        forall.operation.attributes["mapping"] = ir.Attribute.parse(f"[{threads}]")
+
+
 def _emit_forall(
     ctx: BuildContext,
     graph: torch.fx.Graph,
@@ -172,6 +188,8 @@ def _emit_forall(
         [1] * rank,
         shared_outs=[ctx.tensors.value(name) for name in names],
     )
+    if _on_xpu(ctx):
+        _keep_one_tile_grid(forall, trips)
     with ir.InsertionPoint(forall.body):
         for block_id, bound, trip_iv in zip(
             grid_ids, bounds, forall.induction_variables, strict=True
@@ -412,7 +430,9 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> emit.Result
         end: int | ir.Value,
         carried: list[ir.Value],
     ) -> list[ir.Value]:
-        # A lower bound that is a value counts from 0, with the offset in the body.
+        # A lower bound that is a value counts from 0, with the offset in the body:
+        # XeGPU's prefetch insertion unrolls a loop of a constant trip count from
+        # the loop's own lower bound, which a value there does not give.
         moved = isinstance(begin, ir.Value)
         for_op = scf_d.ForOp(
             ctx.index_const(0) if moved else ctx.as_index(begin),
@@ -459,9 +479,11 @@ def lower_nested_for_loop(ctx: BuildContext, node: torch.fx.Node) -> emit.Result
         step = bounds[level].step
         # Whole tiles first, as if no tile were partial, so that a running value
         # is updated in place; only the partial tile keeps elements of the old one.
+        # Not on the XPU: running values are in registers there, and a loop of one
+        # tile gets a constant mask, on which ocloc crashes (IGC 2.41).
         whole_end = (
             _whole_tiles_end(begin, end, step)
-            if _tile_dims(ctx, block_ids[level], running)
+            if _tile_dims(ctx, block_ids[level], running) and not _on_xpu(ctx)
             else end
         )
         if whole_end is not end:
@@ -825,8 +847,9 @@ def _keep_past_tile(
     if valid is None:
         return yields
     dims = _tile_dims(ctx, block_id, nodes) or [[] for _ in nodes]
+    keep_past = emit.keep_past_by_element if _on_xpu(ctx) else emit.keep_past
     return [
-        emit.keep_past(value, old, dict.fromkeys(tile_dims, ctx.as_index(valid)))
+        keep_past(value, old, dict.fromkeys(tile_dims, ctx.as_index(valid)))
         if tile_dims
         else value
         for value, old, tile_dims in zip(yields, carried, dims, strict=True)

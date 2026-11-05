@@ -323,7 +323,7 @@ def _note_guarded_ints(bound: object) -> None:
 
 
 def _warn_on_many_int_compiles(bound: object, args: tuple[object, ...]) -> None:
-    """A compile per value is right but costs: say so once a
+    """A compile per value is right but costs, over a minute on XPU: say so once a
     kernel has many, as nothing evicts them."""
     kernel = bound.kernel  # type: ignore[attr-defined]
     values = _guarded_ints(kernel, args)
@@ -711,7 +711,8 @@ def _register_autotune_cache() -> None:
 
 
 def _allow_config_keys() -> None:
-    """Let configs carry ``mlir_pipeline`` and the targets' lowering keys: Helion accepts only keys in ``VALID_KEYS``. Backends
+    """Let configs carry ``mlir_pipeline`` and the targets' lowering keys (e.g.
+    ``xegpu_sg_tiles``): Helion accepts only keys in ``VALID_KEYS``. Backends
     that do not support them drop them from configs."""
     import helion.autotuner.config_spec as config_spec
 
