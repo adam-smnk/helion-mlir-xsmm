@@ -66,6 +66,7 @@ from ..mlir_transforms.prints import refuse_prints_needing_allocation
 from ..mlir_transforms.prints import settle_prints_of_stored_buffers
 from ..mlir_transforms.prints import warn_print_is_experimental
 from ..mlir_transforms.row_maxima import restore_nan_propagating_maxima
+from ..mlir_transforms.nsz_reductions import nsz_reductions
 from ..mlir_transforms.xegpu_attention_loops import copy_attention_layouts
 from ..mlir_transforms.xegpu_block_surfaces import check_block_surfaces
 from ..mlir_transforms.xegpu_sfc_walk import walk_on_curve
@@ -231,6 +232,7 @@ def _stages(
     if stop_at != "xegpu-wg":
         schedules.extend(
             [
+                ("nsz-reductions", _NszReductions()),
                 ("sfc-walk", _SfcWalk(entry, kernels)),
                 ("store-hints", _StoreWriteBack(entry, kernels)),
                 ("xevm-math", xpu_transforms.extend_math()),
@@ -727,9 +729,17 @@ class _AllocaArrays(Stage):
         return module
 
 
+class _NszReductions(Stage):
+    """Cheap row maxima, ``nsz`` on the kernels' reductions (:mod:`nsz_reductions`)."""
+
+    def apply(self, module: ir.Module) -> ir.Module:
+        nsz_reductions(module)
+        return module
+
+
 class _NszMinMax(Stage):
-    """Device minima and maxima without the order of -0 and +0, much cheaper
-    in SPIR-V (:mod:`xevm_nsz_minmax`)."""
+    """The flag XeGPU's lowering drops, back on the row maxima
+    (:mod:`xevm_nsz_minmax`)."""
 
     def apply(self, module: ir.Module) -> ir.Module:
         nsz_minmax(module)

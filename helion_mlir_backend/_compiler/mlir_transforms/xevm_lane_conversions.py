@@ -15,7 +15,7 @@ block of its own for every lane. With the conversions next to their lanes, they
 are in different blocks, and the vectorizer's check that a slice shares one
 block rejects them.
 
-Bug and removal: an LLVM-level workaround for the bug reported as "``fptrunc`` before
+Bug and removal: an LLVM-level workaround for the bug written up as "``fptrunc`` before
 its operand" in helion-mlir-dev's
 ``agent-wiki/upstream-repro/igc-vector-minmax/BUG-REPORT.md``. The reproducer is
 ``agent-wiki/upstream-repro/igc-vector-minmax/fptrunc/``, with

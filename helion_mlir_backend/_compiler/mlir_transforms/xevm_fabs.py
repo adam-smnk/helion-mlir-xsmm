@@ -9,6 +9,10 @@ source modifier on an unsigned type does nothing, so the operand comes out
 unchanged. Vector forms (``llvm.fabs.v4f16``) were wrong as well (Arc B50, IGC
 2.41). Reproducer (helion-mlir-dev): ``agent-wiki/upstream-repro/igc-bf16-rounding/``.
 
+Removal: when ``llvm.fabs.bf16`` and ``llvm.fabs.v4f16`` clear the sign bit on the IGC builds
+the XPU target supports, and ``tests/test_xpu_runtime.py``'s math checks pass without this
+stage. It also serves f64 vectors, so check those too.
+
 The obvious ``and bits, 0x7FFFFFFF`` does not survive: InstCombine turns a
 one-use ``and`` of a bitcast back into ``fabs`` and narrows it, unless the bits
 come straight from a load. The minimum is the same bits: of ``bits`` and

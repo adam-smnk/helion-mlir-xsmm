@@ -14,6 +14,11 @@ in helion-mlir-dev: ``agent-wiki/upstream-repro/xpu-nan/README.md``):
   ``clamp_max(clamp_min(x, 0.0), 1.0)`` folds to), ``(sat)`` lands on a bf16
   ``mov (sat) :uw :uw``: nothing happens, -3.375 stays -3.375.
 
+Removal: when that reproducer's clamps give NaN for NaN, -0 for -0 and a real clamp on bf16
+without this stage, on the IGC builds the XPU target supports, and
+``tests/test_xevm_unit_clamps.py``'s device checks and ``tests/test_xpu_runtime.py`` pass
+without it.
+
 So the compare with 1 changes to the same test against the neighbouring number:
 ``y > 1`` is ``y >= 1 + ulp``, ``y < 1`` is ``y <= 1 - ulp/2``. It is the same
 test for every ``y``, NaN and infinities too (both numbers are normal, so

@@ -16,7 +16,7 @@ other rows are read unwritten: silent wrong elements, in lanes other than the fi
 Not covered: ``and(bitcast x, 0x7FFFFFFF)``, which InstCombine also makes a vector ``fabs``. No
 kernel reaches it: ``torch.abs`` is :mod:`.xevm_fabs`'s ``umin``.
 
-Bug and removal: a named workaround, reported in helion-mlir-dev's
+Bug and removal: a named workaround, reproduced in helion-mlir-dev's
 ``agent-wiki/upstream-repro/igc-vector-fabs/``. This stage goes when, on the IGC builds the XPU
 target supports, that directory's ``idiom`` and ``iabs`` kernels compile to 16 ``(abs)`` movs
 with ``visa_uninit.py`` clean, and ``tests/test_xpu_scalar_compares.py`` is right on the device

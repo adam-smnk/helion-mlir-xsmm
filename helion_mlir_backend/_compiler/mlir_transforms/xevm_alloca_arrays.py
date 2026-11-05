@@ -13,9 +13,13 @@ loaded before the K loop). An array alloca addressed by a GEP keeps its type
 (``OpVariable`` of the array). Reproducer (helion-mlir-dev):
 ``agent-wiki/upstream-repro/spirv-alloca/spirv_alloca_count_mangled_call.ll``.
 
+Removal: when ``llc`` on that reproducer gives an ``OpVariable`` of the array, on the XPU
+LLVM this backend supports, and ``tests/test_xpu_runtime.py`` is right on the device
+without this stage.
+
 The rewrite keeps the semantics (the same number of elements, alignment and
 address space, one allocation where the old one was), so it stays harmless
-once the backend is fixed. Only allocas whose count is an ``llvm.mlir.constant``
+until then. Only allocas whose count is an ``llvm.mlir.constant``
 greater than 1 are rewritten, only in ``gpu.module``s with an ``#xevm.target``;
 dynamic counts, single elements, array element types, allocas with attributes
 other than ``elem_type`` and ``alignment`` (e.g. ``inalloca``, which the new

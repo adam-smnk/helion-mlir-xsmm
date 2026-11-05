@@ -15,6 +15,11 @@ plus one chunk's temporaries. No spill, 3.9 ms. IGC keeps this order but does no
 make it: its own scheduler leaves the vector-op order spilling, with or without
 its vectorizer.
 
+Not a bug but a cost, in XeGPU's unrolling: accepted as a workaround (user, 2026-11-02).
+Reproduced in helion-mlir-dev's ``agent-wiki/upstream-repro/xegpu-tile-order/``. Removal: when
+that reproducer doesn't spill with this stage off, on the IGC builds the XPU target supports,
+because XeGPU's unrolling emits chunks depth first or IGC's scheduler stops spilling.
+
 The reorder only preserves values; it can also cost time when nothing spills
 (elementwise Mish at ``[128, 256]``: about +7 %). So it applies per GPU module, to
 those that spill: the XPU target's binary stage compiles, reads ``spill_size`` from

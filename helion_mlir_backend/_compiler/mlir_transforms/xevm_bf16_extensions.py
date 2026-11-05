@@ -16,6 +16,9 @@ f32 between the same two conversions). A plain f32-to-bf16 conversion
 not ``fpext``s: the shrinking needs them (or constants exact in bf16).
 Reproducer (helion-mlir-dev): ``agent-wiki/upstream-repro/igc-bf16-rounding/``.
 
+Removal: when that reproducer's bf16 adds and muls all round to nearest even, on the IGC builds
+the XPU target supports, and ``tests/test_xpu_runtime.py``'s bf16 checks pass without this stage.
+
 Rejected alternatives, tried on the device: an explicit round-to-nearest-even
 in integer ops instead of the ``fptrunc`` is right on its own, but its NaN test
 (compare and select) is miscompiled by IGC next to other predicated code
