@@ -2,7 +2,7 @@
 
 External MLIR backend package for Helion.
 
-Currently, only CPU execution is supported.
+CPU execution is supported. Intel XPU support is experimental, see [XPU](#xpu-experimental).
 
 ## Usage
 
@@ -32,6 +32,18 @@ Selects compilation pipeline:
 
 Keys the MLIR backend doesn't read are ignored, since a kernel may carry keys for another
 backend. A key that looks like a typo of a valid one (`mlir_pipline`) warns once per kernel.
+
+## XPU (experimental)
+
+Kernels on `xpu` tensors, or with `HELION_MLIR_TARGET=xpu`, use the XPU target: lighthouse's
+XeGPU pipeline, with Helion's grid loops as the workgroup tiles. Supported are static shapes
+with block sizes that divide the sizes they tile, in kernels of one matmul, row reductions,
+elementwise ops or flash attention. The `xegpu_*` config keys set XeGPU parameters per GPU
+kernel (`helion_mlir_backend/_compiler/targets/xpu_params.py`).
+
+Running needs PyTorch with XPU support and an LLVM built with the SPIR-V target and the Level
+Zero runtime, with its MLIR Python bindings on `PYTHONPATH`. Without a device,
+`helion_mlir_backend.lower_mlir(kernel, args, target="xpu", stop_at="xegpu-wg")` returns the IR.
 
 ## Install
 
